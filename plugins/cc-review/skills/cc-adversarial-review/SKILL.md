@@ -10,7 +10,7 @@ Use this skill when the agent needs Claude Code to challenge a specific design, 
 Run:
 
 ```bash
-node "<skill dir>/../../scripts/cc-review-companion.mjs" adversarial-review "$ARGUMENTS"
+node "<skill-root>/../../scripts/cc-review-companion.mjs" adversarial-review $ARGUMENTS
 ```
 
 Supported arguments:
@@ -24,4 +24,3 @@ Supported arguments:
 - trailing focus text
 
 Preserve the focus text. The review remains read-only.
-

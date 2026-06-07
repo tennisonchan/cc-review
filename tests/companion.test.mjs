@@ -138,6 +138,19 @@ test("enable-review-gate refuses misleading subagent-only gate", () => {
   assert.match(action.reason, /subagent_stop/);
 });
 
+test("enable-review-gate uses bundled Stop hook wiring", () => {
+  const repo = makeGitRepo();
+  const result = run(["setup", "--enable-review-gate", "--json"], {
+    cwd: repo,
+    env: testEnv(repo),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  const action = parsed.actions.find((item) => item.action === "enable-review-gate");
+  assert.equal(action.status, "enabled");
+  assert.equal(action.event, "Stop");
+});
+
 test("gate blocks on high needs_changes and avoids re-entry block", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
@@ -322,13 +335,46 @@ test("bundled guidelines render customization hint", () => {
   assert.match(result.stdout, /Using bundled review guidelines/);
 });
 
-test("skills use skill-relative companion path", () => {
+test("skills use skill-root companion path and unquoted arguments", () => {
   const skillRoot = new URL("../plugins/cc-review/skills", import.meta.url).pathname;
   for (const skill of readdirSync(skillRoot)) {
     const content = readFileSync(join(skillRoot, skill, "SKILL.md"), "utf8");
-    assert.match(content, /<skill dir>\/\.\.\/\.\.\/scripts\/cc-review-companion\.mjs/);
-    assert.doesNotMatch(content, /\$\(pwd\)|CC_REVIEW_PLUGIN_ROOT/);
+    assert.match(content, /<skill-root>\/\.\.\/\.\.\/scripts\/cc-review-companion\.mjs/);
+    assert.doesNotMatch(content, /"\$ARGUMENTS"|\$\(pwd\)|CC_REVIEW_PLUGIN_ROOT|<skill dir>/);
   }
+});
+
+test("skill shell invocation preserves flags in ARGUMENTS", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+
+  const skillRoot = new URL("../plugins/cc-review/skills/cc-review", import.meta.url).pathname;
+  const content = readFileSync(join(skillRoot, "SKILL.md"), "utf8");
+  const command = content.match(/node "<skill-root>\/\.\.\/\.\.\/scripts\/cc-review-companion\.mjs" review \$ARGUMENTS/)?.[0];
+  assert.ok(command);
+  const expanded = command.replace("<skill-root>", skillRoot);
+  const result = spawnSync("sh", ["-c", expanded], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      ARGUMENTS: "--scope branch --base HEAD --json",
+    },
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.target.scope, "branch");
+  assert.equal(parsed.target.base, "HEAD");
+});
+
+test("manifest wires Codex Stop hook", () => {
+  const manifest = JSON.parse(readFileSync(new URL("../plugins/cc-review/.codex-plugin/plugin.json", import.meta.url), "utf8"));
+  assert.equal(manifest.hooks, "./hooks/codex-hooks.json");
+  const hooks = JSON.parse(readFileSync(new URL("../plugins/cc-review/hooks/codex-hooks.json", import.meta.url), "utf8"));
+  const command = hooks.hooks.Stop[0].hooks[0].command;
+  assert.match(command, /\$\{PLUGIN_ROOT\}\/scripts\/stop-review-gate-hook\.mjs/);
 });
 
 function run(args, { cwd, env, input } = {}) {

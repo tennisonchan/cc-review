@@ -10,7 +10,7 @@ Use this skill before a final response, implementation-ready claim, or PR submis
 Run:
 
 ```bash
-node "<skill dir>/../../scripts/cc-review-companion.mjs" review "$ARGUMENTS"
+node "<skill-root>/../../scripts/cc-review-companion.mjs" review $ARGUMENTS
 ```
 
 Supported arguments:
@@ -23,4 +23,3 @@ Supported arguments:
 - `--json`
 
 The review is read-only. Do not ask Claude Code to patch, edit, commit, or continue into implementation.
-

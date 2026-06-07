@@ -8,11 +8,10 @@ description: Show a completed cc-review background job result.
 Run:
 
 ```bash
-node "<skill dir>/../../scripts/cc-review-companion.mjs" result "$ARGUMENTS"
+node "<skill-root>/../../scripts/cc-review-companion.mjs" result $ARGUMENTS
 ```
 
 Supported arguments:
 
 - `[job-id]`
 - `--json`
-

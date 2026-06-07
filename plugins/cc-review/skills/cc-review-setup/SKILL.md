@@ -10,7 +10,7 @@ Use this skill when the user or agent needs to prepare `cc-review`.
 Run:
 
 ```bash
-node "<skill dir>/../../scripts/cc-review-companion.mjs" setup "$ARGUMENTS"
+node "<skill-root>/../../scripts/cc-review-companion.mjs" setup $ARGUMENTS
 ```
 
 Supported arguments:
@@ -23,4 +23,3 @@ Supported arguments:
 - `--block-on high|medium|low`
 
 Do not ask Claude Code to edit files. Setup only checks local prerequisites, initializes guidelines when requested, and configures the conditional gate when the current Codex hook surface supports it.
-

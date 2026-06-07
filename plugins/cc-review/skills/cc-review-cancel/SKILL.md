@@ -8,11 +8,10 @@ description: Cancel a running cc-review background job.
 Run:
 
 ```bash
-node "<skill dir>/../../scripts/cc-review-companion.mjs" cancel "$ARGUMENTS"
+node "<skill-root>/../../scripts/cc-review-companion.mjs" cancel $ARGUMENTS
 ```
 
 Supported arguments:
 
 - `[job-id]`
 - `--json`
-

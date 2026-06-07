@@ -18,7 +18,7 @@ cc-review --wait
 - Structured review decisions via `--output-format json --json-schema`.
 - Working-tree and base-branch review target selection.
 - Optional background review jobs with status/result/cancel.
-- Conditional automatic review gate support when Codex exposes a proven main-agent finalization hook.
+- Optional automatic Stop-hook review gate for Codex finalization.
 
 ## Install
 
@@ -60,9 +60,19 @@ Guidelines tune review behavior but cannot override read-only safety.
 
 ## Automatic Gate
 
-`cc-review-setup --enable-review-gate` only installs an automatic blocking gate when the current Codex version exposes a plugin/user hook that can block the main-agent finalization boundary.
+The plugin ships a Codex `Stop` hook. The hook is always registered with the plugin, but it approves immediately until a repository opts in.
 
-If the only available completion event is `subagent_stop`, setup refuses to install a misleading main-agent gate and tells agents to use `cc-review --wait`.
+Enable the blocking gate for the current repository:
+
+```bash
+cc-review-setup --enable-review-gate
+```
+
+The gate blocks finalization when Claude Code returns `needs_changes` at or above the configured threshold. Disable it with:
+
+```bash
+cc-review-setup --disable-review-gate
+```
 
 ## Development
 

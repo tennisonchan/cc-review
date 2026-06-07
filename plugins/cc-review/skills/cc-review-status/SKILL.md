@@ -8,7 +8,7 @@ description: List running and recent cc-review background jobs for the current r
 Run:
 
 ```bash
-node "<skill dir>/../../scripts/cc-review-companion.mjs" status "$ARGUMENTS"
+node "<skill-root>/../../scripts/cc-review-companion.mjs" status $ARGUMENTS
 ```
 
 Supported arguments:
@@ -16,4 +16,3 @@ Supported arguments:
 - `[job-id]`
 - `--all`
 - `--json`
-

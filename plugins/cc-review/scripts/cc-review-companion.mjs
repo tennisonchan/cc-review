@@ -3,7 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, copyFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -428,7 +428,7 @@ function resolveGuidelines(explicit, cwd, repoRoot) {
   }
 
   let cursor = cwd;
-  while (cursor.startsWith(repoRoot)) {
+  while (isWithinPath(cursor, repoRoot)) {
     candidates.push({ path: join(cursor, ".claude", "rules", "review-guidelines.md"), source: "project" });
     if (cursor === repoRoot) break;
     cursor = dirname(cursor);
@@ -655,10 +655,23 @@ function detectMainAgentGateSupport() {
   if (process.env.CC_REVIEW_FORCE_MAIN_AGENT_HOOK === "1") {
     return { supported: true, event: "main_agent_finalization", source: "CC_REVIEW_FORCE_MAIN_AGENT_HOOK" };
   }
+  const bundledHookConfig = join(ROOT, "hooks", "codex-hooks.json");
+  if (existsSync(bundledHookConfig)) {
+    const hooks = readJson(bundledHookConfig).hooks || {};
+    if (Array.isArray(hooks.Stop) && hooks.Stop.length > 0) {
+      return { supported: true, event: "Stop", source: bundledHookConfig };
+    }
+  }
   return {
     supported: false,
     reason: "No proven main-agent finalization hook is available in this Codex version.",
   };
+}
+
+function isWithinPath(candidate, root) {
+  const normalizedCandidate = resolve(candidate);
+  const normalizedRoot = resolve(root);
+  return normalizedCandidate === normalizedRoot || normalizedCandidate.startsWith(`${normalizedRoot}${sep}`);
 }
 
 function readGateConfig(repoRoot) {
