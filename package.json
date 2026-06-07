@@ -1,0 +1,25 @@
+{
+  "name": "cc-review",
+  "version": "0.1.0",
+  "description": "Codex plugin for running read-only Claude Code reviews and review gates.",
+  "type": "module",
+  "private": false,
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "bin": {
+    "cc-review-companion": "./plugins/cc-review/scripts/cc-review-companion.mjs"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "validate": "node --test tests/*.test.mjs && node plugins/cc-review/scripts/cc-review-companion.mjs setup --json"
+  },
+  "keywords": [
+    "codex",
+    "claude",
+    "code-review",
+    "plugin"
+  ],
+  "author": "Tennison Chan"
+}

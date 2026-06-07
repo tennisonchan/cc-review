@@ -1,0 +1,20 @@
+{
+  "name": "cc-review",
+  "interface": {
+    "displayName": "cc-review"
+  },
+  "plugins": [
+    {
+      "name": "cc-review",
+      "source": {
+        "source": "local",
+        "path": "./plugins/cc-review"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

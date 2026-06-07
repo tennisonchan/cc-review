@@ -1,0 +1,36 @@
+{
+  "name": "cc-review",
+  "version": "0.1.0",
+  "description": "Run read-only Claude Code reviews from Codex before finalization.",
+  "author": {
+    "name": "Tennison Chan"
+  },
+  "homepage": "https://github.com/tennisonchan/cc-review",
+  "repository": "https://github.com/tennisonchan/cc-review",
+  "license": "Apache-2.0",
+  "keywords": [
+    "code-review",
+    "claude-code",
+    "review-gate"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "cc-review",
+    "shortDescription": "Run read-only Claude Code reviews before Codex finalizes work",
+    "longDescription": "Use cc-review to connect Codex to Claude Code for read-only code reviews, structured approved/needs_changes decisions, customizable review guidelines, and conditional agent-finalization review gates.",
+    "developerName": "Tennison Chan",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read"
+    ],
+    "websiteURL": "https://github.com/tennisonchan/cc-review",
+    "defaultPrompt": [
+      "Run a read-only Claude Code review before finalizing this change",
+      "Initialize review guidelines for this project",
+      "Check whether the cc-review gate can be enabled"
+    ],
+    "screenshots": [],
+    "brandColor": "#111827"
+  }
+}
