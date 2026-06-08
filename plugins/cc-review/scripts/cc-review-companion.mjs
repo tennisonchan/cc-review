@@ -550,14 +550,14 @@ async function cancelCommand(args) {
 async function gateCommand(args) {
   const hookPayload = await readStdinJson();
   if (hookPayload?.stop_hook_active || hookPayload?.hook_active || hookPayload?.cc_review_active) {
-    outputHook({ decision: "approve", reason: "cc-review gate already active; not re-blocking this finalization attempt." });
+    outputHookAllow();
     return;
   }
 
   const repo = resolveWorkspace();
   const config = readGateConfig(repo.root);
   if (!config?.enabled) {
-    outputHook({ decision: "approve", reason: "cc-review gate is not enabled for this repository." });
+    outputHookAllow();
     return;
   }
 
@@ -577,7 +577,7 @@ async function gateCommand(args) {
   if (!blocking.length) {
     delete state.tasks[taskKey];
     writeGateState(repo.root, state);
-    outputHook({ decision: "approve", reason: "cc-review approved or found no blocking findings." });
+    outputHookAllow();
     return;
   }
 
@@ -594,7 +594,7 @@ async function gateCommand(args) {
 
   const reason = blocking.map((finding) => `[${finding.severity}] ${finding.location}: ${finding.summary}`).join("\n");
   if (taskState.block_count > 3) {
-    outputHook({ decision: "approve", reason: `cc-review reached the three-block convergence cap. Report-only unresolved findings:\n${reason}` });
+    outputHookAllow();
     return;
   }
   outputHook({ decision: "block", reason: `cc-review needs_changes:\n${reason}` });
@@ -763,6 +763,10 @@ function output(value, json, renderer) {
 
 function outputHook(value) {
   console.log(JSON.stringify(value));
+}
+
+function outputHookAllow() {
+  outputHook({});
 }
 
 function listJobs(repoRoot) {

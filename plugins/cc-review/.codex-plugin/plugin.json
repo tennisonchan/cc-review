@@ -1,6 +1,6 @@
 {
   "name": "cc-review",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Run read-only Claude Code reviews from Codex before finalization.",
   "author": {
     "name": "Tennison Chan"

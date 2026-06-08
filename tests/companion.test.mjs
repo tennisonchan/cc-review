@@ -185,7 +185,7 @@ test("gate blocks on high needs_changes and avoids re-entry block", () => {
 
   const reentered = run(["gate", "--json"], { cwd: repo, env, input: '{"stop_hook_active":true}' });
   assert.equal(reentered.status, 0, reentered.stderr);
-  assert.equal(JSON.parse(reentered.stdout).decision, "approve");
+  assert.deepEqual(JSON.parse(reentered.stdout), {});
 });
 
 test("gate uses persisted block_on and resets after clean review", () => {
@@ -211,18 +211,17 @@ test("gate uses persisted block_on and resets after clean review", () => {
     assert.equal(JSON.parse(result.stdout).decision, "block");
   }
   const capped = run(["gate", "--json"], { cwd: repo, env: mediumEnv, input: '{"turn_id":"t1"}' });
-  assert.equal(JSON.parse(capped.stdout).decision, "approve");
-  assert.match(JSON.parse(capped.stdout).reason, /convergence cap/);
+  assert.deepEqual(JSON.parse(capped.stdout), {});
 
   const cleanEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", approved: true, max_severity: "info", needs_changes: [], notes: [] }) };
   const clean = run(["gate", "--json"], { cwd: repo, env: cleanEnv, input: '{"turn_id":"t1"}' });
-  assert.equal(JSON.parse(clean.stdout).decision, "approve");
+  assert.deepEqual(JSON.parse(clean.stdout), {});
 
   const blocksAgain = run(["gate", "--json"], { cwd: repo, env: mediumEnv, input: '{"turn_id":"t1"}' });
   assert.equal(JSON.parse(blocksAgain.stdout).decision, "block");
 });
 
-test("gate approves when not enabled", () => {
+test("gate allows when not enabled", () => {
   const repo = makeGitRepo();
   const result = run(["gate", "--json"], {
     cwd: repo,
@@ -230,8 +229,12 @@ test("gate approves when not enabled", () => {
     input: "{}",
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).decision, "approve");
-  assert.match(JSON.parse(result.stdout).reason, /not enabled/);
+  assert.deepEqual(JSON.parse(result.stdout), {});
+});
+
+test("gate allow paths never emit invalid approve decision", () => {
+  const source = readFileSync(new URL("../plugins/cc-review/scripts/cc-review-companion.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /decision:\s*["']approve["']/);
 });
 
 test("gate infrastructure errors fail closed with block decision", () => {
