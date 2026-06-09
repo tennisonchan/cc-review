@@ -211,7 +211,10 @@ test("gate uses persisted block_on and resets after clean review", () => {
     assert.equal(JSON.parse(result.stdout).decision, "block");
   }
   const capped = run(["gate", "--json"], { cwd: repo, env: mediumEnv, input: '{"turn_id":"t1"}' });
-  assert.deepEqual(JSON.parse(capped.stdout), {});
+  const cappedParsed = JSON.parse(capped.stdout);
+  assert.match(cappedParsed.systemMessage, /three-block convergence cap/);
+  assert.match(cappedParsed.systemMessage, /file\.txt:1: Medium issue/);
+  assert.doesNotMatch(cappedParsed.systemMessage, /decision/);
 
   const cleanEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", approved: true, max_severity: "info", needs_changes: [], notes: [] }) };
   const clean = run(["gate", "--json"], { cwd: repo, env: cleanEnv, input: '{"turn_id":"t1"}' });
@@ -394,6 +397,7 @@ function makeGitRepo() {
   runGit(["init"], dir);
   runGit(["config", "user.email", "test@example.com"], dir);
   runGit(["config", "user.name", "Test User"], dir);
+  runGit(["config", "commit.gpgsign", "false"], dir);
   return dir;
 }
 

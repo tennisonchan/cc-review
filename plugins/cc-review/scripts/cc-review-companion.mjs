@@ -568,7 +568,7 @@ async function gateCommand(args) {
     result = await runReview({ kind: "review", args: { ...args, json: true, positional: [] }, cwd: process.cwd(), gate: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    outputHook({ decision: "block", reason: `cc-review infrastructure failure: ${redact(message)}` });
+    outputHookBlock(`cc-review infrastructure failure: ${redact(message)}`);
     return;
   }
   const blocking = blockingFindings(result.decision, blockOn);
@@ -594,10 +594,10 @@ async function gateCommand(args) {
 
   const reason = blocking.map((finding) => `[${finding.severity}] ${finding.location}: ${finding.summary}`).join("\n");
   if (taskState.block_count > 3) {
-    outputHookAllow();
+    outputHookAllow(`cc-review reached the three-block convergence cap. Report-only unresolved findings:\n${reason}`);
     return;
   }
-  outputHook({ decision: "block", reason: `cc-review needs_changes:\n${reason}` });
+  outputHookBlock(`cc-review needs_changes:\n${reason}`);
 }
 
 function blockingFindings(decision, blockOn) {
@@ -765,8 +765,12 @@ function outputHook(value) {
   console.log(JSON.stringify(value));
 }
 
-function outputHookAllow() {
-  outputHook({});
+function outputHookAllow(systemMessage) {
+  outputHook(systemMessage ? { systemMessage } : {});
+}
+
+function outputHookBlock(reason) {
+  outputHook({ decision: "block", reason });
 }
 
 function listJobs(repoRoot) {
