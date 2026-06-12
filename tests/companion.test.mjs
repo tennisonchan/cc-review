@@ -83,9 +83,16 @@ process.stdin.on("end", () => {
     env: { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: fakeClaude },
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(JSON.parse(readFileSync(argvFile, "utf8")).slice(0, 5), ["-p", "--permission-mode", "plan", "--tools", "Read,Grep,Glob"]);
+  const argv = JSON.parse(readFileSync(argvFile, "utf8"));
+  assert.deepEqual(argv.slice(0, 5), ["-p", "--permission-mode", "plan", "--tools", "Read,Grep,Glob"]);
   assert.match(readFileSync(stdinFile, "utf8"), /You are Claude Code acting as a read-only reviewer/);
-  assert.doesNotMatch(JSON.stringify(JSON.parse(readFileSync(argvFile, "utf8"))), /You are Claude Code/);
+  assert.doesNotMatch(JSON.stringify(argv), /You are Claude Code/);
+  // claude --json-schema silently drops structured output when the schema
+  // carries a $schema meta key; the companion must strip it.
+  const schemaArg = argv[argv.indexOf("--json-schema") + 1];
+  const schema = JSON.parse(schemaArg);
+  assert.equal(schema.$schema, undefined);
+  assert.deepEqual(schema.properties.decision.enum, ["approved", "needs_changes"]);
 });
 
 test("oversized diffs are truncated in the review prompt", () => {
