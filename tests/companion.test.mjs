@@ -671,10 +671,14 @@ function runGit(args, cwd) {
 function testEnv(repo) {
   const bin = join(repo, "bin");
   mkdirSync(bin, { recursive: true });
+  // Isolate HOME so a developer's real ~/.claude/rules/review-guidelines.md
+  // cannot leak into guideline resolution during tests.
+  mkdirSync(join(repo, ".home"), { recursive: true });
   const fakeClaude = join(bin, "claude");
   writeFileSync(fakeClaude, "#!/usr/bin/env sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.167 (Claude Code)'; exit 0; fi\nif [ \"$1\" = \"auth\" ]; then echo 'ok'; exit 0; fi\necho '{\"structured_output\":{\"decision\":\"approved\",\"approved\":true,\"max_severity\":\"info\",\"needs_changes\":[],\"notes\":[]},\"result\":\"ok\"}'\n", { mode: 0o755 });
   return {
     ...process.env,
+    HOME: join(repo, ".home"),
     CC_REVIEW_CLAUDE_BIN: fakeClaude,
     XDG_STATE_HOME: join(repo, ".state"),
   };

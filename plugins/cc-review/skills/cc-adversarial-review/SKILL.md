@@ -15,7 +15,6 @@ node "<skill-root>/../../scripts/cc-review-companion.mjs" adversarial-review $AR
 
 Supported arguments:
 
-- `--wait`
 - `--background`
 - `--base <ref>`
 - `--scope auto|working-tree|branch`
