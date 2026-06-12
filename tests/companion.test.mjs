@@ -254,6 +254,35 @@ test("gate total block ceiling bounds churning finding sets", () => {
   assert.equal(JSON.parse(nextTask.stdout).decision, "block");
 });
 
+test("gate default-key counters reset after the chain gap window", async () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1", CC_REVIEW_GATE_CHAIN_GAP_MS: "1" };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const findingEnv = (id) => ({
+    ...baseEnv,
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      decision: "needs_changes",
+      approved: false,
+      max_severity: "high",
+      needs_changes: [{ id, severity: "high", location: "file.txt:1", summary: `Issue ${id}.`, required_action: "Fix." }],
+      notes: [],
+    }),
+  });
+  // Six unkeyed stops separated by more than the chain gap stay independent
+  // tasks: each gets a fresh budget and blocks instead of hitting a ceiling.
+  for (let i = 0; i < 6; i += 1) {
+    const result = run(["gate", "--json"], { cwd: repo, env: findingEnv(`finding-${i}`), input: "{}" });
+    assert.equal(JSON.parse(result.stdout).decision, "block", `block ${i}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+});
+
 test("gate stops blocking after repeated infrastructure failures", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");

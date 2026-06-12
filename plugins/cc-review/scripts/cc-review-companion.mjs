@@ -15,6 +15,7 @@ const GATE_FINGERPRINT_BLOCK_LIMIT = 3;
 const GATE_TOTAL_BLOCK_LIMIT = 5;
 const GATE_INFRA_FAILURE_BLOCK_LIMIT = 2;
 const GATE_TASK_STATE_TTL_MS = 60 * 60 * 1000;
+const GATE_DEFAULT_KEY_CHAIN_GAP_MS = 10 * 60 * 1000;
 const TEXT_EXTENSIONS = new Set([
   ".c", ".cc", ".cpp", ".cs", ".css", ".go", ".h", ".hpp", ".html", ".java",
   ".js", ".jsx", ".json", ".md", ".mjs", ".py", ".rb", ".rs", ".sh", ".sql",
@@ -572,7 +573,7 @@ async function gateCommand(args) {
   assertSeverity(blockOn, "gate block_on");
   const taskKey = gateTaskKey(hookPayload);
   const state = readGateState(repo.root);
-  const taskState = freshTaskState(state.tasks[taskKey]);
+  const taskState = freshTaskState(state.tasks[taskKey], taskKey);
 
   let result;
   try {
@@ -633,13 +634,19 @@ async function gateCommand(args) {
   outputHookBlock(`cc-review needs_changes:\n${reason}`);
 }
 
-function freshTaskState(taskState) {
+function freshTaskState(taskState, taskKey) {
   const empty = { block_count: 0, fingerprint: "", total_blocks: 0, infra_failures: 0 };
   if (!taskState) return empty;
   // Abandoned stop chains (user interrupts mid-block) leave counters behind
-  // under coarse keys; expire them so later tasks are not penalized.
+  // under coarse keys; expire them so later tasks are not penalized. The
+  // default key cannot distinguish tasks at all, so it uses a short chain-gap
+  // window instead: blocks in one stop chain arrive minutes apart, while a
+  // later unrelated task deserves its own cap budget.
+  const ttl = taskKey === "default"
+    ? Number(process.env.CC_REVIEW_GATE_CHAIN_GAP_MS || GATE_DEFAULT_KEY_CHAIN_GAP_MS)
+    : GATE_TASK_STATE_TTL_MS;
   const updatedAt = Date.parse(taskState.updated_at || taskState.last_blocked_at || "");
-  if (!Number.isFinite(updatedAt) || Date.now() - updatedAt > GATE_TASK_STATE_TTL_MS) return empty;
+  if (!Number.isFinite(updatedAt) || Date.now() - updatedAt > ttl) return empty;
   return taskState;
 }
 
