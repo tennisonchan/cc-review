@@ -316,6 +316,41 @@ test("gate reuses the cached decision for an unchanged tree", () => {
   assert.deepEqual(JSON.parse(fresh.stdout), {});
 });
 
+test("gate cache misses on changes invisible to the rendered prompt", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "base\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  // Untracked file longer than the 200-line preview: edits past the preview
+  // window do not change the rendered prompt, but must change cache identity.
+  const longBody = Array.from({ length: 240 }, (_, i) => `line ${i}`);
+  writeFileSync(join(repo, "long.txt"), longBody.join("\n"));
+  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const blockingEnv = {
+    ...baseEnv,
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      decision: "needs_changes",
+      approved: false,
+      max_severity: "high",
+      needs_changes: [{ id: "tail", severity: "high", location: "long.txt:230", summary: "Issue past the preview.", required_action: "Fix." }],
+      notes: [],
+    }),
+  };
+  const first = run(["gate", "--json"], { cwd: repo, env: blockingEnv, input: '{"turn_id":"tail"}' });
+  assert.equal(JSON.parse(first.stdout).decision, "block");
+
+  // The fix lands past the preview window; the verdict must be fresh, not
+  // the cached block.
+  longBody[230] = "line 230 fixed";
+  writeFileSync(join(repo, "long.txt"), longBody.join("\n"));
+  const approvingEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", approved: true, max_severity: "info", needs_changes: [], notes: [] }) };
+  const fixed = run(["gate", "--json"], { cwd: repo, env: approvingEnv, input: '{"turn_id":"tail"}' });
+  assert.deepEqual(JSON.parse(fixed.stdout), {});
+});
+
 test("gate allows immediately on recursion sentinels", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");

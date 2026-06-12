@@ -272,8 +272,10 @@ async function runReview({ kind, args, cwd, cache = false }) {
   // The gate re-reviews every stop, but a stop that changed nothing deserves
   // the same verdict: reuse the previous decision when the review input
   // (target + guidelines) is identical, instead of paying another claude run.
+  // The hash covers target.fingerprint — full-fidelity raw inputs — not the
+  // rendered prompt, which truncates previews and would miss tail changes.
   const targetHash = createHash("sha256")
-    .update(JSON.stringify([kind, guidelines.content, target.content]))
+    .update(JSON.stringify([kind, guidelines.content, target.fingerprint]))
     .digest("hex");
   if (cache) {
     const cached = readReviewCache(repo.root, targetHash);
@@ -482,6 +484,7 @@ function collectReviewTarget(repoRoot, args) {
       base,
       empty: !stat.stdout.trim() && !diff.stdout.trim(),
       content,
+      fingerprint: targetFingerprint(["branch", base, stat.stdout, diff.stdout]),
     };
   }
 
@@ -508,7 +511,28 @@ function collectReviewTarget(repoRoot, args) {
     scope,
     empty: !status.stdout.trim() && !staged.stdout.trim() && !unstaged.stdout.trim() && !untracked.trim(),
     content,
+    fingerprint: targetFingerprint(["working-tree", status.stdout, staged.stdout, unstaged.stdout, untrackedFingerprint(repoRoot)]),
   };
+}
+
+function targetFingerprint(parts) {
+  return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+}
+
+// Full-fidelity identity for untracked content: previews shown to the
+// reviewer are capped (20 files, 200 lines), but cache identity must change
+// whenever any untracked byte does.
+function untrackedFingerprint(repoRoot) {
+  const listed = git(["ls-files", "--others", "--exclude-standard", "-z"], { cwd: repoRoot, optional: true });
+  if (!listed.stdout) return "";
+  return listed.stdout.split("\0").filter(Boolean).map((file) => {
+    try {
+      const stat = statSync(join(repoRoot, file));
+      return `${file}:${stat.size}:${stat.mtimeMs}`;
+    } catch {
+      return `${file}:unreadable`;
+    }
+  }).join("|");
 }
 
 function collectUntrackedPreviews(repoRoot) {
