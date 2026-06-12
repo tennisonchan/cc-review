@@ -83,7 +83,7 @@ process.stdin.on("end", () => {
     env: { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: fakeClaude },
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(JSON.parse(readFileSync(argvFile, "utf8")).slice(0, 5), ["-p", "--permission-mode", "plan", "--tools", ""]);
+  assert.deepEqual(JSON.parse(readFileSync(argvFile, "utf8")).slice(0, 5), ["-p", "--permission-mode", "plan", "--tools", "Read,Grep,Glob"]);
   assert.match(readFileSync(stdinFile, "utf8"), /You are Claude Code acting as a read-only reviewer/);
   assert.doesNotMatch(JSON.stringify(JSON.parse(readFileSync(argvFile, "utf8"))), /You are Claude Code/);
 });

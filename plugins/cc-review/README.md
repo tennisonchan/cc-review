@@ -13,7 +13,7 @@ cc-review --wait
 
 ## Features
 
-- Read-only Claude Code invocation using `--permission-mode plan`.
+- Read-only Claude Code invocation: plan mode plus a Read/Grep/Glob-only tool list, so the reviewer can inspect surrounding code but never modify it.
 - Project-customizable review rubric at `.claude/rules/review-guidelines.md`.
 - Structured review decisions via `--output-format json --json-schema`.
 - Working-tree and base-branch review target selection.
