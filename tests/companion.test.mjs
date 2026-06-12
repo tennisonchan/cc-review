@@ -151,7 +151,7 @@ test("enable-review-gate uses bundled Stop hook wiring", () => {
   assert.equal(action.event, "Stop");
 });
 
-test("gate blocks on high needs_changes and avoids re-entry block", () => {
+test("gate re-reviews after a block instead of allowing on stop_hook_active", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
   runGit(["add", "file.txt"], repo);
@@ -185,7 +185,135 @@ test("gate blocks on high needs_changes and avoids re-entry block", () => {
 
   const reentered = run(["gate", "--json"], { cwd: repo, env, input: '{"stop_hook_active":true}' });
   assert.equal(reentered.status, 0, reentered.stderr);
-  assert.deepEqual(JSON.parse(reentered.stdout), {});
+  assert.equal(JSON.parse(reentered.stdout).decision, "block");
+
+  const cleanEnv = { ...env, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", approved: true, max_severity: "info", needs_changes: [], notes: [] }) };
+  const fixed = run(["gate", "--json"], { cwd: repo, env: cleanEnv, input: '{"stop_hook_active":true}' });
+  assert.equal(fixed.status, 0, fixed.stderr);
+  assert.deepEqual(JSON.parse(fixed.stdout), {});
+});
+
+test("gate allows immediately on recursion sentinels", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const env = {
+    ...testEnv(repo),
+    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      decision: "needs_changes",
+      approved: false,
+      max_severity: "high",
+      needs_changes: [{ id: "blocker", severity: "high", location: "file.txt:1", summary: "Blocking issue.", required_action: "Fix it." }],
+      notes: [],
+    }),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  for (const payload of ['{"hook_active":true}', '{"cc_review_active":true}']) {
+    const result = run(["gate", "--json"], { cwd: repo, env, input: payload });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {}, payload);
+  }
+});
+
+test("gate total block ceiling bounds churning finding sets", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const findingEnv = (id) => ({
+    ...baseEnv,
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      decision: "needs_changes",
+      approved: false,
+      max_severity: "high",
+      needs_changes: [{ id, severity: "high", location: "file.txt:1", summary: `Issue ${id}.`, required_action: "Fix." }],
+      notes: [],
+    }),
+  });
+  for (let i = 0; i < 5; i += 1) {
+    const result = run(["gate", "--json"], { cwd: repo, env: findingEnv(`finding-${i}`), input: '{"turn_id":"churn"}' });
+    assert.equal(JSON.parse(result.stdout).decision, "block", `block ${i}`);
+  }
+  const capped = run(["gate", "--json"], { cwd: repo, env: findingEnv("finding-5"), input: '{"turn_id":"churn"}' });
+  const cappedParsed = JSON.parse(capped.stdout);
+  assert.equal(cappedParsed.decision, undefined);
+  assert.match(cappedParsed.systemMessage, /total block ceiling/);
+
+  // A cap allow ends the stop chain and consumes the counters, so a later
+  // unrelated task reusing the same coarse key is still gated.
+  const nextTask = run(["gate", "--json"], { cwd: repo, env: findingEnv("unrelated"), input: '{"turn_id":"churn"}' });
+  assert.equal(JSON.parse(nextTask.stdout).decision, "block");
+});
+
+test("gate default-key counters reset after the chain gap window", async () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1", CC_REVIEW_GATE_CHAIN_GAP_MS: "1" };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const findingEnv = (id) => ({
+    ...baseEnv,
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      decision: "needs_changes",
+      approved: false,
+      max_severity: "high",
+      needs_changes: [{ id, severity: "high", location: "file.txt:1", summary: `Issue ${id}.`, required_action: "Fix." }],
+      notes: [],
+    }),
+  });
+  // Six unkeyed stops separated by more than the chain gap stay independent
+  // tasks: each gets a fresh budget and blocks instead of hitting a ceiling.
+  for (let i = 0; i < 6; i += 1) {
+    const result = run(["gate", "--json"], { cwd: repo, env: findingEnv(`finding-${i}`), input: "{}" });
+    assert.equal(JSON.parse(result.stdout).decision, "block", `block ${i}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+});
+
+test("gate stops blocking after repeated infrastructure failures", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const brokenEnv = {
+    ...baseEnv,
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", approved: true, max_severity: "prose", needs_changes: [], notes: [] }),
+  };
+  for (let i = 0; i < 2; i += 1) {
+    const result = run(["gate", "--json"], { cwd: repo, env: brokenEnv, input: '{"turn_id":"infra"}' });
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.decision, "block", `block ${i}`);
+    assert.match(parsed.reason, /infrastructure failure/);
+  }
+  const released = run(["gate", "--json"], { cwd: repo, env: brokenEnv, input: '{"turn_id":"infra"}' });
+  const releasedParsed = JSON.parse(released.stdout);
+  assert.equal(releasedParsed.decision, undefined);
+  assert.match(releasedParsed.systemMessage, /could not run after 3 attempts/);
+
+  const cleanEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", approved: true, max_severity: "info", needs_changes: [], notes: [] }) };
+  const clean = run(["gate", "--json"], { cwd: repo, env: cleanEnv, input: '{"turn_id":"infra"}' });
+  assert.deepEqual(JSON.parse(clean.stdout), {});
+
+  const failsAgain = run(["gate", "--json"], { cwd: repo, env: brokenEnv, input: '{"turn_id":"infra"}' });
+  assert.equal(JSON.parse(failsAgain.stdout).decision, "block");
 });
 
 test("gate uses persisted block_on and resets after clean review", () => {

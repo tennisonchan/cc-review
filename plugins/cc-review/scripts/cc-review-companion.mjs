@@ -11,6 +11,10 @@ const SCHEMA_PATH = join(ROOT, "schemas", "review-output.schema.json");
 const TEMPLATE_GUIDELINES = join(ROOT, "templates", "review-guidelines.md");
 const SEVERITIES = ["info", "low", "medium", "high"];
 const DEFAULT_BLOCK_ON = "high";
+const GATE_FINGERPRINT_BLOCK_LIMIT = 3;
+const GATE_TOTAL_BLOCK_LIMIT = 5;
+const GATE_INFRA_FAILURE_BLOCK_LIMIT = 2;
+const GATE_CHAIN_GAP_MS = 10 * 60 * 1000;
 const TEXT_EXTENSIONS = new Set([
   ".c", ".cc", ".cpp", ".cs", ".css", ".go", ".h", ".hpp", ".html", ".java",
   ".js", ".jsx", ".json", ".md", ".mjs", ".py", ".rb", ".rs", ".sh", ".sql",
@@ -549,7 +553,10 @@ async function cancelCommand(args) {
 
 async function gateCommand(args) {
   const hookPayload = await readStdinJson();
-  if (hookPayload?.stop_hook_active || hookPayload?.hook_active || hookPayload?.cc_review_active) {
+  // Recursion sentinels: a review already in flight must not start another.
+  // stop_hook_active is deliberately NOT checked — stops that follow a block
+  // are re-reviewed so fixes get verified; the per-task counters bound them.
+  if (hookPayload?.hook_active || hookPayload?.cc_review_active) {
     outputHookAllow();
     return;
   }
@@ -563,17 +570,33 @@ async function gateCommand(args) {
 
   const blockOn = config.block_on || args.blockOn || DEFAULT_BLOCK_ON;
   assertSeverity(blockOn, "gate block_on");
+  const taskKey = gateTaskKey(hookPayload);
+  const state = readGateState(repo.root);
+  const taskState = freshTaskState(state.tasks[taskKey]);
+
   let result;
   try {
     result = await runReview({ kind: "review", args: { ...args, json: true, positional: [] }, cwd: process.cwd(), gate: true });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    outputHookBlock(`cc-review infrastructure failure: ${redact(message)}`);
+    const message = redact(error instanceof Error ? error.message : String(error));
+    taskState.infra_failures = Number(taskState.infra_failures || 0) + 1;
+    taskState.updated_at = new Date().toISOString();
+    if (taskState.infra_failures > GATE_INFRA_FAILURE_BLOCK_LIMIT) {
+      // A cap allow ends the stop chain, so consume the counters; the next
+      // stop under the same coarse key is a new task and stays gated.
+      delete state.tasks[taskKey];
+      writeGateState(repo.root, state);
+      outputHookAllow(`cc-review could not run after ${taskState.infra_failures} attempts; allowing finalization without review. Last failure:\n${message}`);
+      return;
+    }
+    state.tasks[taskKey] = taskState;
+    writeGateState(repo.root, state);
+    outputHookBlock(`cc-review infrastructure failure: ${message}`);
     return;
   }
+
+  taskState.infra_failures = 0;
   const blocking = blockingFindings(result.decision, blockOn);
-  const taskKey = gateTaskKey(hookPayload);
-  const state = readGateState(repo.root);
   if (!blocking.length) {
     delete state.tasks[taskKey];
     writeGateState(repo.root, state);
@@ -581,23 +604,46 @@ async function gateCommand(args) {
     return;
   }
 
+  // Reset the same-fingerprint count when Claude reports a different finding
+  // set; the total ceiling bounds churn when findings change on every run.
   const fingerprint = blocking.map((finding) => finding.id).sort().join("|");
-  // Reset the convergence count when Claude reports a different finding set;
-  // stable finding IDs keep repeated disagreement bounded for the same issue.
-  const taskState = state.tasks[taskKey] || { block_count: 0, fingerprint: "" };
   taskState.block_count = taskState.fingerprint === fingerprint ? Number(taskState.block_count || 0) + 1 : 1;
   taskState.fingerprint = fingerprint;
+  taskState.total_blocks = Number(taskState.total_blocks || 0) + 1;
   taskState.last_blocked_at = new Date().toISOString();
+  taskState.updated_at = taskState.last_blocked_at;
   taskState.last_findings = blocking.map((finding) => finding.id);
-  state.tasks[taskKey] = taskState;
-  writeGateState(repo.root, state);
 
   const reason = blocking.map((finding) => `[${finding.severity}] ${finding.location}: ${finding.summary}`).join("\n");
-  if (taskState.block_count > 3) {
-    outputHookAllow(`cc-review reached the three-block convergence cap. Report-only unresolved findings:\n${reason}`);
+  const cap = taskState.block_count > GATE_FINGERPRINT_BLOCK_LIMIT
+    ? "cc-review reached the three-block convergence cap."
+    : taskState.total_blocks > GATE_TOTAL_BLOCK_LIMIT
+      ? "cc-review reached the total block ceiling for this task."
+      : null;
+  if (cap) {
+    // A cap allow ends the stop chain, so consume the counters; the next
+    // stop under the same coarse key is a new task and stays gated.
+    delete state.tasks[taskKey];
+    writeGateState(repo.root, state);
+    outputHookAllow(`${cap} Report-only unresolved findings:\n${reason}`);
     return;
   }
+  state.tasks[taskKey] = taskState;
+  writeGateState(repo.root, state);
   outputHookBlock(`cc-review needs_changes:\n${reason}`);
+}
+
+function freshTaskState(taskState) {
+  const empty = { block_count: 0, fingerprint: "", total_blocks: 0, infra_failures: 0 };
+  if (!taskState) return empty;
+  // Every key is a coarse task proxy (session_id and thread_id span many
+  // tasks; the default key spans everything), so counters are scoped to the
+  // live stop chain by recency: blocks in one chain arrive minutes apart,
+  // while a later unrelated task deserves its own cap budget.
+  const gap = Number(process.env.CC_REVIEW_GATE_CHAIN_GAP_MS || GATE_CHAIN_GAP_MS);
+  const updatedAt = Date.parse(taskState.updated_at || taskState.last_blocked_at || "");
+  if (!Number.isFinite(updatedAt) || Date.now() - updatedAt > gap) return empty;
+  return taskState;
 }
 
 function blockingFindings(decision, blockOn) {

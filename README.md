@@ -68,7 +68,7 @@ Enable the blocking gate for the current repository:
 cc-review-setup --enable-review-gate
 ```
 
-The gate blocks finalization when Claude Code returns `needs_changes` at or above the configured threshold. Disable it with:
+The gate blocks finalization when Claude Code returns `needs_changes` at or above the configured threshold. Each blocked stop is re-reviewed, so fixes are verified before finalization. Loop prevention is bounded per task: three blocks for the same finding set, five blocks total, and two blocks for review infrastructure failures; past those caps the gate allows finalization and reports the unresolved findings instead. Disable it with:
 
 ```bash
 cc-review-setup --disable-review-gate
