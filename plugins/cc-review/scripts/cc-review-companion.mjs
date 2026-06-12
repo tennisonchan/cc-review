@@ -109,6 +109,7 @@ function parseArgs(argv) {
         args.background = true;
         break;
       case "--wait":
+        // Accepted for compatibility; reviews are synchronous by default.
         args.wait = true;
         break;
       case "--force":
@@ -178,7 +179,7 @@ async function setup(args) {
         action: "enable-review-gate",
         status: "unsupported",
         reason: support.reason,
-        recommendation: "Use cc-review --wait before finalization.",
+        recommendation: "Use cc-review before finalization.",
       });
     } else {
       const config = gateConfigPath(repo.root);
@@ -213,12 +214,13 @@ async function setup(args) {
 
 function initGuidelines(repoRoot, force) {
   const dest = join(repoRoot, ".claude", "rules", "review-guidelines.md");
-  if (existsSync(dest) && !force) {
+  const existed = existsSync(dest);
+  if (existed && !force) {
     return { action: "init-guidelines", status: "skipped", path: dest, reason: "already exists" };
   }
   mkdirSync(dirname(dest), { recursive: true });
   copyFileSync(TEMPLATE_GUIDELINES, dest);
-  return { action: "init-guidelines", status: existsSync(dest) ? "created_or_overwritten" : "created", path: dest };
+  return { action: "init-guidelines", status: existed ? "overwritten" : "created", path: dest };
 }
 
 async function reviewCommand(kind, args) {
@@ -227,11 +229,11 @@ async function reviewCommand(kind, args) {
     output(job, args.json, (value) => `Started cc-review job ${value.id}\nState: ${value.state}\n`);
     return;
   }
-  const result = await runReview({ kind, args, cwd: process.cwd(), gate: false });
+  const result = await runReview({ kind, args, cwd: process.cwd() });
   output(result, args.json, renderReviewResult);
 }
 
-async function runReview({ kind, args, cwd, gate }) {
+async function runReview({ kind, args, cwd }) {
   const repo = resolveWorkspace(cwd);
   const guidelines = resolveGuidelines(args.guidelines, cwd, repo.root);
   const target = collectReviewTarget(repo.root, args);
@@ -347,6 +349,9 @@ async function runClaude(prompt) {
     throw new Error(`claude structured output was not JSON: ${redact(stdout.slice(0, 500))}`);
   }
 
+  if (envelope.is_error) {
+    throw new Error(`claude reported an error: ${redact(envelope.result || envelope.subtype || "unknown")}`);
+  }
   if (!envelope.structured_output) {
     throw new Error("claude JSON envelope did not include structured_output");
   }
@@ -553,7 +558,7 @@ async function runBackgroundJob(jobPath) {
   const outcome = {};
   try {
     outcome.state = "completed";
-    outcome.result = await runReview({ kind: job.kind, args: job.args, cwd: job.cwd, gate: false });
+    outcome.result = await runReview({ kind: job.kind, args: job.args, cwd: job.cwd });
     outcome.exit_code = 0;
   } catch (error) {
     outcome.state = "failed";
@@ -586,9 +591,13 @@ async function statusCommand(args) {
   const selected = args.positional[0]
     ? jobs.filter((job) => job.id === args.positional[0])
     : args.all ? jobs : jobs.slice(0, 10);
-  output({ jobs: selected }, args.json, (value) => {
+  output({ jobs: selected, total: jobs.length }, args.json, (value) => {
     if (!value.jobs.length) return "No cc-review jobs found.\n";
-    return value.jobs.map((job) => `${job.id}\t${job.state}\t${job.updated_at}`).join("\n") + "\n";
+    const lines = value.jobs.map((job) => `${job.id}\t${job.state}\t${job.updated_at}`);
+    if (value.total > value.jobs.length) {
+      lines.push(`(showing ${value.jobs.length} of ${value.total}; use --all)`);
+    }
+    return lines.join("\n") + "\n";
   });
 }
 
@@ -667,7 +676,7 @@ async function gateCommand(args) {
 
   let result;
   try {
-    result = await runReview({ kind: "review", args: { ...args, json: true, positional: [] }, cwd: process.cwd(), gate: true });
+    result = await runReview({ kind: "review", args: { ...args, json: true, positional: [] }, cwd: process.cwd() });
   } catch (error) {
     const message = redact(error instanceof Error ? error.message : String(error));
     taskState.infra_failures = Number(taskState.infra_failures || 0) + 1;
@@ -1016,5 +1025,7 @@ async function readStdinJson() {
 function redact(text) {
   return String(text)
     .replace(/sk-[A-Za-z0-9_-]{16,}/g, "sk-REDACTED")
+    .replace(/\b(ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{16,}\b/g, "$1_REDACTED")
+    .replace(/\b(AKIA|ASIA)[0-9A-Z]{16}\b/g, "$1REDACTED")
     .replace(/(token|api[_-]?key|authorization)(=|:)\s*["']?[^"'\s]+/gi, "$1$2 REDACTED");
 }

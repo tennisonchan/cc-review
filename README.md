@@ -6,7 +6,7 @@ The core workflow is agent-first:
 
 ```bash
 cc-review-setup --init-guidelines
-cc-review --wait
+cc-review
 ```
 
 `cc-review` asks Claude Code to review local changes without editing files. Review output uses a structured `approved` / `needs_changes` decision model so Codex can decide whether to continue, fix findings, or report a blocked review.
@@ -56,7 +56,7 @@ Resolution order:
 3. `~/.claude/rules/review-guidelines.md`
 4. bundled `templates/review-guidelines.md`
 
-Guidelines tune review behavior but cannot override read-only safety.
+Guidelines tune review behavior but cannot override read-only safety: the reviewer's inability to modify files is enforced mechanically (plan mode plus a read-only tool list), not by prompt text. Note that guidelines and the reviewed diff are still prompt input, so they can influence review judgment - treat the guidelines file as trusted configuration.
 
 ## Automatic Gate
 
