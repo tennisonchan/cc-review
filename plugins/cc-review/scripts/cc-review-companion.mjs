@@ -553,6 +553,14 @@ async function cancelCommand(args) {
 
 async function gateCommand(args) {
   const hookPayload = await readStdinJson();
+  // Recursion sentinels: a review already in flight must not start another.
+  // stop_hook_active is deliberately NOT checked — stops that follow a block
+  // are re-reviewed so fixes get verified; the per-task counters bound them.
+  if (hookPayload?.hook_active || hookPayload?.cc_review_active) {
+    outputHookAllow();
+    return;
+  }
+
   const repo = resolveWorkspace();
   const config = readGateConfig(repo.root);
   if (!config?.enabled) {
@@ -560,8 +568,6 @@ async function gateCommand(args) {
     return;
   }
 
-  // Re-stops after a block (stop_hook_active) are re-reviewed on purpose so
-  // fixes get verified; the per-task counters below bound every block path.
   const blockOn = config.block_on || args.blockOn || DEFAULT_BLOCK_ON;
   assertSeverity(blockOn, "gate block_on");
   const taskKey = gateTaskKey(hookPayload);

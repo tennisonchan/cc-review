@@ -193,6 +193,32 @@ test("gate re-reviews after a block instead of allowing on stop_hook_active", ()
   assert.deepEqual(JSON.parse(fixed.stdout), {});
 });
 
+test("gate allows immediately on recursion sentinels", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const env = {
+    ...testEnv(repo),
+    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      decision: "needs_changes",
+      approved: false,
+      max_severity: "high",
+      needs_changes: [{ id: "blocker", severity: "high", location: "file.txt:1", summary: "Blocking issue.", required_action: "Fix it." }],
+      notes: [],
+    }),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  for (const payload of ['{"hook_active":true}', '{"cc_review_active":true}']) {
+    const result = run(["gate", "--json"], { cwd: repo, env, input: payload });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {}, payload);
+  }
+});
+
 test("gate total block ceiling bounds churning finding sets", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
