@@ -113,8 +113,13 @@ process.stdin.on("end", () => {
   });
   assert.equal(result.status, 0, result.stderr);
   const prompt = readFileSync(stdinFile, "utf8");
-  assert.match(prompt, /\[unstaged diff truncated: \d+ characters omitted; use Read or Grep/);
+  const marker = prompt.match(/\[unstaged diff truncated: \d+ characters omitted; the complete unstaged diff is saved at (\S+) /);
+  assert.ok(marker, "expected truncation marker with overflow path");
   assert.ok(prompt.length < 8000, `prompt unexpectedly large: ${prompt.length}`);
+  // The omitted tail stays recoverable: the overflow file holds the full diff.
+  const overflow = readFileSync(marker[1], "utf8");
+  assert.ok(overflow.length > 8000, `overflow file too small: ${overflow.length}`);
+  assert.match(overflow, /^diff --git/);
 });
 
 test("hung claude invocation times out instead of hanging the review", () => {

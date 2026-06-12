@@ -449,8 +449,29 @@ function collectUntrackedPreviews(repoRoot) {
 function truncateForPrompt(text, label) {
   const limit = Number(process.env.CC_REVIEW_MAX_DIFF_CHARS || DEFAULT_MAX_DIFF_CHARS);
   if (text.length <= limit) return text;
+  // Read/Grep cannot reconstruct the base side of omitted hunks, so the full
+  // diff is spilled to a file the reviewer can Read in chunks.
+  const overflowPath = writeOverflowFile(label, text);
   const omitted = text.length - limit;
-  return `${text.slice(0, limit)}\n[${label} truncated: ${omitted} characters omitted; use Read or Grep on the changed files for full context]`;
+  return `${text.slice(0, limit)}\n[${label} truncated: ${omitted} characters omitted; the complete ${label} is saved at ${overflowPath} — use the Read tool on that file to review the remainder]`;
+}
+
+function writeOverflowFile(label, text) {
+  const dir = join(stateRoot(), "overflow");
+  mkdirSync(dir, { recursive: true });
+  pruneOldFiles(dir);
+  const file = join(dir, `${Date.now()}-${randomUUID().slice(0, 8)}-${label.replace(/[^a-z0-9]+/gi, "-")}.diff`);
+  writeFileSync(file, text);
+  return file;
+}
+
+function pruneOldFiles(dir) {
+  for (const entry of readdirSync(dir)) {
+    try {
+      const path = join(dir, entry);
+      if (Date.now() - statSync(path).mtimeMs > 24 * 60 * 60 * 1000) rmSync(path);
+    } catch {}
+  }
 }
 
 function isProbablyText(path) {
