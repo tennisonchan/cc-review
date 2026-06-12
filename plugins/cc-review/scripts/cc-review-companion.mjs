@@ -265,6 +265,7 @@ function buildPrompt({ kind, guidelines, target, focus }) {
   return [
     "You are Claude Code acting as a read-only reviewer for Codex.",
     "Non-overridable safety: do not edit files, write files, apply patches, commit, run destructive commands, or continue into implementation.",
+    "You may use Read, Grep, and Glob to inspect surrounding code for context.",
     "Return findings only. Use the requested structured output schema exactly.",
     "",
     `Review mode: ${mode}`,
@@ -284,7 +285,9 @@ async function runClaude(prompt) {
     return { structuredOutput, resultText: "", meta: { fake: true } };
   }
 
-  const args = ["-p", "--permission-mode", "plan", "--tools", "", "--output-format", "json", "--json-schema", readFileSync(SCHEMA_PATH, "utf8")];
+  // Read-only context tools so the reviewer can see beyond the diff (the
+  // enclosing function, callers, tests); plan mode prevents writes.
+  const args = ["-p", "--permission-mode", "plan", "--tools", "Read,Grep,Glob", "--output-format", "json", "--json-schema", readFileSync(SCHEMA_PATH, "utf8")];
 
   const child = spawn(claudeBin(), args, {
     cwd: process.cwd(),
