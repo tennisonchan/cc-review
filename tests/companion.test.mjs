@@ -88,6 +88,81 @@ process.stdin.on("end", () => {
   assert.doesNotMatch(JSON.stringify(JSON.parse(readFileSync(argvFile, "utf8"))), /You are Claude Code/);
 });
 
+test("oversized diffs are truncated in the review prompt", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "small\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), `${"x".repeat(80)}\n`.repeat(100));
+  const stdinFile = join(repo, "stdin.txt");
+  const fakeClaude = join(repo, "bin", "claude-capture");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeClaude, `#!/usr/bin/env node
+const fs = require("fs");
+let input = "";
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
+  console.log(JSON.stringify({ structured_output: { decision: "approved", approved: true, max_severity: "info", needs_changes: [], notes: [] }, result: "ok" }));
+});
+`, { mode: 0o755 });
+
+  const result = run(["review"], {
+    cwd: repo,
+    env: { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: fakeClaude, CC_REVIEW_MAX_DIFF_CHARS: "500" },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const prompt = readFileSync(stdinFile, "utf8");
+  assert.match(prompt, /\[unstaged diff truncated: \d+ characters omitted; use Read or Grep/);
+  assert.ok(prompt.length < 8000, `prompt unexpectedly large: ${prompt.length}`);
+});
+
+test("hung claude invocation times out instead of hanging the review", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const fakeClaude = join(repo, "bin", "claude-hang");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeClaude, "#!/usr/bin/env sh\nsleep 30\n", { mode: 0o755 });
+
+  const result = run(["review"], {
+    cwd: repo,
+    env: { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: fakeClaude, CC_REVIEW_CLAUDE_TIMEOUT_MS: "200" },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /timed out/);
+});
+
+test("unreadable untracked files do not crash the review", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  const locked = join(repo, "locked.txt");
+  writeFileSync(locked, "secret\n", { mode: 0o000 });
+  const stdinFile = join(repo, "stdin.txt");
+  const fakeClaude = join(repo, "bin", "claude-capture");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeClaude, `#!/usr/bin/env node
+const fs = require("fs");
+let input = "";
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
+  console.log(JSON.stringify({ structured_output: { decision: "approved", approved: true, max_severity: "info", needs_changes: [], notes: [] }, result: "ok" }));
+});
+`, { mode: 0o755 });
+
+  const result = run(["review"], {
+    cwd: repo,
+    env: { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: fakeClaude },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(readFileSync(stdinFile, "utf8"), /locked\.txt\n\[unreadable; preview omitted\]/);
+});
+
 test("invalid structured severity fails closed", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");

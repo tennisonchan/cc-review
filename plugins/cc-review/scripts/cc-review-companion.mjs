@@ -15,6 +15,8 @@ const GATE_FINGERPRINT_BLOCK_LIMIT = 3;
 const GATE_TOTAL_BLOCK_LIMIT = 5;
 const GATE_INFRA_FAILURE_BLOCK_LIMIT = 2;
 const GATE_CHAIN_GAP_MS = 10 * 60 * 1000;
+const DEFAULT_MAX_DIFF_CHARS = 200 * 1000;
+const DEFAULT_CLAUDE_TIMEOUT_MS = 10 * 60 * 1000;
 const TEXT_EXTENSIONS = new Set([
   ".c", ".cc", ".cpp", ".cs", ".css", ".go", ".h", ".hpp", ".html", ".java",
   ".js", ".jsx", ".json", ".md", ".mjs", ".py", ".rb", ".rs", ".sh", ".sql",
@@ -306,10 +308,34 @@ async function runClaude(prompt) {
   });
   child.stdin.end(prompt);
 
-  const status = await new Promise((resolveStatus) => {
-    child.on("close", (code) => resolveStatus(code));
-  });
+  const timeoutMs = Number(process.env.CC_REVIEW_CLAUDE_TIMEOUT_MS || DEFAULT_CLAUDE_TIMEOUT_MS);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGTERM");
+    setTimeout(() => child.kill("SIGKILL"), 2000).unref();
+  }, timeoutMs);
+  timer.unref();
 
+  const status = await new Promise((resolveStatus) => {
+    // "close" waits for stdio to drain, which is right for the happy path,
+    // but a killed claude can leave grandchildren holding the pipes open —
+    // after a timeout, the process exit is all we need.
+    child.on("close", (code) => resolveStatus(code));
+    child.on("exit", (code) => {
+      if (timedOut) {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.stdin.destroy();
+        resolveStatus(code);
+      }
+    });
+  });
+  clearTimeout(timer);
+
+  if (timedOut) {
+    throw new Error(`claude review timed out after ${Math.round(timeoutMs / 1000)}s`);
+  }
   if (status !== 0) {
     throw new Error(`claude review failed with exit ${status}: ${redact(stderr || stdout)}`);
   }
@@ -360,7 +386,7 @@ function collectReviewTarget(repoRoot, args) {
       stat.stdout,
       "",
       "diff:",
-      diff.stdout,
+      truncateForPrompt(diff.stdout, "diff"),
     ].join("\n");
     return {
       scope,
@@ -381,10 +407,10 @@ function collectReviewTarget(repoRoot, args) {
     status.stdout,
     "",
     "staged diff:",
-    staged.stdout,
+    truncateForPrompt(staged.stdout, "staged diff"),
     "",
     "unstaged diff:",
-    unstaged.stdout,
+    truncateForPrompt(unstaged.stdout, "unstaged diff"),
     "",
     "untracked file previews:",
     untracked,
@@ -404,7 +430,12 @@ function collectUntrackedPreviews(repoRoot) {
   const previews = files.map((file) => {
     const full = join(repoRoot, file);
     if (!isProbablyText(full)) return `--- ${file}\n[binary or unsupported preview omitted]`;
-    const lines = readFileSync(full, "utf8").split("\n");
+    let lines;
+    try {
+      lines = readFileSync(full, "utf8").split("\n");
+    } catch {
+      return `--- ${file}\n[unreadable; preview omitted]`;
+    }
     const content = lines.slice(0, 200).join("\n");
     const suffix = lines.length > 200 ? "\n[preview truncated after 200 lines]" : "";
     return `--- ${file}\n${content}${suffix}`;
@@ -413,6 +444,13 @@ function collectUntrackedPreviews(repoRoot) {
     previews.push(`[untracked preview truncated: ${allFiles.length - files.length} additional files omitted]`);
   }
   return previews.join("\n\n");
+}
+
+function truncateForPrompt(text, label) {
+  const limit = Number(process.env.CC_REVIEW_MAX_DIFF_CHARS || DEFAULT_MAX_DIFF_CHARS);
+  if (text.length <= limit) return text;
+  const omitted = text.length - limit;
+  return `${text.slice(0, limit)}\n[${label} truncated: ${omitted} characters omitted; use Read or Grep on the changed files for full context]`;
 }
 
 function isProbablyText(path) {
@@ -862,7 +900,13 @@ function checkCommand(command, args) {
 }
 
 function git(args, { cwd, optional = false } = {}) {
-  const result = spawnSync("git", args, { cwd, encoding: "utf8", maxBuffer: 20 * 1024 * 1024 });
+  const result = spawnSync("git", args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  // Spawn errors (ENOBUFS on a giant diff, ENOENT) must throw even for
+  // optional calls: treating truncated output as "no changes" would let the
+  // gate approve a review target it never saw.
+  if (result.error) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.error.message}`);
+  }
   if (result.status !== 0 && !optional) {
     throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
   }
