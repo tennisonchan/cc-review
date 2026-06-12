@@ -283,6 +283,15 @@ function buildPrompt({ kind, guidelines, target, focus }) {
   ].filter(Boolean).join("\n");
 }
 
+function loadReviewSchema() {
+  // claude --json-schema silently skips structured output when the schema
+  // carries a $schema meta key (observed on 2.1.176: subtype "success", no
+  // structured_output field), so strip it before passing the schema along.
+  const schema = JSON.parse(readFileSync(SCHEMA_PATH, "utf8"));
+  delete schema.$schema;
+  return JSON.stringify(schema);
+}
+
 async function runClaude(prompt) {
   if (process.env.CC_REVIEW_FAKE_STRUCTURED_OUTPUT) {
     const structuredOutput = JSON.parse(process.env.CC_REVIEW_FAKE_STRUCTURED_OUTPUT);
@@ -291,7 +300,7 @@ async function runClaude(prompt) {
 
   // Read-only context tools so the reviewer can see beyond the diff (the
   // enclosing function, callers, tests); plan mode prevents writes.
-  const args = ["-p", "--permission-mode", "plan", "--tools", "Read,Grep,Glob", "--output-format", "json", "--json-schema", readFileSync(SCHEMA_PATH, "utf8")];
+  const args = ["-p", "--permission-mode", "plan", "--tools", "Read,Grep,Glob", "--output-format", "json", "--json-schema", loadReviewSchema()];
 
   const child = spawn(claudeBin(), args, {
     cwd: process.cwd(),
