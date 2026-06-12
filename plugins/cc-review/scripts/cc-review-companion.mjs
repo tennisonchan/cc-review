@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, copyFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, copyFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -522,26 +522,26 @@ async function startBackgroundReview(kind, args) {
   const dir = jobsDir(repo.root);
   mkdirSync(dir, { recursive: true });
   const jobPath = join(dir, `${id}.json`);
-  const job = {
-    id,
-    kind,
-    cwd: process.cwd(),
-    args,
-    state: "queued",
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    pid: null,
-  };
-  writeJson(jobPath, job);
 
+  // Each writer owns one phase, so the writes cannot race: the parent writes
+  // the initial record (pid included) once, the child writes only terminal
+  // states, and it cannot reach them before this record exists because its
+  // first step is reading it.
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "__run-job", jobPath], {
     cwd: process.cwd(),
     detached: true,
     stdio: "ignore",
   });
-  job.pid = child.pid;
-  job.state = "running";
-  job.updated_at = new Date().toISOString();
+  const job = {
+    id,
+    kind,
+    cwd: process.cwd(),
+    args,
+    state: "running",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    pid: child.pid,
+  };
   writeJson(jobPath, job);
   child.unref();
   return job;
@@ -549,23 +549,35 @@ async function startBackgroundReview(kind, args) {
 
 async function runBackgroundJob(jobPath) {
   if (!jobPath) throw new Error("__run-job requires a job path");
-  const job = readJson(jobPath);
-  job.state = "running";
-  job.updated_at = new Date().toISOString();
-  writeJson(jobPath, job);
+  const job = await readJobWithRetry(jobPath);
+  const outcome = {};
   try {
-    const result = await runReview({ kind: job.kind, args: job.args, cwd: job.cwd, gate: false });
-    job.state = "completed";
-    job.result = result;
-    job.exit_code = 0;
+    outcome.state = "completed";
+    outcome.result = await runReview({ kind: job.kind, args: job.args, cwd: job.cwd, gate: false });
+    outcome.exit_code = 0;
   } catch (error) {
-    job.state = "failed";
-    job.error = error instanceof Error ? error.message : String(error);
-    job.exit_code = 1;
+    outcome.state = "failed";
+    outcome.error = error instanceof Error ? error.message : String(error);
+    outcome.exit_code = 1;
   }
-  job.completed_at = new Date().toISOString();
-  job.updated_at = job.completed_at;
-  writeJson(jobPath, job);
+  // Merge onto the latest record, and never resurrect a cancelled job.
+  const latest = existsSync(jobPath) ? readJson(jobPath) : job;
+  if (latest.state === "cancelled") return;
+  Object.assign(latest, outcome);
+  latest.completed_at = new Date().toISOString();
+  latest.updated_at = latest.completed_at;
+  writeJson(jobPath, latest);
+}
+
+async function readJobWithRetry(jobPath) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      return readJson(jobPath);
+    } catch {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    }
+  }
+  throw new Error(`job file never appeared: ${jobPath}`);
 }
 
 async function statusCommand(args) {
@@ -600,14 +612,31 @@ async function cancelCommand(args) {
   const id = args.positional[0] || jobs.find((job) => job.state === "running")?.id;
   if (!id) throw new Error("no job id provided and no running job found");
   const jobPath = join(jobsDir(repo.root), `${id}.json`);
-  const job = readJson(jobPath);
+  let job = readJson(jobPath);
+  if (["completed", "failed", "cancelled"].includes(job.state)) {
+    output(job, args.json, (value) => `Job ${value.id} is already ${value.state}; nothing to cancel.\n`);
+    return;
+  }
+
+  let escalated = false;
   if (job.pid) {
     signalProcessTree(job.pid, "SIGTERM");
     await new Promise((resolveWait) => setTimeout(resolveWait, Number(process.env.CC_REVIEW_CANCEL_GRACE_MS || 500)));
-    signalProcessTree(job.pid, "SIGKILL");
-    job.kill_escalated = true;
+    if (isProcessTreeAlive(job.pid)) {
+      signalProcessTree(job.pid, "SIGKILL");
+      escalated = true;
+    }
+  }
+
+  // The job may have finished between the read and the kill; keep a terminal
+  // result written by the child rather than overwriting it.
+  job = readJson(jobPath);
+  if (["completed", "failed"].includes(job.state)) {
+    output(job, args.json, (value) => `Job ${value.id} ${value.state} before cancellation took effect.\n`);
+    return;
   }
   job.state = "cancelled";
+  if (escalated) job.kill_escalated = true;
   job.updated_at = new Date().toISOString();
   writeJson(jobPath, job);
   output(job, args.json, (value) => `Cancelled ${value.id}.\n`);
@@ -811,6 +840,22 @@ function signalProcessTree(pid, signal) {
   }
 }
 
+function isProcessTreeAlive(pid) {
+  // Signal 0 probes for existence; check the group first so a surviving
+  // grandchild (e.g. a claude that ignores SIGTERM) still counts as alive.
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
 function renderSetup(value) {
   const lines = [];
   lines.push(`Node: ${value.checks.node.ok ? value.checks.node.stdout.trim() : "missing"}`);
@@ -944,7 +989,11 @@ function readJson(path) {
 
 function writeJson(path, value) {
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
+  // Write-then-rename so concurrent readers (status/result/cancel) never see
+  // a torn file, e.g. when a kill lands mid-write.
+  const tmp = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
+  renameSync(tmp, path);
 }
 
 async function readStdinJson() {

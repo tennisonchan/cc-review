@@ -507,7 +507,59 @@ test("background review job can be started, listed, and read", async () => {
 
   const result = run(["result", job.id, "--json"], { cwd: repo, env });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).state, "completed");
+  const completed = JSON.parse(result.stdout);
+  assert.equal(completed.state, "completed");
+  assert.equal(typeof completed.pid, "number");
+});
+
+test("cancel of a completed job preserves the result", async () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const env = {
+    ...testEnv(repo),
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", approved: true, max_severity: "info", needs_changes: [], notes: [] }),
+  };
+  const started = run(["review", "--background", "--json"], { cwd: repo, env });
+  const job = JSON.parse(started.stdout);
+  await waitFor(() => {
+    const status = run(["status", job.id, "--json"], { cwd: repo, env });
+    return JSON.parse(status.stdout).jobs[0]?.state === "completed";
+  });
+  const cancelled = run(["cancel", job.id, "--json"], { cwd: repo, env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.equal(JSON.parse(cancelled.stdout).state, "completed");
+  const result = run(["result", job.id, "--json"], { cwd: repo, env });
+  assert.equal(JSON.parse(result.stdout).result.decision.approved, true);
+});
+
+test("graceful cancel does not report kill escalation", async () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const fakeClaude = join(repo, "bin", "claude-sleep");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeClaude, `#!/usr/bin/env sh
+if [ "$1" = "--version" ]; then echo "2.1.167 (Claude Code)"; exit 0; fi
+if [ "$1" = "auth" ]; then echo "ok"; exit 0; fi
+sleep 10
+`, { mode: 0o755 });
+  const env = { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: fakeClaude, CC_REVIEW_CANCEL_GRACE_MS: "300" };
+  const started = run(["review", "--background", "--json"], { cwd: repo, env });
+  const job = JSON.parse(started.stdout);
+  await waitFor(() => {
+    const status = run(["status", job.id, "--json"], { cwd: repo, env });
+    return JSON.parse(status.stdout).jobs[0]?.state === "running";
+  });
+  const cancelled = run(["cancel", job.id, "--json"], { cwd: repo, env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  const parsed = JSON.parse(cancelled.stdout);
+  assert.equal(parsed.state, "cancelled");
+  assert.equal(parsed.kill_escalated, undefined);
 });
 
 test("cancel escalates when a background review ignores SIGTERM", async () => {
@@ -522,13 +574,14 @@ test("cancel escalates when a background review ignores SIGTERM", async () => {
 if [ "$1" = "--version" ]; then echo "2.1.167 (Claude Code)"; exit 0; fi
 if [ "$1" = "auth" ]; then echo "ok"; exit 0; fi
 trap '' TERM
-sleep 10
-echo '{"structured_output":{"decision":"approved","approved":true,"max_severity":"info","needs_changes":[],"notes":[]},"result":"ok"}'
+: > started.marker
+while :; do sleep 1; done
 `, { mode: 0o755 });
   const env = { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: fakeClaude, CC_REVIEW_CANCEL_GRACE_MS: "50" };
   const started = run(["review", "--background", "--json"], { cwd: repo, env });
   assert.equal(started.status, 0, started.stderr);
   const job = JSON.parse(started.stdout);
+  await waitFor(() => existsSync(join(repo, "started.marker")));
   const cancelled = run(["cancel", job.id, "--json"], { cwd: repo, env });
   assert.equal(cancelled.status, 0, cancelled.stderr);
   assert.equal(JSON.parse(cancelled.stdout).state, "cancelled");
