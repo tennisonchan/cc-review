@@ -221,6 +221,11 @@ test("gate total block ceiling bounds churning finding sets", () => {
   const cappedParsed = JSON.parse(capped.stdout);
   assert.equal(cappedParsed.decision, undefined);
   assert.match(cappedParsed.systemMessage, /total block ceiling/);
+
+  // A cap allow ends the stop chain and consumes the counters, so a later
+  // unrelated task reusing the same coarse key is still gated.
+  const nextTask = run(["gate", "--json"], { cwd: repo, env: findingEnv("unrelated"), input: '{"turn_id":"churn"}' });
+  assert.equal(JSON.parse(nextTask.stdout).decision, "block");
 });
 
 test("gate stops blocking after repeated infrastructure failures", () => {
