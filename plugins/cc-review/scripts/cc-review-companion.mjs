@@ -198,6 +198,7 @@ async function setup(args) {
         // Stored only when explicitly chosen; otherwise the guidelines
         // policy block (or the built-in default) decides the threshold.
         block_on: args.blockOn || null,
+        block_on_explicit: Boolean(args.blockOn),
         installed_at: new Date().toISOString(),
         companion: fileURLToPath(import.meta.url),
       };
@@ -793,10 +794,15 @@ async function gateCommand(args) {
     return;
   }
 
-  // Threshold precedence: explicit per-repo setup choice, then the
-  // guidelines policy block, then the built-in default. The policy is
-  // resolved after the review runs, since the guidelines come with it.
-  const configuredBlockOn = config.block_on || args.blockOn || null;
+  // Base-threshold precedence: explicit per-repo setup choice, then the
+  // guidelines policy block, then the built-in default; category overrides
+  // from the guidelines always apply. Legacy configs (pre-policy) stored the
+  // default unconditionally, so without the explicit marker only a
+  // non-default value counts as a choice.
+  const explicitConfigBlockOn = config.block_on_explicit
+    ? config.block_on
+    : (config.block_on && config.block_on !== DEFAULT_BLOCK_ON ? config.block_on : null);
+  const configuredBlockOn = explicitConfigBlockOn || args.blockOn || null;
   if (configuredBlockOn) assertSeverity(configuredBlockOn, "gate block_on");
   const taskKey = gateTaskKey(hookPayload);
   const state = readGateState(repo.root);

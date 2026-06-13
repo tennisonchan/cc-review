@@ -600,6 +600,80 @@ test("explicit setup block_on overrides the guidelines policy", () => {
   assert.equal(JSON.parse(blocked.stdout).decision, "block");
 });
 
+test("category overrides apply on top of an explicit block_on base", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+
+\`\`\`json cc-review
+{ "block_on": "low", "category_block_on": { "security": "medium" } }
+\`\`\`
+`);
+  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  // Explicit high base overrides the policy's low base...
+  const setup = run(["setup", "--enable-review-gate", "--block-on", "high", "--json"], { cwd: repo, env: baseEnv });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const mediumSecurityEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+    decision: "needs_changes",
+    approved: false,
+    max_severity: "medium",
+    needs_changes: [
+      { id: "sec", severity: "medium", category: "security", location: "file.txt:1", summary: "Leaky.", required_action: "Fix." },
+      { id: "plain", severity: "medium", location: "file.txt:2", summary: "Meh.", required_action: "Fix." },
+    ],
+    notes: [],
+  }) };
+  // ...but the category override still blocks the medium security finding,
+  // while the uncategorized medium finding is held to the explicit high base.
+  const blocked = run(["gate", "--json"], { cwd: repo, env: mediumSecurityEnv, input: '{"turn_id":"mix"}' });
+  const parsed = JSON.parse(blocked.stdout);
+  assert.equal(parsed.decision, "block");
+  assert.match(parsed.reason, /Leaky/);
+  assert.doesNotMatch(parsed.reason, /Meh/);
+});
+
+test("legacy gate config default does not shadow the guidelines policy", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+
+\`\`\`json cc-review
+{ "block_on": "medium" }
+\`\`\`
+`);
+  const env = {
+    ...testEnv(repo),
+    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      decision: "needs_changes",
+      approved: false,
+      max_severity: "medium",
+      needs_changes: [{ id: "m", severity: "medium", location: "file.txt:1", summary: "Medium issue.", required_action: "Fix." }],
+      notes: [],
+    }),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  // Simulate a pre-policy config: block_on stored unconditionally, no marker.
+  const configPath = JSON.parse(setup.stdout).actions.find((item) => item.action === "enable-review-gate").path;
+  const legacy = JSON.parse(readFileSync(configPath, "utf8"));
+  legacy.block_on = "high";
+  delete legacy.block_on_explicit;
+  writeFileSync(configPath, JSON.stringify(legacy));
+
+  const blocked = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"legacy"}' });
+  assert.equal(JSON.parse(blocked.stdout).decision, "block");
+});
+
 test("malformed guidelines policy fails closed at the gate", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
