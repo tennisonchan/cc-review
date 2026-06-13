@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, copyFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync, copyFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,11 +42,24 @@ const TEST_MARKERS = [
   { pattern: /(^|\/)test_[^/]+\.py$/, label: "pytest test_ files" },
 ];
 
-main(process.argv.slice(2)).catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`cc-review: ${message}`);
-  process.exitCode = 1;
-});
+// Auto-run only when executed directly (node cc-review-companion.mjs ...);
+// the bin alias wrappers import runMain and prepend their subcommand.
+const invokedDirectly = (() => {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+})();
+if (invokedDirectly) runMain(process.argv.slice(2));
+
+export function runMain(argv) {
+  main(argv).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`cc-review: ${message}`);
+    process.exitCode = 1;
+  });
+}
 
 async function main(argv) {
   const [command, ...rest] = argv;

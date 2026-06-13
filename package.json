@@ -9,7 +9,13 @@
     "node": ">=18.18.0"
   },
   "bin": {
-    "cc-review-companion": "./plugins/cc-review/scripts/cc-review-companion.mjs"
+    "cc-review-companion": "./plugins/cc-review/scripts/cc-review-companion.mjs",
+    "cc-review": "./plugins/cc-review/scripts/bin/cc-review.mjs",
+    "cc-review-setup": "./plugins/cc-review/scripts/bin/cc-review-setup.mjs",
+    "cc-review-status": "./plugins/cc-review/scripts/bin/cc-review-status.mjs",
+    "cc-review-result": "./plugins/cc-review/scripts/bin/cc-review-result.mjs",
+    "cc-review-cancel": "./plugins/cc-review/scripts/bin/cc-review-cancel.mjs",
+    "cc-adversarial-review": "./plugins/cc-review/scripts/bin/cc-adversarial-review.mjs"
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",

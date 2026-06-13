@@ -41,6 +41,13 @@ codex plugin marketplace add .agents/plugins
 codex plugin add cc-review@cc-review
 ```
 
+Inside Codex, `cc-review`, `cc-review-setup`, and the other commands are plugin skills — ask the agent to run them. To use the same commands from your own shell, install the binaries globally:
+
+```bash
+npm install -g github:tennisonchan/cc-review
+cc-review-setup --init-guidelines
+```
+
 ## Review Guidelines
 
 Initialize project guidelines:
