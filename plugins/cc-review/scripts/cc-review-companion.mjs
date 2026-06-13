@@ -96,6 +96,8 @@ function parseArgs(argv) {
     wait: false,
     enableReviewGate: false,
     disableReviewGate: false,
+    enableGateDebug: false,
+    disableGateDebug: false,
     positional: [],
   };
 
@@ -126,6 +128,12 @@ function parseArgs(argv) {
         break;
       case "--disable-review-gate":
         args.disableReviewGate = true;
+        break;
+      case "--enable-gate-debug":
+        args.enableGateDebug = true;
+        break;
+      case "--disable-gate-debug":
+        args.disableGateDebug = true;
         break;
       case "--base":
       case "--guidelines":
@@ -203,6 +211,18 @@ async function setup(args) {
     }
   }
 
+  if (args.enableGateDebug || args.disableGateDebug) {
+    const configPath = gateConfigPath(repo.root);
+    const config = existsSync(configPath) ? readJson(configPath) : {};
+    config.debug = Boolean(args.enableGateDebug);
+    writeJson(configPath, config);
+    actions.push({
+      action: args.enableGateDebug ? "enable-gate-debug" : "disable-gate-debug",
+      status: config.debug ? "enabled" : "disabled",
+      log: gateDebugLogPath(repo.root),
+    });
+  }
+
   const result = {
     ok: checks.node.ok && checks.claude.ok,
     repo: repo.root,
@@ -233,7 +253,7 @@ async function reviewCommand(kind, args) {
   output(result, args.json, renderReviewResult);
 }
 
-async function runReview({ kind, args, cwd }) {
+async function runReview({ kind, args, cwd, cache = false }) {
   const repo = resolveWorkspace(cwd);
   const guidelines = resolveGuidelines(args.guidelines, cwd, repo.root);
   const target = collectReviewTarget(repo.root, args);
@@ -249,10 +269,42 @@ async function runReview({ kind, args, cwd }) {
     };
   }
 
+  // The gate re-reviews every stop, but a stop that changed nothing deserves
+  // the same verdict: reuse the previous decision when the review input
+  // (target + guidelines) is identical, instead of paying another claude run.
+  // The hash covers target.fingerprint — full-fidelity raw inputs — not the
+  // rendered prompt, which truncates previews and would miss tail changes.
+  const targetHash = createHash("sha256")
+    .update(JSON.stringify([kind, guidelines.content, target.fingerprint]))
+    .digest("hex");
+  if (cache) {
+    const cached = readReviewCache(repo.root, targetHash);
+    if (cached) {
+      return {
+        ok: cached.decision.approved,
+        repo: repo.root,
+        guidelines,
+        target,
+        decision: cached.decision,
+        raw: cached.raw || "",
+        claude: { ...(cached.meta || {}), cached: true },
+      };
+    }
+  }
+
   const focus = kind === "adversarial-review" ? args.positional.join(" ").trim() : "";
   const prompt = buildPrompt({ kind, guidelines, target, focus });
   const claude = await runClaude(prompt);
   const decision = validateDecision(claude.structuredOutput);
+  if (cache) {
+    writeJson(reviewCachePath(repo.root), {
+      target_hash: targetHash,
+      decision,
+      raw: claude.resultText,
+      meta: claude.meta,
+      created_at: new Date().toISOString(),
+    });
+  }
   return {
     ok: decision.approved,
     repo: repo.root,
@@ -262,6 +314,31 @@ async function runReview({ kind, args, cwd }) {
     raw: claude.resultText,
     claude: claude.meta,
   };
+}
+
+function readReviewCache(repoRoot, targetHash) {
+  const path = reviewCachePath(repoRoot);
+  if (!existsSync(path)) return null;
+  let cached;
+  try {
+    cached = readJson(path);
+  } catch {
+    return null;
+  }
+  if (cached.target_hash !== targetHash) return null;
+  const ttl = Number(process.env.CC_REVIEW_GATE_CHAIN_GAP_MS || GATE_CHAIN_GAP_MS);
+  const createdAt = Date.parse(cached.created_at || "");
+  if (!Number.isFinite(createdAt) || Date.now() - createdAt > ttl) return null;
+  try {
+    validateDecision(cached.decision);
+  } catch {
+    return null;
+  }
+  return cached;
+}
+
+function reviewCachePath(repoRoot) {
+  return join(stateRoot(), "review-cache", `${repoHash(repoRoot)}.json`);
 }
 
 function buildPrompt({ kind, guidelines, target, focus }) {
@@ -407,6 +484,7 @@ function collectReviewTarget(repoRoot, args) {
       base,
       empty: !stat.stdout.trim() && !diff.stdout.trim(),
       content,
+      fingerprint: targetFingerprint(["branch", base, stat.stdout, diff.stdout]),
     };
   }
 
@@ -433,7 +511,34 @@ function collectReviewTarget(repoRoot, args) {
     scope,
     empty: !status.stdout.trim() && !staged.stdout.trim() && !unstaged.stdout.trim() && !untracked.trim(),
     content,
+    fingerprint: targetFingerprint(["working-tree", status.stdout, staged.stdout, unstaged.stdout, untrackedFingerprint(repoRoot)]),
   };
+}
+
+function targetFingerprint(parts) {
+  return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+}
+
+// Full-fidelity identity for untracked content: previews shown to the
+// reviewer are capped (20 files, 200 lines), but cache identity must change
+// whenever any untracked byte does, so contents are hashed. Files too large
+// to hash cheaply fall back to stat identity — at that size they are almost
+// certainly artifacts, and a timestamp-preserving in-place edit is the only
+// blind spot.
+function untrackedFingerprint(repoRoot) {
+  const listed = git(["ls-files", "--others", "--exclude-standard", "-z"], { cwd: repoRoot, optional: true });
+  if (!listed.stdout) return "";
+  return listed.stdout.split("\0").filter(Boolean).map((file) => {
+    const full = join(repoRoot, file);
+    try {
+      const stat = statSync(full);
+      if (!stat.isFile()) return `${file}:nonfile`;
+      if (stat.size > 16 * 1024 * 1024) return `${file}:large:${stat.size}:${stat.mtimeMs}`;
+      return `${file}:${createHash("sha256").update(readFileSync(full)).digest("hex")}`;
+    } catch {
+      return `${file}:unreadable`;
+    }
+  }).join("|");
 }
 
 function collectUntrackedPreviews(repoRoot) {
@@ -662,6 +767,16 @@ async function cancelCommand(args) {
 
 async function gateCommand(args) {
   const hookPayload = await readStdinJson();
+  const repo = resolveWorkspace();
+  const config = readGateConfig(repo.root);
+  if (config?.debug) {
+    try {
+      const logPath = gateDebugLogPath(repo.root);
+      mkdirSync(dirname(logPath), { recursive: true });
+      writeFileSync(logPath, `${JSON.stringify({ ts: new Date().toISOString(), cwd: process.cwd(), payload: hookPayload })}\n`, { flag: "a" });
+    } catch {}
+  }
+
   // Recursion sentinels: a review already in flight must not start another.
   // stop_hook_active is deliberately NOT checked — stops that follow a block
   // are re-reviewed so fixes get verified; the per-task counters bound them.
@@ -670,8 +785,6 @@ async function gateCommand(args) {
     return;
   }
 
-  const repo = resolveWorkspace();
-  const config = readGateConfig(repo.root);
   if (!config?.enabled) {
     outputHookAllow();
     return;
@@ -685,7 +798,7 @@ async function gateCommand(args) {
 
   let result;
   try {
-    result = await runReview({ kind: "review", args: { ...args, json: true, positional: [] }, cwd: process.cwd() });
+    result = await runReview({ kind: "review", args: { ...args, json: true, positional: [] }, cwd: process.cwd(), cache: true });
   } catch (error) {
     const message = redact(error instanceof Error ? error.message : String(error));
     taskState.infra_failures = Number(taskState.infra_failures || 0) + 1;
@@ -895,6 +1008,9 @@ function renderSetup(value) {
       }
     }
     if (action.action === "disable-review-gate") lines.push(`Review gate disabled: ${action.path}`);
+    if (action.action === "enable-gate-debug" || action.action === "disable-gate-debug") {
+      lines.push(`Gate debug ${action.status}: ${action.log}`);
+    }
   }
   return lines.join("\n") + "\n";
 }
@@ -959,6 +1075,10 @@ function jobsDir(repoRoot) {
 
 function gateConfigPath(repoRoot) {
   return join(stateRoot(), "gates", `${repoHash(repoRoot)}.json`);
+}
+
+function gateDebugLogPath(repoRoot) {
+  return join(stateRoot(), "debug", `${repoHash(repoRoot)}.jsonl`);
 }
 
 function gateStatePath(repoRoot) {

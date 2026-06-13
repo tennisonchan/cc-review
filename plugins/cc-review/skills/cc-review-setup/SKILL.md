@@ -21,5 +21,7 @@ Supported arguments:
 - `--enable-review-gate`
 - `--disable-review-gate`
 - `--block-on info|low|medium|high`
+- `--enable-gate-debug`
+- `--disable-gate-debug`
 
 Do not ask Claude Code to edit files. Setup only checks local prerequisites, initializes guidelines when requested, and configures the conditional gate when the current Codex hook surface supports it.
