@@ -73,6 +73,11 @@ async function main(argv) {
     return;
   }
 
+  if (rest.includes("--help") || rest.includes("-h")) {
+    printSubcommandHelp(command);
+    return;
+  }
+
   const args = parseArgs(rest);
   switch (command) {
     case "setup":
@@ -111,7 +116,28 @@ Subcommands:
   status
   result
   cancel
-  gate`);
+  gate
+
+Run "<subcommand> --help" for subcommand options.`);
+}
+
+const SUBCOMMAND_HELP = {
+  setup: "setup [--init-guidelines] [--force] [--enable-review-gate] [--disable-review-gate] [--block-on info|low|medium|high] [--enable-gate-debug] [--disable-gate-debug] [--json]",
+  review: "review [--background] [--base <ref>] [--scope auto|working-tree|branch] [--guidelines <path>] [--json]",
+  "adversarial-review": "adversarial-review [--background] [--base <ref>] [--scope auto|working-tree|branch] [--guidelines <path>] [--json] [focus text...]",
+  status: "status [job-id] [--all] [--json]",
+  result: "result [job-id] [--json]",
+  cancel: "cancel [job-id] [--json]",
+  gate: "gate [--json]  (internal: reads the host Stop-hook payload from stdin)",
+};
+
+function printSubcommandHelp(command) {
+  const usage = SUBCOMMAND_HELP[command];
+  if (!usage) {
+    printHelp();
+    return;
+  }
+  console.log(`Usage: cc-review-companion ${usage}`);
 }
 
 function parseArgs(argv) {

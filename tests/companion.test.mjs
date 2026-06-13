@@ -1012,6 +1012,21 @@ test("bin aliases dispatch to their subcommand", () => {
   assert.equal(JSON.parse(review.stdout).decision.approved, true);
 });
 
+test("alias --help prints usage instead of running the subcommand", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const reviewBin = new URL("../plugins/cc-review/scripts/bin/cc-review.mjs", import.meta.url).pathname;
+  // A fake claude that fails loudly, so a real review attempt would be visible.
+  const env = { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: "/bin/false" };
+  const result = spawnSync(process.execPath, [reviewBin, "--help"], { cwd: repo, env, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Usage: cc-review-companion review/);
+  assert.doesNotMatch(result.stdout, /Decision:/);
+});
+
 test("package bin map covers the documented commands", () => {
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   for (const name of ["cc-review", "cc-review-setup", "cc-review-status", "cc-review-result", "cc-review-cancel", "cc-adversarial-review", "cc-review-companion"]) {
