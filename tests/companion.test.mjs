@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -344,8 +344,12 @@ test("gate cache misses on changes invisible to the rendered prompt", () => {
 
   // The fix lands past the preview window; the verdict must be fresh, not
   // the cached block.
-  longBody[230] = "line 230 fixed";
+  // Same-length edit with the original timestamps restored: only the bytes
+  // differ, so content hashing is the only thing that can catch it.
+  const before = statSync(join(repo, "long.txt"));
+  longBody[230] = "LINE 230";
   writeFileSync(join(repo, "long.txt"), longBody.join("\n"));
+  utimesSync(join(repo, "long.txt"), before.atime, before.mtime);
   const approvingEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", approved: true, max_severity: "info", needs_changes: [], notes: [] }) };
   const fixed = run(["gate", "--json"], { cwd: repo, env: approvingEnv, input: '{"turn_id":"tail"}' });
   assert.deepEqual(JSON.parse(fixed.stdout), {});

@@ -521,14 +521,20 @@ function targetFingerprint(parts) {
 
 // Full-fidelity identity for untracked content: previews shown to the
 // reviewer are capped (20 files, 200 lines), but cache identity must change
-// whenever any untracked byte does.
+// whenever any untracked byte does, so contents are hashed. Files too large
+// to hash cheaply fall back to stat identity — at that size they are almost
+// certainly artifacts, and a timestamp-preserving in-place edit is the only
+// blind spot.
 function untrackedFingerprint(repoRoot) {
   const listed = git(["ls-files", "--others", "--exclude-standard", "-z"], { cwd: repoRoot, optional: true });
   if (!listed.stdout) return "";
   return listed.stdout.split("\0").filter(Boolean).map((file) => {
+    const full = join(repoRoot, file);
     try {
-      const stat = statSync(join(repoRoot, file));
-      return `${file}:${stat.size}:${stat.mtimeMs}`;
+      const stat = statSync(full);
+      if (!stat.isFile()) return `${file}:nonfile`;
+      if (stat.size > 16 * 1024 * 1024) return `${file}:large:${stat.size}:${stat.mtimeMs}`;
+      return `${file}:${createHash("sha256").update(readFileSync(full)).digest("hex")}`;
     } catch {
       return `${file}:unreadable`;
     }
