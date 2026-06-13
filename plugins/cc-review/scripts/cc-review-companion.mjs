@@ -22,6 +22,25 @@ const TEXT_EXTENSIONS = new Set([
   ".js", ".jsx", ".json", ".md", ".mjs", ".py", ".rb", ".rs", ".sh", ".sql",
   ".ts", ".tsx", ".txt", ".yaml", ".yml", ".toml", ".xml",
 ]);
+const LANGUAGE_PROFILES = {
+  ".ts": { name: "TypeScript", focus: "unhandled promise rejections, missing await, any-typed escape hatches, unvalidated input at API boundaries" },
+  ".tsx": { name: "TypeScript (React)", focus: "effect dependency mistakes, state updates after unmount, unkeyed lists" },
+  ".js": { name: "JavaScript", focus: "unhandled promise rejections, missing await, loose equality on user input" },
+  ".jsx": { name: "JavaScript (React)", focus: "effect dependency mistakes, state updates after unmount, unkeyed lists" },
+  ".mjs": { name: "JavaScript (ESM)", focus: "unhandled promise rejections, missing await, loose equality on user input" },
+  ".py": { name: "Python", focus: "mutable default arguments, missing context managers for resources, broad except clauses, shell=True subprocess calls" },
+  ".go": { name: "Go", focus: "ignored error returns, goroutine leaks, data races on shared state, missing context cancellation" },
+  ".rs": { name: "Rust", focus: "unwrap/expect outside tests, blocking calls in async contexts, unsafe blocks without justification" },
+  ".rb": { name: "Ruby", focus: "n+1 queries, missing strong parameter filtering, rescue of StandardError without re-raise" },
+  ".java": { name: "Java", focus: "swallowed exceptions, resource leaks outside try-with-resources, equals/hashCode asymmetry" },
+  ".sh": { name: "Shell", focus: "unquoted variable expansions, missing set -e/-u pitfalls, word-splitting on filenames" },
+};
+const TEST_MARKERS = [
+  { pattern: /(^|\/)(tests?|__tests__|spec)\//, label: "dedicated test directories" },
+  { pattern: /\.(test|spec)\.[jt]sx?$/, label: "co-located *.test/*.spec files" },
+  { pattern: /_test\.go$/, label: "Go _test files" },
+  { pattern: /(^|\/)test_[^/]+\.py$/, label: "pytest test_ files" },
+];
 
 main(process.argv.slice(2)).catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
@@ -242,8 +261,53 @@ function initGuidelines(repoRoot, force) {
     return { action: "init-guidelines", status: "skipped", path: dest, reason: "already exists" };
   }
   mkdirSync(dirname(dest), { recursive: true });
-  copyFileSync(TEMPLATE_GUIDELINES, dest);
-  return { action: "init-guidelines", status: existed ? "overwritten" : "created", path: dest };
+  const profile = detectProjectProfile(repoRoot);
+  const content = readFileSync(TEMPLATE_GUIDELINES, "utf8") + renderProjectProfile(profile);
+  writeFileSync(dest, content);
+  return { action: "init-guidelines", status: existed ? "overwritten" : "created", path: dest, profile };
+}
+
+function detectProjectProfile(repoRoot) {
+  const listed = git(["ls-files"], { cwd: repoRoot, optional: true });
+  const files = listed.stdout.split("\n").filter(Boolean);
+  const extensionCounts = new Map();
+  const testStyles = new Set();
+  for (const file of files) {
+    const ext = file.includes(".") ? file.slice(file.lastIndexOf(".")) : "";
+    if (LANGUAGE_PROFILES[ext]) extensionCounts.set(ext, (extensionCounts.get(ext) || 0) + 1);
+    for (const marker of TEST_MARKERS) {
+      if (marker.pattern.test(file)) testStyles.add(marker.label);
+    }
+  }
+  const languages = [...extensionCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([ext]) => LANGUAGE_PROFILES[ext]);
+
+  const testCommands = [];
+  try {
+    const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
+    if (pkg.scripts?.test) testCommands.push(`npm test (${pkg.scripts.test})`);
+  } catch {}
+  for (const [manifest, command] of [["pyproject.toml", "pytest"], ["go.mod", "go test ./..."], ["Cargo.toml", "cargo test"], ["Gemfile", "bundle exec rake test"]]) {
+    if (existsSync(join(repoRoot, manifest))) testCommands.push(command);
+  }
+  return { languages, testStyles: [...testStyles], testCommands };
+}
+
+function renderProjectProfile(profile) {
+  if (!profile.languages.length && !profile.testStyles.length && !profile.testCommands.length) return "";
+  const lines = ["", "## Project profile", "", "Detected by `cc-review-setup --init-guidelines`; edit freely.", ""];
+  for (const language of profile.languages) {
+    lines.push(`- ${language.name}: pay extra attention to ${language.focus}.`);
+  }
+  if (profile.testStyles.length) {
+    lines.push(`- Tests live in ${profile.testStyles.join(" and ")}; flag changed behavior that lacks matching test updates.`);
+  }
+  if (profile.testCommands.length) {
+    lines.push(`- Expected test entry points: ${profile.testCommands.join(", ")}.`);
+  }
+  return lines.join("\n") + "\n";
 }
 
 async function reviewCommand(kind, args) {
