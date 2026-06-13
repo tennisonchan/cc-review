@@ -522,6 +522,110 @@ test("gate uses persisted block_on and resets after clean review", () => {
   assert.equal(JSON.parse(blocksAgain.stdout).decision, "block");
 });
 
+test("guidelines policy drives category-aware blocking", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+
+\`\`\`json cc-review
+{ "block_on": "high", "category_block_on": { "security": "low", "style": "never" } }
+\`\`\`
+`);
+  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const decisionWith = (findings) => JSON.stringify({
+    decision: "needs_changes",
+    approved: false,
+    max_severity: "high",
+    needs_changes: findings,
+    notes: [],
+  });
+
+  // A low-severity security finding blocks because the category threshold is low.
+  const securityEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: decisionWith([
+    { id: "sec1", severity: "low", category: "security", location: "file.txt:1", summary: "Leaky.", required_action: "Fix." },
+  ]) };
+  const secBlock = run(["gate", "--json"], { cwd: repo, env: securityEnv, input: '{"turn_id":"sec"}' });
+  assert.equal(JSON.parse(secBlock.stdout).decision, "block");
+  assert.match(JSON.parse(secBlock.stdout).reason, /Leaky/);
+
+  // A high-severity style finding never blocks.
+  writeFileSync(join(repo, "file.txt"), "style change\n");
+  const styleEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: decisionWith([
+    { id: "style1", severity: "high", category: "style", location: "file.txt:1", summary: "Ugly.", required_action: "Prettify." },
+  ]) };
+  const styleAllow = run(["gate", "--json"], { cwd: repo, env: styleEnv, input: '{"turn_id":"style"}' });
+  assert.deepEqual(JSON.parse(styleAllow.stdout), {});
+
+  // Uncategorized findings use the base threshold from the policy.
+  writeFileSync(join(repo, "file.txt"), "medium change\n");
+  const mediumEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: decisionWith([
+    { id: "m1", severity: "medium", location: "file.txt:1", summary: "Meh.", required_action: "Fix." },
+  ]) };
+  const mediumAllow = run(["gate", "--json"], { cwd: repo, env: mediumEnv, input: '{"turn_id":"med"}' });
+  assert.deepEqual(JSON.parse(mediumAllow.stdout), {});
+});
+
+test("explicit setup block_on overrides the guidelines policy", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+
+\`\`\`json cc-review
+{ "block_on": "high" }
+\`\`\`
+`);
+  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const setup = run(["setup", "--enable-review-gate", "--block-on", "low", "--json"], { cwd: repo, env: baseEnv });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const lowEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+    decision: "needs_changes",
+    approved: false,
+    max_severity: "low",
+    needs_changes: [{ id: "l1", severity: "low", location: "file.txt:1", summary: "Small.", required_action: "Fix." }],
+    notes: [],
+  }) };
+  const blocked = run(["gate", "--json"], { cwd: repo, env: lowEnv, input: '{"turn_id":"o"}' });
+  assert.equal(JSON.parse(blocked.stdout).decision, "block");
+});
+
+test("malformed guidelines policy fails closed at the gate", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+
+\`\`\`json cc-review
+{ "block_on": "catastrophic" }
+\`\`\`
+`);
+  const env = {
+    ...testEnv(repo),
+    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", approved: true, max_severity: "info", needs_changes: [], notes: [] }),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"bad"}' });
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.decision, "block");
+  assert.match(parsed.reason, /guidelines block_on/);
+});
+
 test("gate debug mode logs hook payloads to the state dir", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");

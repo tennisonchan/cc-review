@@ -28,6 +28,9 @@
           "severity": {
             "$ref": "#/$defs/severity"
           },
+          "category": {
+            "type": "string"
+          },
           "location": {
             "type": "string"
           },

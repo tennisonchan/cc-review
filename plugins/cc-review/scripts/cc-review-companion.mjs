@@ -195,7 +195,9 @@ async function setup(args) {
       const payload = {
         enabled: true,
         event: support.event,
-        block_on: args.blockOn || DEFAULT_BLOCK_ON,
+        // Stored only when explicitly chosen; otherwise the guidelines
+        // policy block (or the built-in default) decides the threshold.
+        block_on: args.blockOn || null,
         installed_at: new Date().toISOString(),
         companion: fileURLToPath(import.meta.url),
       };
@@ -204,7 +206,7 @@ async function setup(args) {
         action: "enable-review-gate",
         status: "enabled",
         event: support.event,
-        block_on: args.blockOn || DEFAULT_BLOCK_ON,
+        block_on: args.blockOn || "guidelines-or-default",
         path: config,
         artifact_root: jobsDir(repo.root),
       });
@@ -348,6 +350,7 @@ function buildPrompt({ kind, guidelines, target, focus }) {
     "Non-overridable safety: do not edit files, write files, apply patches, commit, run destructive commands, or continue into implementation.",
     "You may use Read, Grep, and Glob to inspect surrounding code for context.",
     "Return findings only. Use the requested structured output schema exactly.",
+    "When the guidelines define finding categories, set each finding's category field to the best-matching one.",
     "",
     `Review mode: ${mode}`,
     focus ? `Focus: ${focus}` : "",
@@ -790,15 +793,21 @@ async function gateCommand(args) {
     return;
   }
 
-  const blockOn = config.block_on || args.blockOn || DEFAULT_BLOCK_ON;
-  assertSeverity(blockOn, "gate block_on");
+  // Threshold precedence: explicit per-repo setup choice, then the
+  // guidelines policy block, then the built-in default. The policy is
+  // resolved after the review runs, since the guidelines come with it.
+  const configuredBlockOn = config.block_on || args.blockOn || null;
+  if (configuredBlockOn) assertSeverity(configuredBlockOn, "gate block_on");
   const taskKey = gateTaskKey(hookPayload);
   const state = readGateState(repo.root);
   const taskState = freshTaskState(state.tasks[taskKey]);
 
-  let result;
+  let blocking;
   try {
-    result = await runReview({ kind: "review", args: { ...args, json: true, positional: [] }, cwd: process.cwd(), cache: true });
+    const result = await runReview({ kind: "review", args: { ...args, json: true, positional: [] }, cwd: process.cwd(), cache: true });
+    const policy = guidelinePolicy(result.guidelines);
+    const blockOn = configuredBlockOn || policy.blockOn || DEFAULT_BLOCK_ON;
+    blocking = blockingFindings(result.decision, blockOn, policy);
   } catch (error) {
     const message = redact(error instanceof Error ? error.message : String(error));
     taskState.infra_failures = Number(taskState.infra_failures || 0) + 1;
@@ -818,7 +827,6 @@ async function gateCommand(args) {
   }
 
   taskState.infra_failures = 0;
-  const blocking = blockingFindings(result.decision, blockOn);
   if (!blocking.length) {
     delete state.tasks[taskKey];
     writeGateState(repo.root, state);
@@ -868,9 +876,50 @@ function freshTaskState(taskState) {
   return taskState;
 }
 
-function blockingFindings(decision, blockOn) {
-  const threshold = SEVERITIES.indexOf(blockOn);
-  return decision.needs_changes.filter((finding) => SEVERITIES.indexOf(finding.severity) >= threshold);
+function blockingFindings(decision, blockOn, policy = { categories: {} }) {
+  return decision.needs_changes.filter((finding) => {
+    const categoryThreshold = finding.category ? policy.categories[finding.category] : undefined;
+    const threshold = categoryThreshold !== undefined ? categoryThreshold : blockOn;
+    if (threshold === "never") return false;
+    return SEVERITIES.indexOf(finding.severity) >= SEVERITIES.indexOf(threshold);
+  });
+}
+
+// Guidelines may carry a machine-readable policy in a fenced block:
+//   ```json cc-review
+//   { "block_on": "medium", "category_block_on": { "security": "low", "style": "never" } }
+//   ```
+// block_on sets the base gate threshold; category_block_on overrides it per
+// finding category ("never" exempts the category from blocking entirely).
+function guidelinePolicy(guidelines) {
+  const policy = { blockOn: null, categories: {} };
+  const match = guidelines.content.match(/```json[ \t]+cc-review[ \t]*\n([\s\S]*?)```/);
+  if (!match) return policy;
+  let parsed;
+  try {
+    parsed = JSON.parse(match[1]);
+  } catch (error) {
+    throw new Error(`invalid cc-review policy block in ${guidelines.path}: ${error.message}`);
+  }
+  for (const key of Object.keys(parsed)) {
+    if (!["block_on", "category_block_on"].includes(key)) {
+      throw new Error(`unknown cc-review policy key in ${guidelines.path}: ${key}`);
+    }
+  }
+  if (parsed.block_on !== undefined) {
+    assertSeverity(parsed.block_on, "guidelines block_on");
+    policy.blockOn = parsed.block_on;
+  }
+  if (parsed.category_block_on !== undefined) {
+    if (!parsed.category_block_on || typeof parsed.category_block_on !== "object" || Array.isArray(parsed.category_block_on)) {
+      throw new Error(`guidelines category_block_on must be an object in ${guidelines.path}`);
+    }
+    for (const [category, value] of Object.entries(parsed.category_block_on)) {
+      if (value !== "never") assertSeverity(value, `guidelines category_block_on.${category}`);
+      policy.categories[category] = value;
+    }
+  }
+  return policy;
 }
 
 function validateDecision(value) {
@@ -892,6 +941,9 @@ function validateDecision(value) {
     if (!finding.id) throw new Error("finding.id is required");
     assertSeverity(finding.severity, "finding.severity");
     if (typeof finding.location !== "string") throw new Error("finding.location must be a string");
+    if (finding.category !== undefined && typeof finding.category !== "string") {
+      throw new Error("finding.category must be a string when present");
+    }
     if (!finding.summary) throw new Error("finding.summary is required");
     if (!finding.required_action) throw new Error("finding.required_action is required");
   }
