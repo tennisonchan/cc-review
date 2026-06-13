@@ -351,7 +351,7 @@ function buildPrompt({ kind, guidelines, target, focus }) {
     "Non-overridable safety: do not edit files, write files, apply patches, commit, run destructive commands, or continue into implementation.",
     "You may use Read, Grep, and Glob to inspect surrounding code for context.",
     "Return findings only. Use the requested structured output schema exactly.",
-    "When the guidelines define finding categories, set each finding's category field to the best-matching one.",
+    "Set each finding's category to the best-matching guideline-defined category, or a short kind such as correctness, security, or style when none are defined.",
     "",
     `Review mode: ${mode}`,
     focus ? `Focus: ${focus}` : "",
@@ -947,8 +947,8 @@ function validateDecision(value) {
     if (!finding.id) throw new Error("finding.id is required");
     assertSeverity(finding.severity, "finding.severity");
     if (typeof finding.location !== "string") throw new Error("finding.location must be a string");
-    if (finding.category !== undefined && typeof finding.category !== "string") {
-      throw new Error("finding.category must be a string when present");
+    if (typeof finding.category !== "string" || !finding.category) {
+      throw new Error("finding.category is required");
     }
     if (!finding.summary) throw new Error("finding.summary is required");
     if (!finding.required_action) throw new Error("finding.required_action is required");

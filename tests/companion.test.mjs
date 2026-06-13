@@ -40,6 +40,7 @@ test("review uses structured output and renders needs_changes", () => {
       {
         id: "file-txt-high",
         severity: "high",
+        category: "correctness",
         location: "file.txt:1",
         summary: "The change is intentionally flagged.",
         required_action: "Fix the test fixture.",
@@ -255,6 +256,7 @@ test("gate re-reviews after a block instead of allowing on stop_hook_active", ()
         {
           id: "blocker",
           severity: "high",
+          category: "correctness",
           location: "file.txt:1",
           summary: "Blocking issue.",
           required_action: "Fix it.",
@@ -297,7 +299,7 @@ test("gate reuses the cached decision for an unchanged tree", () => {
       decision: "needs_changes",
       approved: false,
       max_severity: "high",
-      needs_changes: [{ id: "cached", severity: "high", location: "file.txt:1", summary: "Cached issue.", required_action: "Fix." }],
+      needs_changes: [{ id: "cached", severity: "high", category: "correctness", location: "file.txt:1", summary: "Cached issue.", required_action: "Fix." }],
       notes: [],
     }),
   };
@@ -335,7 +337,7 @@ test("gate cache misses on changes invisible to the rendered prompt", () => {
       decision: "needs_changes",
       approved: false,
       max_severity: "high",
-      needs_changes: [{ id: "tail", severity: "high", location: "long.txt:230", summary: "Issue past the preview.", required_action: "Fix." }],
+      needs_changes: [{ id: "tail", severity: "high", category: "correctness", location: "long.txt:230", summary: "Issue past the preview.", required_action: "Fix." }],
       notes: [],
     }),
   };
@@ -368,7 +370,7 @@ test("gate allows immediately on recursion sentinels", () => {
       decision: "needs_changes",
       approved: false,
       max_severity: "high",
-      needs_changes: [{ id: "blocker", severity: "high", location: "file.txt:1", summary: "Blocking issue.", required_action: "Fix it." }],
+      needs_changes: [{ id: "blocker", severity: "high", category: "correctness", location: "file.txt:1", summary: "Blocking issue.", required_action: "Fix it." }],
       notes: [],
     }),
   };
@@ -397,7 +399,7 @@ test("gate total block ceiling bounds churning finding sets", () => {
       decision: "needs_changes",
       approved: false,
       max_severity: "high",
-      needs_changes: [{ id, severity: "high", location: "file.txt:1", summary: `Issue ${id}.`, required_action: "Fix." }],
+      needs_changes: [{ id, severity: "high", category: "correctness", location: "file.txt:1", summary: `Issue ${id}.`, required_action: "Fix." }],
       notes: [],
     }),
   });
@@ -437,7 +439,7 @@ test("gate default-key counters reset after the chain gap window", async () => {
       decision: "needs_changes",
       approved: false,
       max_severity: "high",
-      needs_changes: [{ id, severity: "high", location: "file.txt:1", summary: `Issue ${id}.`, required_action: "Fix." }],
+      needs_changes: [{ id, severity: "high", category: "correctness", location: "file.txt:1", summary: `Issue ${id}.`, required_action: "Fix." }],
       notes: [],
     }),
   });
@@ -498,7 +500,7 @@ test("gate uses persisted block_on and resets after clean review", () => {
     decision: "needs_changes",
     approved: false,
     max_severity: "medium",
-    needs_changes: [{ id: "m1", severity: "medium", location: "file.txt:1", summary: "Medium issue.", required_action: "Fix." }],
+    needs_changes: [{ id: "m1", severity: "medium", category: "correctness", location: "file.txt:1", summary: "Medium issue.", required_action: "Fix." }],
     notes: [],
   };
   const mediumEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(mediumFinding) };
@@ -563,10 +565,10 @@ test("guidelines policy drives category-aware blocking", () => {
   const styleAllow = run(["gate", "--json"], { cwd: repo, env: styleEnv, input: '{"turn_id":"style"}' });
   assert.deepEqual(JSON.parse(styleAllow.stdout), {});
 
-  // Uncategorized findings use the base threshold from the policy.
+  // Categories absent from the policy map use the base threshold.
   writeFileSync(join(repo, "file.txt"), "medium change\n");
   const mediumEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: decisionWith([
-    { id: "m1", severity: "medium", location: "file.txt:1", summary: "Meh.", required_action: "Fix." },
+    { id: "m1", severity: "medium", category: "maintainability", location: "file.txt:1", summary: "Meh.", required_action: "Fix." },
   ]) };
   const mediumAllow = run(["gate", "--json"], { cwd: repo, env: mediumEnv, input: '{"turn_id":"med"}' });
   assert.deepEqual(JSON.parse(mediumAllow.stdout), {});
@@ -593,7 +595,7 @@ test("explicit setup block_on overrides the guidelines policy", () => {
     decision: "needs_changes",
     approved: false,
     max_severity: "low",
-    needs_changes: [{ id: "l1", severity: "low", location: "file.txt:1", summary: "Small.", required_action: "Fix." }],
+    needs_changes: [{ id: "l1", severity: "low", category: "correctness", location: "file.txt:1", summary: "Small.", required_action: "Fix." }],
     notes: [],
   }) };
   const blocked = run(["gate", "--json"], { cwd: repo, env: lowEnv, input: '{"turn_id":"o"}' });
@@ -624,7 +626,7 @@ test("category overrides apply on top of an explicit block_on base", () => {
     max_severity: "medium",
     needs_changes: [
       { id: "sec", severity: "medium", category: "security", location: "file.txt:1", summary: "Leaky.", required_action: "Fix." },
-      { id: "plain", severity: "medium", location: "file.txt:2", summary: "Meh.", required_action: "Fix." },
+      { id: "plain", severity: "medium", category: "maintainability", location: "file.txt:2", summary: "Meh.", required_action: "Fix." },
     ],
     notes: [],
   }) };
@@ -653,7 +655,7 @@ test("guidelines policy fence parses with CRLF line endings", () => {
       decision: "needs_changes",
       approved: false,
       max_severity: "medium",
-      needs_changes: [{ id: "m", severity: "medium", location: "file.txt:1", summary: "Medium issue.", required_action: "Fix." }],
+      needs_changes: [{ id: "m", severity: "medium", category: "correctness", location: "file.txt:1", summary: "Medium issue.", required_action: "Fix." }],
       notes: [],
     }),
   };
@@ -683,7 +685,7 @@ test("legacy gate config default does not shadow the guidelines policy", () => {
       decision: "needs_changes",
       approved: false,
       max_severity: "medium",
-      needs_changes: [{ id: "m", severity: "medium", location: "file.txt:1", summary: "Medium issue.", required_action: "Fix." }],
+      needs_changes: [{ id: "m", severity: "medium", category: "correctness", location: "file.txt:1", summary: "Medium issue.", required_action: "Fix." }],
       notes: [],
     }),
   };
@@ -754,7 +756,7 @@ test("gate allows when not enabled", () => {
   const repo = makeGitRepo();
   const result = run(["gate", "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "needs_changes", approved: false, max_severity: "high", needs_changes: [{ id: "h1", severity: "high", location: "x", summary: "x", required_action: "x" }], notes: [] }) },
+    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "needs_changes", approved: false, max_severity: "high", needs_changes: [{ id: "h1", severity: "high", category: "correctness", location: "x", summary: "x", required_action: "x" }], notes: [] }) },
     input: "{}",
   });
   assert.equal(result.status, 0, result.stderr);
