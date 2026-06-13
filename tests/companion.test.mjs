@@ -25,6 +25,39 @@ test("setup initializes project review guidelines without overwriting", () => {
   assert.equal(secondParsed.actions.find((item) => item.action === "init-guidelines").status, "skipped");
 });
 
+test("init-guidelines scaffolds a project profile from the tracked tree", () => {
+  const repo = makeGitRepo();
+  mkdirSync(join(repo, "src"), { recursive: true });
+  mkdirSync(join(repo, "tests"), { recursive: true });
+  writeFileSync(join(repo, "src", "app.ts"), "export const x = 1;\n");
+  writeFileSync(join(repo, "src", "util.ts"), "export const y = 2;\n");
+  writeFileSync(join(repo, "tests", "app.test.ts"), "test\n");
+  writeFileSync(join(repo, "package.json"), JSON.stringify({ scripts: { test: "vitest run" } }));
+  runGit(["add", "."], repo);
+  runGit(["commit", "-m", "init"], repo);
+
+  const result = run(["setup", "--init-guidelines", "--json"], { cwd: repo, env: testEnv(repo) });
+  assert.equal(result.status, 0, result.stderr);
+  const action = JSON.parse(result.stdout).actions.find((item) => item.action === "init-guidelines");
+  const content = readFileSync(action.path, "utf8");
+  assert.match(content, /## Project profile/);
+  assert.match(content, /TypeScript: pay extra attention to/);
+  assert.match(content, /dedicated test directories/);
+  assert.match(content, /npm test \(vitest run\)/);
+  // The machine-read policy block from the template must survive scaffolding.
+  assert.match(content, /```json cc-review/);
+});
+
+test("init-guidelines omits the profile section for an empty repo", () => {
+  const repo = makeGitRepo();
+  const result = run(["setup", "--init-guidelines", "--json"], { cwd: repo, env: testEnv(repo) });
+  assert.equal(result.status, 0, result.stderr);
+  const action = JSON.parse(result.stdout).actions.find((item) => item.action === "init-guidelines");
+  const content = readFileSync(action.path, "utf8");
+  assert.doesNotMatch(content, /## Project profile/);
+  assert.match(content, /```json cc-review/);
+});
+
 test("review uses structured output and renders needs_changes", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
