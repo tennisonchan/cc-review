@@ -637,6 +637,32 @@ test("category overrides apply on top of an explicit block_on base", () => {
   assert.doesNotMatch(parsed.reason, /Meh/);
 });
 
+test("guidelines policy fence parses with CRLF line endings", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"),
+    '# Rules\r\n\r\n```json cc-review\r\n{ "block_on": "medium" }\r\n```\r\n');
+  const env = {
+    ...testEnv(repo),
+    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      decision: "needs_changes",
+      approved: false,
+      max_severity: "medium",
+      needs_changes: [{ id: "m", severity: "medium", location: "file.txt:1", summary: "Medium issue.", required_action: "Fix." }],
+      notes: [],
+    }),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  const blocked = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"crlf"}' });
+  assert.equal(JSON.parse(blocked.stdout).decision, "block");
+});
+
 test("legacy gate config default does not shadow the guidelines policy", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");

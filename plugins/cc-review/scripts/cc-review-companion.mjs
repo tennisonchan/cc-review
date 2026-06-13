@@ -899,7 +899,7 @@ function blockingFindings(decision, blockOn, policy = { categories: {} }) {
 // finding category ("never" exempts the category from blocking entirely).
 function guidelinePolicy(guidelines) {
   const policy = { blockOn: null, categories: {} };
-  const match = guidelines.content.match(/```json[ \t]+cc-review[ \t]*\n([\s\S]*?)```/);
+  const match = guidelines.content.match(/```json[ \t]+cc-review[ \t]*\r?\n([\s\S]*?)```/);
   if (!match) return policy;
   let parsed;
   try {
