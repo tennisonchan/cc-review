@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+- Fixed structured output against real Claude Code: the `$schema` meta key made `claude --json-schema` silently skip structured output, so every real review failed as an infrastructure error; the key is now stripped before invocation. Verified end-to-end through real Codex Stop hooks (allow and block paths).
+- Gate reviews are cached per full-fidelity target fingerprint (content-hashed untracked files, full diff text), so a stop that changed nothing reuses the previous verdict instead of invoking Claude again.
+- Review guidelines can declare the gate blocking policy in a `json cc-review` fenced block: `block_on` sets the base severity threshold and `category_block_on` overrides it per finding category (`"never"` exempts a category). Findings now require a `category`, and explicit `--block-on` choices override only the policy's base threshold. Legacy configs that stored the default threshold no longer shadow guidelines policies.
+- `--init-guidelines` scaffolds a project-aware rubric: detected languages with review focus areas, test conventions, and manifest-derived test entry points.
+- `cc-review-setup --enable-gate-debug` logs hook payloads to the state dir for diagnosing host integrations.
+
 ## 0.2.0
 
 - Gate loop prevention is owned by bounded per-task counters (same-fingerprint cap, total block ceiling, infra-failure cap) instead of an early allow on `stop_hook_active`, so fixes are re-reviewed before finalization.

@@ -1,6 +1,6 @@
 {
   "name": "cc-review",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Codex plugin for running read-only Claude Code reviews and review gates.",
   "type": "module",
   "private": false,
