@@ -19,7 +19,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "severity", "location", "summary", "required_action"],
+        "required": ["id", "severity", "category", "location", "summary", "required_action"],
         "properties": {
           "id": {
             "type": "string",
@@ -27,6 +27,10 @@
           },
           "severity": {
             "$ref": "#/$defs/severity"
+          },
+          "category": {
+            "type": "string",
+            "minLength": 1
           },
           "location": {
             "type": "string"

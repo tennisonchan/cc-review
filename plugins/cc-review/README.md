@@ -56,6 +56,20 @@ Resolution order:
 3. `~/.claude/rules/review-guidelines.md`
 4. bundled `templates/review-guidelines.md`
 
+Guidelines may include a machine-read blocking policy in a fenced block:
+
+```json cc-review
+{
+  "block_on": "high",
+  "category_block_on": {
+    "security": "medium",
+    "style": "never"
+  }
+}
+```
+
+`block_on` sets the gate's base severity threshold and `category_block_on` overrides it per finding category, with `"never"` exempting a category from blocking. An explicit `cc-review-setup --enable-review-gate --block-on <severity>` choice overrides the policy's base `block_on`; `category_block_on` overrides still apply on top of it.
+
 Guidelines tune review behavior but cannot override read-only safety: the reviewer's inability to modify files is enforced mechanically (plan mode plus a read-only tool list), not by prompt text. Note that guidelines and the reviewed diff are still prompt input, so they can influence review judgment - treat the guidelines file as trusted configuration.
 
 ## Automatic Gate

@@ -40,6 +40,7 @@ test("review uses structured output and renders needs_changes", () => {
       {
         id: "file-txt-high",
         severity: "high",
+        category: "correctness",
         location: "file.txt:1",
         summary: "The change is intentionally flagged.",
         required_action: "Fix the test fixture.",
@@ -255,6 +256,7 @@ test("gate re-reviews after a block instead of allowing on stop_hook_active", ()
         {
           id: "blocker",
           severity: "high",
+          category: "correctness",
           location: "file.txt:1",
           summary: "Blocking issue.",
           required_action: "Fix it.",
@@ -297,7 +299,7 @@ test("gate reuses the cached decision for an unchanged tree", () => {
       decision: "needs_changes",
       approved: false,
       max_severity: "high",
-      needs_changes: [{ id: "cached", severity: "high", location: "file.txt:1", summary: "Cached issue.", required_action: "Fix." }],
+      needs_changes: [{ id: "cached", severity: "high", category: "correctness", location: "file.txt:1", summary: "Cached issue.", required_action: "Fix." }],
       notes: [],
     }),
   };
@@ -335,7 +337,7 @@ test("gate cache misses on changes invisible to the rendered prompt", () => {
       decision: "needs_changes",
       approved: false,
       max_severity: "high",
-      needs_changes: [{ id: "tail", severity: "high", location: "long.txt:230", summary: "Issue past the preview.", required_action: "Fix." }],
+      needs_changes: [{ id: "tail", severity: "high", category: "correctness", location: "long.txt:230", summary: "Issue past the preview.", required_action: "Fix." }],
       notes: [],
     }),
   };
@@ -368,7 +370,7 @@ test("gate allows immediately on recursion sentinels", () => {
       decision: "needs_changes",
       approved: false,
       max_severity: "high",
-      needs_changes: [{ id: "blocker", severity: "high", location: "file.txt:1", summary: "Blocking issue.", required_action: "Fix it." }],
+      needs_changes: [{ id: "blocker", severity: "high", category: "correctness", location: "file.txt:1", summary: "Blocking issue.", required_action: "Fix it." }],
       notes: [],
     }),
   };
@@ -397,7 +399,7 @@ test("gate total block ceiling bounds churning finding sets", () => {
       decision: "needs_changes",
       approved: false,
       max_severity: "high",
-      needs_changes: [{ id, severity: "high", location: "file.txt:1", summary: `Issue ${id}.`, required_action: "Fix." }],
+      needs_changes: [{ id, severity: "high", category: "correctness", location: "file.txt:1", summary: `Issue ${id}.`, required_action: "Fix." }],
       notes: [],
     }),
   });
@@ -437,7 +439,7 @@ test("gate default-key counters reset after the chain gap window", async () => {
       decision: "needs_changes",
       approved: false,
       max_severity: "high",
-      needs_changes: [{ id, severity: "high", location: "file.txt:1", summary: `Issue ${id}.`, required_action: "Fix." }],
+      needs_changes: [{ id, severity: "high", category: "correctness", location: "file.txt:1", summary: `Issue ${id}.`, required_action: "Fix." }],
       notes: [],
     }),
   });
@@ -498,7 +500,7 @@ test("gate uses persisted block_on and resets after clean review", () => {
     decision: "needs_changes",
     approved: false,
     max_severity: "medium",
-    needs_changes: [{ id: "m1", severity: "medium", location: "file.txt:1", summary: "Medium issue.", required_action: "Fix." }],
+    needs_changes: [{ id: "m1", severity: "medium", category: "correctness", location: "file.txt:1", summary: "Medium issue.", required_action: "Fix." }],
     notes: [],
   };
   const mediumEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(mediumFinding) };
@@ -520,6 +522,210 @@ test("gate uses persisted block_on and resets after clean review", () => {
   writeFileSync(join(repo, "file.txt"), "regressed again\n");
   const blocksAgain = run(["gate", "--json"], { cwd: repo, env: mediumEnv, input: '{"turn_id":"t1"}' });
   assert.equal(JSON.parse(blocksAgain.stdout).decision, "block");
+});
+
+test("guidelines policy drives category-aware blocking", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+
+\`\`\`json cc-review
+{ "block_on": "high", "category_block_on": { "security": "low", "style": "never" } }
+\`\`\`
+`);
+  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const decisionWith = (findings) => JSON.stringify({
+    decision: "needs_changes",
+    approved: false,
+    max_severity: "high",
+    needs_changes: findings,
+    notes: [],
+  });
+
+  // A low-severity security finding blocks because the category threshold is low.
+  const securityEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: decisionWith([
+    { id: "sec1", severity: "low", category: "security", location: "file.txt:1", summary: "Leaky.", required_action: "Fix." },
+  ]) };
+  const secBlock = run(["gate", "--json"], { cwd: repo, env: securityEnv, input: '{"turn_id":"sec"}' });
+  assert.equal(JSON.parse(secBlock.stdout).decision, "block");
+  assert.match(JSON.parse(secBlock.stdout).reason, /Leaky/);
+
+  // A high-severity style finding never blocks.
+  writeFileSync(join(repo, "file.txt"), "style change\n");
+  const styleEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: decisionWith([
+    { id: "style1", severity: "high", category: "style", location: "file.txt:1", summary: "Ugly.", required_action: "Prettify." },
+  ]) };
+  const styleAllow = run(["gate", "--json"], { cwd: repo, env: styleEnv, input: '{"turn_id":"style"}' });
+  assert.deepEqual(JSON.parse(styleAllow.stdout), {});
+
+  // Categories absent from the policy map use the base threshold.
+  writeFileSync(join(repo, "file.txt"), "medium change\n");
+  const mediumEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: decisionWith([
+    { id: "m1", severity: "medium", category: "maintainability", location: "file.txt:1", summary: "Meh.", required_action: "Fix." },
+  ]) };
+  const mediumAllow = run(["gate", "--json"], { cwd: repo, env: mediumEnv, input: '{"turn_id":"med"}' });
+  assert.deepEqual(JSON.parse(mediumAllow.stdout), {});
+});
+
+test("explicit setup block_on overrides the guidelines policy", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+
+\`\`\`json cc-review
+{ "block_on": "high" }
+\`\`\`
+`);
+  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const setup = run(["setup", "--enable-review-gate", "--block-on", "low", "--json"], { cwd: repo, env: baseEnv });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const lowEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+    decision: "needs_changes",
+    approved: false,
+    max_severity: "low",
+    needs_changes: [{ id: "l1", severity: "low", category: "correctness", location: "file.txt:1", summary: "Small.", required_action: "Fix." }],
+    notes: [],
+  }) };
+  const blocked = run(["gate", "--json"], { cwd: repo, env: lowEnv, input: '{"turn_id":"o"}' });
+  assert.equal(JSON.parse(blocked.stdout).decision, "block");
+});
+
+test("category overrides apply on top of an explicit block_on base", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+
+\`\`\`json cc-review
+{ "block_on": "low", "category_block_on": { "security": "medium" } }
+\`\`\`
+`);
+  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  // Explicit high base overrides the policy's low base...
+  const setup = run(["setup", "--enable-review-gate", "--block-on", "high", "--json"], { cwd: repo, env: baseEnv });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const mediumSecurityEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+    decision: "needs_changes",
+    approved: false,
+    max_severity: "medium",
+    needs_changes: [
+      { id: "sec", severity: "medium", category: "security", location: "file.txt:1", summary: "Leaky.", required_action: "Fix." },
+      { id: "plain", severity: "medium", category: "maintainability", location: "file.txt:2", summary: "Meh.", required_action: "Fix." },
+    ],
+    notes: [],
+  }) };
+  // ...but the category override still blocks the medium security finding,
+  // while the uncategorized medium finding is held to the explicit high base.
+  const blocked = run(["gate", "--json"], { cwd: repo, env: mediumSecurityEnv, input: '{"turn_id":"mix"}' });
+  const parsed = JSON.parse(blocked.stdout);
+  assert.equal(parsed.decision, "block");
+  assert.match(parsed.reason, /Leaky/);
+  assert.doesNotMatch(parsed.reason, /Meh/);
+});
+
+test("guidelines policy fence parses with CRLF line endings", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"),
+    '# Rules\r\n\r\n```json cc-review\r\n{ "block_on": "medium" }\r\n```\r\n');
+  const env = {
+    ...testEnv(repo),
+    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      decision: "needs_changes",
+      approved: false,
+      max_severity: "medium",
+      needs_changes: [{ id: "m", severity: "medium", category: "correctness", location: "file.txt:1", summary: "Medium issue.", required_action: "Fix." }],
+      notes: [],
+    }),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  const blocked = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"crlf"}' });
+  assert.equal(JSON.parse(blocked.stdout).decision, "block");
+});
+
+test("legacy gate config default does not shadow the guidelines policy", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+
+\`\`\`json cc-review
+{ "block_on": "medium" }
+\`\`\`
+`);
+  const env = {
+    ...testEnv(repo),
+    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      decision: "needs_changes",
+      approved: false,
+      max_severity: "medium",
+      needs_changes: [{ id: "m", severity: "medium", category: "correctness", location: "file.txt:1", summary: "Medium issue.", required_action: "Fix." }],
+      notes: [],
+    }),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  // Simulate a pre-policy config: block_on stored unconditionally, no marker.
+  const configPath = JSON.parse(setup.stdout).actions.find((item) => item.action === "enable-review-gate").path;
+  const legacy = JSON.parse(readFileSync(configPath, "utf8"));
+  legacy.block_on = "high";
+  delete legacy.block_on_explicit;
+  writeFileSync(configPath, JSON.stringify(legacy));
+
+  const blocked = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"legacy"}' });
+  assert.equal(JSON.parse(blocked.stdout).decision, "block");
+});
+
+test("malformed guidelines policy fails closed at the gate", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+
+\`\`\`json cc-review
+{ "block_on": "catastrophic" }
+\`\`\`
+`);
+  const env = {
+    ...testEnv(repo),
+    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", approved: true, max_severity: "info", needs_changes: [], notes: [] }),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"bad"}' });
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.decision, "block");
+  assert.match(parsed.reason, /guidelines block_on/);
 });
 
 test("gate debug mode logs hook payloads to the state dir", () => {
@@ -550,7 +756,7 @@ test("gate allows when not enabled", () => {
   const repo = makeGitRepo();
   const result = run(["gate", "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "needs_changes", approved: false, max_severity: "high", needs_changes: [{ id: "h1", severity: "high", location: "x", summary: "x", required_action: "x" }], notes: [] }) },
+    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "needs_changes", approved: false, max_severity: "high", needs_changes: [{ id: "h1", severity: "high", category: "correctness", location: "x", summary: "x", required_action: "x" }], notes: [] }) },
     input: "{}",
   });
   assert.equal(result.status, 0, result.stderr);
