@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 
@@ -446,6 +446,36 @@ test("gate does not bypass on an unrecognized fallback token", () => {
   assert.equal(JSON.parse(result.stdout).decision, "block");
 });
 
+test("gate state does not persist dead infra failure counters", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const env = {
+    ...testEnv(repo),
+    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      decision: "needs_changes",
+      approved: false,
+      max_severity: "high",
+      needs_changes: [{ id: "blocker", severity: "high", category: "correctness", location: "file.txt:1", summary: "Blocking issue.", required_action: "Fix it." }],
+      notes: [],
+    }),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"no-infra"}' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).decision, "block");
+  const stateDir = join(env.XDG_STATE_HOME, "cc-review", "gate-state");
+  const [stateFile] = readdirSync(stateDir);
+  assert.ok(stateFile, "expected gate state file");
+  const state = JSON.parse(readFileSync(join(stateDir, stateFile), "utf8"));
+  assert.equal("infra_failures" in state.tasks["no-infra"], false);
+});
+
 test("gate blocks review target preparation failures instead of using fallback", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
@@ -631,6 +661,49 @@ process.stdin.on("end", () => {
   assert.ok(argv.includes("--output-last-message"));
   assert.match(JSON.parse(readFileSync(envFile, "utf8")).fallbackToken, /^[0-9a-f-]{36}$/i);
   assert.match(readFileSync(stdinFile, "utf8"), /degraded fallback reviewer/);
+});
+
+test("gate prunes expired fallback sentinels before creating a new one", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const fakeCodex = join(repo, "bin", "codex-capture");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeCodex, `#!/usr/bin/env node
+const fs = require("fs");
+const argv = process.argv.slice(2);
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const out = argv[argv.indexOf("--output-last-message") + 1];
+  fs.writeFileSync(out, JSON.stringify({ decision: "approved", approved: true, max_severity: "info", needs_changes: [], notes: ["fallback ok"] }));
+});
+`, { mode: 0o755 });
+  const env = {
+    ...testEnv(repo),
+    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
+    CC_REVIEW_CODEX_BIN: fakeCodex,
+    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", approved: true, max_severity: "prose", needs_changes: [], notes: [] }),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  const repoStateHash = basename(JSON.parse(setup.stdout).actions.find((item) => item.action === "enable-review-gate").artifact_root);
+  const staleDir = join(env.XDG_STATE_HOME, "cc-review", "fallback-sentinels");
+  mkdirSync(staleDir, { recursive: true });
+  const stalePath = join(staleDir, `${repoStateHash}-00000000-0000-4000-8000-000000000000.json`);
+  writeFileSync(stalePath, JSON.stringify({
+    repo: repo,
+    token: "00000000-0000-4000-8000-000000000000",
+    created_at: "2020-01-01T00:00:00.000Z",
+    expires_at: "2020-01-01T00:10:00.000Z",
+  }));
+
+  const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"prune-sentinel"}' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).decision, undefined);
+  assert.equal(existsSync(stalePath), false);
+  assert.deepEqual(readdirSync(staleDir), []);
 });
 
 test("gate blocks on degraded fallback review findings", () => {

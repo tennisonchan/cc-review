@@ -1093,7 +1093,6 @@ async function gateCommand(args) {
     return;
   }
 
-  taskState.infra_failures = 0;
   if (!blocking.length) {
     delete state.tasks[taskKey];
     writeGateState(repo.root, state);
@@ -1131,7 +1130,7 @@ async function gateCommand(args) {
 }
 
 function freshTaskState(taskState) {
-  const empty = { block_count: 0, fingerprint: "", total_blocks: 0, infra_failures: 0 };
+  const empty = { block_count: 0, fingerprint: "", total_blocks: 0 };
   if (!taskState) return empty;
   // Every key is a coarse task proxy (session_id and thread_id span many
   // tasks; the default key spans everything), so counters are scoped to the
@@ -1410,6 +1409,7 @@ function fallbackSentinelPath(repoRoot, token) {
 
 function createFallbackSentinel(repoRoot) {
   const token = randomUUID();
+  pruneExpiredFallbackSentinels(repoRoot);
   writeJson(fallbackSentinelPath(repoRoot, token), {
     repo: resolve(repoRoot),
     token,
@@ -1437,6 +1437,23 @@ function consumeFallbackSentinel(repoRoot) {
 function clearFallbackSentinel(repoRoot, token) {
   if (!token) return;
   rmSync(fallbackSentinelPath(repoRoot, token), { force: true });
+}
+
+function pruneExpiredFallbackSentinels(repoRoot) {
+  const dir = join(stateRoot(), "fallback-sentinels");
+  if (!existsSync(dir)) return;
+  const prefix = `${repoHash(repoRoot)}-`;
+  for (const entry of readdirSync(dir)) {
+    if (!entry.startsWith(prefix) || !entry.endsWith(".json")) continue;
+    const path = join(dir, entry);
+    try {
+      const sentinel = readJson(path);
+      const expiresAt = Date.parse(sentinel.expires_at || "");
+      if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) rmSync(path, { force: true });
+    } catch {
+      rmSync(path, { force: true });
+    }
+  }
 }
 
 function stateRoot() {
