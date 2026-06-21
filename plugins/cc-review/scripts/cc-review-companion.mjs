@@ -13,10 +13,10 @@ const SEVERITIES = ["info", "low", "medium", "high"];
 const DEFAULT_BLOCK_ON = "high";
 const GATE_FINGERPRINT_BLOCK_LIMIT = 3;
 const GATE_TOTAL_BLOCK_LIMIT = 5;
-const GATE_INFRA_FAILURE_BLOCK_LIMIT = 2;
 const GATE_CHAIN_GAP_MS = 10 * 60 * 1000;
 const DEFAULT_MAX_DIFF_CHARS = 200 * 1000;
 const DEFAULT_CLAUDE_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_FALLBACK_TIMEOUT_MS = 10 * 60 * 1000;
 const TEXT_EXTENSIONS = new Set([
   ".c", ".cc", ".cpp", ".cs", ".css", ".go", ".h", ".hpp", ".html", ".java",
   ".js", ".jsx", ".json", ".md", ".mjs", ".py", ".rb", ".rs", ".sh", ".sql",
@@ -41,6 +41,13 @@ const TEST_MARKERS = [
   { pattern: /_test\.go$/, label: "Go _test files" },
   { pattern: /(^|\/)test_[^/]+\.py$/, label: "pytest test_ files" },
 ];
+
+class ReviewToolFailure extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ReviewToolFailure";
+  }
+}
 
 // Auto-run only when executed directly (node cc-review-companion.mjs ...);
 // the bin alias wrappers import runMain and prepend their subcommand.
@@ -400,8 +407,14 @@ async function runReview({ kind, args, cwd, cache = false }) {
 
   const focus = kind === "adversarial-review" ? args.positional.join(" ").trim() : "";
   const prompt = buildPrompt({ kind, guidelines, target, focus });
-  const claude = await runClaude(prompt);
-  const decision = validateDecision(claude.structuredOutput);
+  let claude;
+  let decision;
+  try {
+    claude = await runClaude(prompt);
+    decision = validateDecision(claude.structuredOutput);
+  } catch (error) {
+    throw new ReviewToolFailure(error instanceof Error ? error.message : String(error));
+  }
   if (cache) {
     writeJson(reviewCachePath(repo.root), {
       target_hash: targetHash,
@@ -419,6 +432,90 @@ async function runReview({ kind, args, cwd, cache = false }) {
     decision,
     raw: claude.resultText,
     claude: claude.meta,
+  };
+}
+
+async function runFallbackReview({ kind, args, cwd, primaryFailure }) {
+  const repo = resolveWorkspace(cwd);
+  const guidelines = resolveGuidelines(args.guidelines, cwd, repo.root);
+  const target = collectReviewTarget(repo.root, args);
+
+  if (target.empty) {
+    return {
+      ok: true,
+      repo: repo.root,
+      guidelines,
+      target,
+      decision: approvedDecision(["Nothing to review."]),
+      raw: "",
+      fallback: { fake: Boolean(process.env.CC_REVIEW_FAKE_FALLBACK_STRUCTURED_OUTPUT), skipped: true },
+    };
+  }
+
+  if (process.env.CC_REVIEW_FAKE_FALLBACK_ERROR) {
+    throw new Error(process.env.CC_REVIEW_FAKE_FALLBACK_ERROR);
+  }
+  if (process.env.CC_REVIEW_FAKE_FALLBACK_STRUCTURED_OUTPUT) {
+    const decision = validateDecision(JSON.parse(process.env.CC_REVIEW_FAKE_FALLBACK_STRUCTURED_OUTPUT));
+    return {
+      ok: decision.approved,
+      repo: repo.root,
+      guidelines,
+      target,
+      decision,
+      raw: "",
+      fallback: { fake: true },
+    };
+  }
+
+  const prompt = buildFallbackPrompt({ kind, guidelines, target, primaryFailure });
+  const outDir = join(stateRoot(), "fallback");
+  mkdirSync(outDir, { recursive: true });
+  pruneOldFiles(outDir);
+  const outPath = join(outDir, `${Date.now()}-${randomUUID().slice(0, 8)}.json`);
+  const fallbackToken = createFallbackSentinel(repo.root);
+  const timeoutMs = Number(process.env.CC_REVIEW_FALLBACK_TIMEOUT_MS || DEFAULT_FALLBACK_TIMEOUT_MS);
+  const result = spawnSync(codexBin(), [
+    "exec",
+    "--sandbox", "read-only",
+    "--cd", repo.root,
+    "--output-schema", SCHEMA_PATH,
+    "--output-last-message", outPath,
+    "-",
+  ], {
+    cwd: repo.root,
+    encoding: "utf8",
+    input: prompt,
+    timeout: timeoutMs,
+    env: { ...process.env, CC_REVIEW_FALLBACK_TOKEN: fallbackToken },
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  clearFallbackSentinel(repo.root, fallbackToken);
+
+  if (result.error) {
+    throw new Error(`codex fallback review failed: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(`codex fallback review failed with exit ${result.status}: ${redact(result.stderr || result.stdout)}`);
+  }
+  if (!existsSync(outPath)) {
+    throw new Error("codex fallback review did not produce structured output");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(outPath, "utf8"));
+  } catch (error) {
+    throw new Error(`codex fallback structured output was not JSON: ${error.message}`);
+  }
+  const decision = validateDecision(parsed);
+  return {
+    ok: decision.approved,
+    repo: repo.root,
+    guidelines,
+    target,
+    decision,
+    raw: readFileSync(outPath, "utf8"),
+    fallback: { status: result.status },
   };
 }
 
@@ -467,6 +564,27 @@ function buildPrompt({ kind, guidelines, target, focus }) {
   ].filter(Boolean).join("\n");
 }
 
+function buildFallbackPrompt({ kind, guidelines, target, primaryFailure }) {
+  const mode = kind === "adversarial-review" ? "adversarial challenge review" : "code review";
+  return [
+    "You are Codex acting as a degraded fallback reviewer because Claude cc-review is unavailable.",
+    "This is a read-only review. Do not edit files, write files, apply patches, commit, or continue into implementation.",
+    "Review the same target Claude cc-review would have reviewed and return only structured findings matching the requested schema.",
+    "Use the requested severity and category fields so the existing cc-review gate policy can decide whether findings block.",
+    "",
+    `Review mode: ${mode}`,
+    "",
+    "Claude cc-review failure context, sanitized:",
+    redact(primaryFailure),
+    "",
+    "Review guidelines:",
+    guidelines.content,
+    "",
+    "Review target:",
+    target.content,
+  ].join("\n");
+}
+
 function loadReviewSchema() {
   // claude --json-schema silently skips structured output when the schema
   // carries a $schema meta key (observed on 2.1.176: subtype "success", no
@@ -501,7 +619,10 @@ async function runClaude(prompt) {
   child.stderr.on("data", (chunk) => {
     stderr += chunk;
   });
-  child.stdin.end(prompt);
+  child.stdin.on("error", () => {});
+  try {
+    child.stdin.end(prompt);
+  } catch {}
 
   const timeoutMs = Number(process.env.CC_REVIEW_CLAUDE_TIMEOUT_MS || DEFAULT_CLAUDE_TIMEOUT_MS);
   let timedOut = false;
@@ -512,22 +633,36 @@ async function runClaude(prompt) {
   }, timeoutMs);
   timer.unref();
 
+  let spawnError = null;
   const status = await new Promise((resolveStatus) => {
+    let settled = false;
+    const resolveOnce = (code) => {
+      if (settled) return;
+      settled = true;
+      resolveStatus(code);
+    };
+    child.on("error", (error) => {
+      spawnError = error;
+      resolveOnce(null);
+    });
     // "close" waits for stdio to drain, which is right for the happy path,
     // but a killed claude can leave grandchildren holding the pipes open —
     // after a timeout, the process exit is all we need.
-    child.on("close", (code) => resolveStatus(code));
+    child.on("close", (code) => resolveOnce(code));
     child.on("exit", (code) => {
       if (timedOut) {
         child.stdout.destroy();
         child.stderr.destroy();
         child.stdin.destroy();
-        resolveStatus(code);
+        resolveOnce(code);
       }
     });
   });
   clearTimeout(timer);
 
+  if (spawnError) {
+    throw new Error(`claude review failed to start: ${spawnError.message}`);
+  }
   if (timedOut) {
     throw new Error(`claude review timed out after ${Math.round(timeoutMs / 1000)}s`);
   }
@@ -887,7 +1022,7 @@ async function gateCommand(args) {
   // Recursion sentinels: a review already in flight must not start another.
   // stop_hook_active is deliberately NOT checked — stops that follow a block
   // are re-reviewed so fixes get verified; the per-task counters bound them.
-  if (hookPayload?.hook_active || hookPayload?.cc_review_active) {
+  if (hookPayload?.hook_active || hookPayload?.cc_review_active || consumeFallbackSentinel(repo.root)) {
     outputHookAllow();
     return;
   }
@@ -911,27 +1046,50 @@ async function gateCommand(args) {
   const state = readGateState(repo.root);
   const taskState = freshTaskState(state.tasks[taskKey]);
 
-  let blocking;
+  let reviewResult;
+  let fallbackDisclosure = "";
   try {
-    const result = await runReview({ kind: "review", args: { ...args, json: true, positional: [] }, cwd: process.cwd(), cache: true });
-    const policy = guidelinePolicy(result.guidelines);
-    const blockOn = configuredBlockOn || policy.blockOn || DEFAULT_BLOCK_ON;
-    blocking = blockingFindings(result.decision, blockOn, policy);
+    reviewResult = await runReview({ kind: "review", args: { ...args, json: true, positional: [] }, cwd: process.cwd(), cache: true });
   } catch (error) {
     const message = redact(error instanceof Error ? error.message : String(error));
-    taskState.infra_failures = Number(taskState.infra_failures || 0) + 1;
-    taskState.updated_at = new Date().toISOString();
-    if (taskState.infra_failures > GATE_INFRA_FAILURE_BLOCK_LIMIT) {
-      // A cap allow ends the stop chain, so consume the counters; the next
-      // stop under the same coarse key is a new task and stays gated.
-      delete state.tasks[taskKey];
+    if (!(error instanceof ReviewToolFailure)) {
+      state.tasks[taskKey] = taskState;
       writeGateState(repo.root, state);
-      outputHookAllow(`cc-review could not run after ${taskState.infra_failures} attempts; allowing finalization without review. Last failure:\n${message}`);
+      outputHookBlock(`cc-review could not prepare review: ${message}`);
       return;
     }
+    try {
+      const fallback = await runFallbackReview({ kind: "review", args: { ...args, json: true, positional: [] }, cwd: process.cwd(), primaryFailure: message });
+      reviewResult = fallback;
+      fallbackDisclosure = [
+        "Claude cc-review was unavailable; used degraded Codex fallback review.",
+        "This is not equivalent to Claude cc-review coverage.",
+        `Primary failure: ${message}`,
+      ].join("\n");
+    } catch (fallbackError) {
+      const fallbackMessage = redact(fallbackError instanceof Error ? fallbackError.message : String(fallbackError));
+      delete state.tasks[taskKey];
+      writeGateState(repo.root, state);
+      outputHookAllow([
+        "Claude cc-review was unavailable and the degraded Codex fallback review also failed.",
+        "Allowing finalization without review coverage.",
+        `Primary failure: ${message}`,
+        `Fallback failure: ${fallbackMessage}`,
+      ].join("\n"));
+      return;
+    }
+  }
+
+  let blocking;
+  try {
+    const policy = guidelinePolicy(reviewResult.guidelines);
+    const blockOn = configuredBlockOn || policy.blockOn || DEFAULT_BLOCK_ON;
+    blocking = blockingFindings(reviewResult.decision, blockOn, policy);
+  } catch (error) {
+    const message = redact(error instanceof Error ? error.message : String(error));
     state.tasks[taskKey] = taskState;
     writeGateState(repo.root, state);
-    outputHookBlock(`cc-review infrastructure failure: ${message}`);
+    outputHookBlock(`cc-review configuration failure: ${message}`);
     return;
   }
 
@@ -939,7 +1097,7 @@ async function gateCommand(args) {
   if (!blocking.length) {
     delete state.tasks[taskKey];
     writeGateState(repo.root, state);
-    outputHookAllow();
+    outputHookAllow(fallbackDisclosure || undefined);
     return;
   }
 
@@ -969,7 +1127,7 @@ async function gateCommand(args) {
   }
   state.tasks[taskKey] = taskState;
   writeGateState(repo.root, state);
-  outputHookBlock(`cc-review needs_changes:\n${reason}`);
+  outputHookBlock(`${fallbackDisclosure ? `${fallbackDisclosure}\n\nFallback review needs_changes` : "cc-review needs_changes"}:\n${reason}`);
 }
 
 function freshTaskState(taskState) {
@@ -1246,6 +1404,41 @@ function gateStatePath(repoRoot) {
   return join(stateRoot(), "gate-state", `${repoHash(repoRoot)}.json`);
 }
 
+function fallbackSentinelPath(repoRoot, token) {
+  return join(stateRoot(), "fallback-sentinels", `${repoHash(repoRoot)}-${token}.json`);
+}
+
+function createFallbackSentinel(repoRoot) {
+  const token = randomUUID();
+  writeJson(fallbackSentinelPath(repoRoot, token), {
+    repo: resolve(repoRoot),
+    token,
+    created_at: new Date().toISOString(),
+    expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+  });
+  return token;
+}
+
+function consumeFallbackSentinel(repoRoot) {
+  const token = process.env.CC_REVIEW_FALLBACK_TOKEN;
+  if (!token || !/^[0-9a-f-]{36}$/i.test(token)) return false;
+  const path = fallbackSentinelPath(repoRoot, token);
+  try {
+    const sentinel = readJson(path);
+    rmSync(path, { force: true });
+    return sentinel.token === token
+      && sentinel.repo === resolve(repoRoot)
+      && Date.parse(sentinel.expires_at || "") > Date.now();
+  } catch {
+    return false;
+  }
+}
+
+function clearFallbackSentinel(repoRoot, token) {
+  if (!token) return;
+  rmSync(fallbackSentinelPath(repoRoot, token), { force: true });
+}
+
 function stateRoot() {
   return join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "cc-review");
 }
@@ -1280,6 +1473,10 @@ function git(args, { cwd, optional = false } = {}) {
 
 function claudeBin() {
   return process.env.CC_REVIEW_CLAUDE_BIN || "claude";
+}
+
+function codexBin() {
+  return process.env.CC_REVIEW_CODEX_BIN || "codex";
 }
 
 function readJson(path) {

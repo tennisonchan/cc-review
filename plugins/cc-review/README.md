@@ -89,7 +89,11 @@ Enable the blocking gate for the current repository:
 cc-review-setup --enable-review-gate
 ```
 
-The gate blocks finalization when Claude Code returns `needs_changes` at or above the configured threshold. Each blocked stop is re-reviewed, so fixes are verified before finalization. Loop prevention is bounded per task: three blocks for the same finding set, five blocks total, and two blocks for review infrastructure failures; past those caps the gate allows finalization and reports the unresolved findings instead. A stop that changed nothing reuses the previous review decision instead of invoking Claude again. Disable it with:
+The gate blocks finalization when Claude Code returns `needs_changes` at or above the configured threshold. Each blocked stop is re-reviewed, so fixes are verified before finalization. Loop prevention is bounded per task: three blocks for the same finding set and five blocks total; past those caps the gate allows finalization and reports the unresolved findings instead. A stop that changed nothing reuses the previous review decision instead of invoking Claude again.
+
+When Claude Code cannot run because of a tool or provider failure, such as authentication, timeout, malformed output, or a missing CLI, the gate runs a degraded Codex fallback review over the same target instead of blocking solely on the tool failure. Findings from that fallback review still use the same `block_on` / `category_block_on` policy and can block finalization. If both Claude Code and the fallback review are unavailable, the gate allows finalization with an explicit missing-review-coverage warning. This MVP fallback is intentionally report-only for tool failure: inducing repeated Claude failures can downgrade review coverage until follow-up escalation/counter controls are added.
+
+Disable the gate with:
 
 ```bash
 cc-review-setup --disable-review-gate
