@@ -18,7 +18,7 @@
   "interface": {
     "displayName": "cc-review",
     "shortDescription": "Run read-only Claude Code reviews before Codex finalizes work",
-    "longDescription": "Use cc-review to connect Codex to Claude Code for read-only code reviews, structured approved/needs_changes decisions, customizable review guidelines, and conditional agent-finalization review gates.",
+    "longDescription": "Use cc-review to connect Codex to Claude Code for read-only reviews, normalized approved/changes_requested decisions, customizable review guidelines, and conditional agent-finalization review gates.",
     "developerName": "Tennison Chan",
     "category": "Developer Tools",
     "capabilities": [

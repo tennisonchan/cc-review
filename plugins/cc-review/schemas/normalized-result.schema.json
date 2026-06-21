@@ -11,8 +11,7 @@
     "required_next_actions",
     "reviewed_inputs",
     "reviewer_mechanism",
-    "read_only",
-    "max_severity"
+    "read_only"
   ],
   "properties": {
     "schema_version": {
@@ -86,9 +85,6 @@
     "read_only": {
       "type": "boolean",
       "const": true
-    },
-    "max_severity": {
-      "$ref": "#/$defs/severity"
     }
   },
   "$defs": {
@@ -132,7 +128,7 @@
         },
         "blocking_reason": {
           "type": "string",
-          "enum": ["reviewer", "category_policy", "severity_policy", "fallback_threshold", "review_execution"]
+          "enum": ["reviewer", "category_policy", "severity_policy", "fallback_threshold"]
         }
       }
     }
