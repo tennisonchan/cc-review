@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "decision",
+    "summary",
+    "blocking_findings",
+    "advisory_findings",
+    "required_next_actions",
+    "reviewed_inputs",
+    "reviewer_mechanism",
+    "read_only",
+    "max_severity"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "2"
+    },
+    "decision": {
+      "type": "string",
+      "enum": ["approved", "changes_requested", "invalid_input", "blocked"]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "blocking_findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    },
+    "advisory_findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    },
+    "required_next_actions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reviewed_inputs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["kind", "display_path", "size", "hash", "format"],
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "display_path": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string"
+          },
+          "base": {
+            "type": ["string", "null"]
+          },
+          "size": {
+            "type": "number"
+          },
+          "hash": {
+            "type": "string"
+          },
+          "format": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "reviewer_mechanism": {
+      "type": "string",
+      "minLength": 1
+    },
+    "read_only": {
+      "type": "boolean",
+      "const": true
+    },
+    "max_severity": {
+      "$ref": "#/$defs/severity"
+    }
+  },
+  "$defs": {
+    "severity": {
+      "type": "string",
+      "enum": ["info", "low", "medium", "high"]
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "severity", "category", "message", "locations", "required_action", "reviewer_disposition"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "severity": {
+          "$ref": "#/$defs/severity"
+        },
+        "category": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "locations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "required_action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviewer_disposition": {
+          "type": "string",
+          "enum": ["blocking", "advisory"]
+        },
+        "blocking_reason": {
+          "type": "string",
+          "enum": ["reviewer", "category_policy", "severity_policy", "fallback_threshold", "review_execution"]
+        }
+      }
+    }
+  }
+}

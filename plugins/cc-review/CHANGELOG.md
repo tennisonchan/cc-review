@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Added the gate-agnostic `run` review engine with `--context`, `--artifact`, `--focus`, `--stance`, `--scope none|auto|working-tree|branch`, `--on-reviewer-failure`, JSON output, and background job support. Public `cc-review` and `cc-adversarial-review` binaries now dispatch through `run`.
+- Breaking for public binary JSON consumers: `cc-review --json` and `cc-adversarial-review --json` now return the normalized `result.decision` / `result.blocking_findings` shape. Legacy `review`, `adversarial-review`, gate, and bundled skill flows keep the existing `decision.approved` / `needs_changes` schema.
+- Added separate reviewer-output and normalized-result schemas. Reviewer output is validated structurally first; cc-review then applies deterministic machine policy/fallback threshold normalization to return snake_case `blocking_findings`, `advisory_findings`, `required_next_actions`, and `reviewed_inputs`.
+- Background job metadata for generic reviews redacts free-form focus text in persisted status/result records.
+- Branch-scope reviews now auto-detect the default branch before falling back to `main`/`master`.
+
 ## 0.3.0
 
 - Gate infrastructure failures now degrade to a Codex fallback review instead of blocking solely on Claude Code tool/provider failure. Fallback findings still use the existing blocking policy; if both review paths fail, the gate allows finalization with an explicit missing-review-coverage warning.

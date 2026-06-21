@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "findings"],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": ["approved", "changes_requested", "invalid_input", "blocked"]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "category", "message", "locations", "required_action"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "severity": {
+            "$ref": "#/$defs/severity"
+          },
+          "category": {
+            "type": "string",
+            "minLength": 1
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "locations": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "required_action": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reviewer_disposition": {
+            "type": "string",
+            "enum": ["blocking", "advisory"]
+          }
+        }
+      }
+    },
+    "required_next_actions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "severity": {
+      "type": "string",
+      "enum": ["info", "low", "medium", "high"]
+    }
+  }
+}
