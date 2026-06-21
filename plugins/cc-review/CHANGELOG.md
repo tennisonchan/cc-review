@@ -2,6 +2,7 @@
 
 ## 0.3.0
 
+- Gate infrastructure failures now degrade to a Codex fallback review instead of blocking solely on Claude Code tool/provider failure. Fallback findings still use the existing blocking policy; if both review paths fail, the gate allows finalization with an explicit missing-review-coverage warning.
 - Fixed structured output against real Claude Code: the `$schema` meta key made `claude --json-schema` silently skip structured output, so every real review failed as an infrastructure error; the key is now stripped before invocation. Verified end-to-end through real Codex Stop hooks (allow and block paths).
 - Gate reviews are cached per full-fidelity target fingerprint (content-hashed untracked files, full diff text), so a stop that changed nothing reuses the previous verdict instead of invoking Claude again.
 - Review guidelines can declare the gate blocking policy in a `json cc-review` fenced block: `block_on` sets the base severity threshold and `category_block_on` overrides it per finding category (`"never"` exempts a category). Findings now require a `category`, and explicit `--block-on` choices override only the policy's base threshold. Legacy configs that stored the default threshold no longer shadow guidelines policies.
