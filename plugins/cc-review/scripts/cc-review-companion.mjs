@@ -7,13 +7,12 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const SCHEMA_PATH = join(ROOT, "schemas", "review-output.schema.json");
 const REVIEWER_OUTPUT_SCHEMA_PATH = join(ROOT, "schemas", "reviewer-output.schema.json");
 const TEMPLATE_GUIDELINES = join(ROOT, "templates", "review-guidelines.md");
 const SEVERITIES = ["info", "low", "medium", "high"];
 const GENERIC_DECISIONS = ["approved", "changes_requested", "invalid_input", "blocked"];
 const REVIEWER_DISPOSITIONS = ["blocking", "advisory"];
-const BLOCKING_REASONS = ["reviewer", "category_policy", "severity_policy", "fallback_threshold", "review_execution"];
+const BLOCKING_REASONS = ["reviewer", "category_policy", "severity_policy", "fallback_threshold"];
 const DEFAULT_BLOCK_ON = "high";
 const GATE_FINGERPRINT_BLOCK_LIMIT = 3;
 const GATE_TOTAL_BLOCK_LIMIT = 5;
@@ -98,10 +97,10 @@ async function main(argv) {
       await runCommand(args);
       break;
     case "review":
-      await reviewCommand("review", args);
+      await runCommand(aliasArgs(args, { scope: args.scopeExplicit ? args.scope : "auto" }));
       break;
     case "adversarial-review":
-      await reviewCommand("adversarial-review", args);
+      await runCommand(aliasArgs(args, { scope: args.scopeExplicit ? args.scope : "auto", stance: "adversarial", focus: args.focus || args.positional.join(" ").trim() }));
       break;
     case "status":
       await statusCommand(args);
@@ -139,8 +138,8 @@ Run "<subcommand> --help" for subcommand options.`);
 const SUBCOMMAND_HELP = {
   setup: "setup [--init-guidelines] [--force] [--enable-review-gate] [--disable-review-gate] [--block-on info|low|medium|high] [--enable-gate-debug] [--disable-gate-debug] [--json]",
   run: "run [--background] [--context <path>] [--artifact <path>] [--focus <text>] [--stance standard|adversarial] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--on-reviewer-failure block|allow] [--json]",
-  review: "review [--background] [--base <ref>] [--scope auto|working-tree|branch] [--guidelines <path>] [--json]",
-  "adversarial-review": "adversarial-review [--background] [--base <ref>] [--scope auto|working-tree|branch] [--guidelines <path>] [--json] [focus text...]",
+  review: "review [--background] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--json]  (alias for run --scope auto)",
+  "adversarial-review": "adversarial-review [--background] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--json] [focus text...]  (alias for run --stance adversarial --scope auto)",
   status: "status [job-id] [--all] [--json]",
   result: "result [job-id] [--json]",
   cancel: "cancel [job-id] [--json]",
@@ -294,10 +293,7 @@ async function setup(args) {
       const payload = {
         enabled: true,
         event: support.event,
-        // Stored only when explicitly chosen; otherwise the guidelines
-        // policy block (or the built-in default) decides the threshold.
         block_on: args.blockOn || null,
-        block_on_explicit: Boolean(args.blockOn),
         installed_at: new Date().toISOString(),
         companion: fileURLToPath(import.meta.url),
       };
@@ -390,19 +386,9 @@ function renderProjectProfile(profile) {
   return lines.join("\n") + "\n";
 }
 
-async function reviewCommand(kind, args) {
-  if (args.background) {
-    const job = await startBackgroundReview(kind, args);
-    output(job, args.json, (value) => `Started cc-review job ${value.id}\nState: ${value.state}\n`);
-    return;
-  }
-  const result = await runReview({ kind, args, cwd: process.cwd() });
-  output(result, args.json, renderReviewResult);
-}
-
 async function runCommand(args) {
   if (args.blockOn) {
-    throw new Error("--block-on is only supported by setup/gate legacy policy configuration; use a json cc-review policy block with run");
+    throw new Error("--block-on is only supported by setup/gate policy configuration; use a json cc-review policy block with run");
   }
   if (args.background) {
     const job = await startBackgroundReview("run", args);
@@ -413,12 +399,58 @@ async function runCommand(args) {
   output(result, args.json, renderGenericReviewResult);
 }
 
-async function runGenericReview({ args, cwd }) {
+function aliasArgs(args, overrides = {}) {
+  return {
+    ...args,
+    ...overrides,
+    positional: [],
+    scopeExplicit: overrides.scope ? true : args.scopeExplicit,
+  };
+}
+
+async function runGenericReview({ args, cwd, cache = false }) {
   const repo = resolveWorkspace(cwd);
   const guidelines = resolveGuidelines(args.guidelines, cwd, repo.root);
   const policy = guidelinePolicy(guidelines);
   const inputs = collectGenericReviewInputs(repo.root, args, cwd);
   const prompt = buildGenericPrompt({ guidelines, inputs, focus: args.focus || args.positional.join(" ").trim(), stance: args.stance, policy });
+  const targetHash = createHash("sha256")
+    .update(JSON.stringify(["run", args.stance, args.focus || args.positional.join(" ").trim(), guidelines.content, inputs.fingerprint]))
+    .digest("hex");
+  if (inputs.empty) {
+    const result = validateNormalizedResult(normalizeReviewOutput({
+      decision: "approved",
+      summary: "Nothing to review.",
+      findings: [],
+      required_next_actions: [],
+    }, {
+      policy,
+      blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
+      reviewedInputs: inputs.reviewed_inputs,
+      reviewerMechanism: "cc-review",
+    }));
+    return {
+      ok: true,
+      repo: repo.root,
+      guidelines: summarizeGuidelines(guidelines),
+      result,
+      raw: "",
+      reviewer_mechanism: { skipped: true, reason: "empty-target" },
+    };
+  }
+  if (cache) {
+    const cached = readReviewCache(repo.root, targetHash);
+    if (cached) {
+      return {
+        ok: cached.result.decision === "approved",
+        repo: repo.root,
+        guidelines: summarizeGuidelines(guidelines),
+        result: cached.result,
+        raw: cached.raw || "",
+        reviewer_mechanism: { ...(cached.meta || {}), cached: true },
+      };
+    }
+  }
   let claude;
   let reviewerOutput;
   try {
@@ -426,6 +458,9 @@ async function runGenericReview({ args, cwd }) {
     reviewerOutput = validateReviewerOutput(claude.structuredOutput);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (args.onReviewerFailure === "throw") {
+      throw new ReviewToolFailure(message);
+    }
     if (args.onReviewerFailure === "allow") {
       reviewerOutput = {
         decision: "approved",
@@ -448,123 +483,58 @@ async function runGenericReview({ args, cwd }) {
 
   const result = normalizeReviewOutput(reviewerOutput, {
     policy,
-    blockOn: policy.blockOn || DEFAULT_BLOCK_ON,
+    blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
     reviewedInputs: inputs.reviewed_inputs,
     reviewerMechanism: mechanismName(claude.meta),
   });
-  return {
-    ok: result.decision === "approved",
-    repo: repo.root,
-    guidelines: summarizeGuidelines(guidelines),
-    result: validateNormalizedResult(result),
-    raw: claude.resultText,
-    reviewer_mechanism: claude.meta,
-  };
-}
-
-async function runReview({ kind, args, cwd, cache = false }) {
-  const repo = resolveWorkspace(cwd);
-  const guidelines = resolveGuidelines(args.guidelines, cwd, repo.root);
-  const target = collectReviewTarget(repo.root, args);
-
-  if (target.empty) {
-    return {
-      ok: true,
-      repo: repo.root,
-      guidelines,
-      target,
-      decision: approvedDecision(["Nothing to review."]),
-      raw: "",
-    };
-  }
-
-  // The gate re-reviews every stop, but a stop that changed nothing deserves
-  // the same verdict: reuse the previous decision when the review input
-  // (target + guidelines) is identical, instead of paying another claude run.
-  // The hash covers target.fingerprint — full-fidelity raw inputs — not the
-  // rendered prompt, which truncates previews and would miss tail changes.
-  const targetHash = createHash("sha256")
-    .update(JSON.stringify([kind, guidelines.content, target.fingerprint]))
-    .digest("hex");
-  if (cache) {
-    const cached = readReviewCache(repo.root, targetHash);
-    if (cached) {
-      return {
-        ok: cached.decision.approved,
-        repo: repo.root,
-        guidelines,
-        target,
-        decision: cached.decision,
-        raw: cached.raw || "",
-        claude: { ...(cached.meta || {}), cached: true },
-      };
-    }
-  }
-
-  const focus = kind === "adversarial-review" ? args.positional.join(" ").trim() : "";
-  const prompt = buildPrompt({ kind, guidelines, target, focus });
-  let claude;
-  let decision;
-  try {
-    claude = await runClaude(prompt);
-    decision = validateDecision(claude.structuredOutput);
-  } catch (error) {
-    throw new ReviewToolFailure(error instanceof Error ? error.message : String(error));
-  }
+  const normalized = validateNormalizedResult(result);
   if (cache) {
     writeJson(reviewCachePath(repo.root), {
       target_hash: targetHash,
-      decision,
+      result: normalized,
       raw: claude.resultText,
       meta: claude.meta,
       created_at: new Date().toISOString(),
     });
   }
   return {
-    ok: decision.approved,
+    ok: normalized.decision === "approved",
     repo: repo.root,
-    guidelines,
-    target,
-    decision,
+    guidelines: summarizeGuidelines(guidelines),
+    result: normalized,
     raw: claude.resultText,
-    claude: claude.meta,
+    reviewer_mechanism: claude.meta,
   };
 }
 
-async function runFallbackReview({ kind, args, cwd, primaryFailure }) {
+async function runFallbackReview({ args, cwd, primaryFailure }) {
   const repo = resolveWorkspace(cwd);
   const guidelines = resolveGuidelines(args.guidelines, cwd, repo.root);
-  const target = collectReviewTarget(repo.root, args);
-
-  if (target.empty) {
-    return {
-      ok: true,
-      repo: repo.root,
-      guidelines,
-      target,
-      decision: approvedDecision(["Nothing to review."]),
-      raw: "",
-      fallback: { fake: Boolean(process.env.CC_REVIEW_FAKE_FALLBACK_STRUCTURED_OUTPUT), skipped: true },
-    };
-  }
+  const policy = guidelinePolicy(guidelines);
+  const inputs = collectGenericReviewInputs(repo.root, args, cwd);
 
   if (process.env.CC_REVIEW_FAKE_FALLBACK_ERROR) {
     throw new Error(process.env.CC_REVIEW_FAKE_FALLBACK_ERROR);
   }
   if (process.env.CC_REVIEW_FAKE_FALLBACK_STRUCTURED_OUTPUT) {
-    const decision = validateDecision(JSON.parse(process.env.CC_REVIEW_FAKE_FALLBACK_STRUCTURED_OUTPUT));
+    const reviewerOutput = validateReviewerOutput(JSON.parse(process.env.CC_REVIEW_FAKE_FALLBACK_STRUCTURED_OUTPUT));
+    const result = validateNormalizedResult(normalizeReviewOutput(reviewerOutput, {
+      policy,
+      blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
+      reviewedInputs: inputs.reviewed_inputs,
+      reviewerMechanism: "codex-fallback-fake",
+    }));
     return {
-      ok: decision.approved,
+      ok: result.decision === "approved",
       repo: repo.root,
-      guidelines,
-      target,
-      decision,
+      guidelines: summarizeGuidelines(guidelines),
+      result,
       raw: "",
       fallback: { fake: true },
     };
   }
 
-  const prompt = buildFallbackPrompt({ kind, guidelines, target, primaryFailure });
+  const prompt = buildFallbackPrompt({ guidelines, inputs, primaryFailure });
   const outDir = join(stateRoot(), "fallback");
   mkdirSync(outDir, { recursive: true });
   pruneOldFiles(outDir);
@@ -575,7 +545,7 @@ async function runFallbackReview({ kind, args, cwd, primaryFailure }) {
     "exec",
     "--sandbox", "read-only",
     "--cd", repo.root,
-    "--output-schema", SCHEMA_PATH,
+    "--output-schema", REVIEWER_OUTPUT_SCHEMA_PATH,
     "--output-last-message", outPath,
     "-",
   ], {
@@ -603,13 +573,18 @@ async function runFallbackReview({ kind, args, cwd, primaryFailure }) {
   } catch (error) {
     throw new Error(`codex fallback structured output was not JSON: ${error.message}`);
   }
-  const decision = validateDecision(parsed);
+  const reviewerOutput = validateReviewerOutput(parsed);
+  const normalized = validateNormalizedResult(normalizeReviewOutput(reviewerOutput, {
+    policy,
+    blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
+    reviewedInputs: inputs.reviewed_inputs,
+    reviewerMechanism: "codex-fallback",
+  }));
   return {
-    ok: decision.approved,
+    ok: normalized.decision === "approved",
     repo: repo.root,
-    guidelines,
-    target,
-    decision,
+    guidelines: summarizeGuidelines(guidelines),
+    result: normalized,
     raw: readFileSync(outPath, "utf8"),
     fallback: { status: result.status },
   };
@@ -629,7 +604,7 @@ function readReviewCache(repoRoot, targetHash) {
   const createdAt = Date.parse(cached.created_at || "");
   if (!Number.isFinite(createdAt) || Date.now() - createdAt > ttl) return null;
   try {
-    validateDecision(cached.decision);
+    validateNormalizedResult(cached.result);
   } catch {
     return null;
   }
@@ -638,26 +613,6 @@ function readReviewCache(repoRoot, targetHash) {
 
 function reviewCachePath(repoRoot) {
   return join(stateRoot(), "review-cache", `${repoHash(repoRoot)}.json`);
-}
-
-function buildPrompt({ kind, guidelines, target, focus }) {
-  const mode = kind === "adversarial-review" ? "adversarial challenge review" : "code review";
-  return [
-    "You are Claude Code acting as a read-only reviewer for Codex.",
-    "Non-overridable safety: do not edit files, write files, apply patches, commit, run destructive commands, or continue into implementation.",
-    "You may use Read, Grep, and Glob to inspect surrounding code for context.",
-    "Return findings only. Use the requested structured output schema exactly.",
-    "Set each finding's category to the best-matching guideline-defined category, or a short kind such as correctness, security, or style when none are defined.",
-    "",
-    `Review mode: ${mode}`,
-    focus ? `Focus: ${focus}` : "",
-    "",
-    "Review guidelines:",
-    guidelines.content,
-    "",
-    "Review target:",
-    target.content,
-  ].filter(Boolean).join("\n");
 }
 
 function buildGenericPrompt({ guidelines, inputs, focus, stance, policy }) {
@@ -699,15 +654,11 @@ function buildGenericPrompt({ guidelines, inputs, focus, stance, policy }) {
   ].filter(Boolean).join("\n");
 }
 
-function buildFallbackPrompt({ kind, guidelines, target, primaryFailure }) {
-  const mode = kind === "adversarial-review" ? "adversarial challenge review" : "code review";
+function buildFallbackPrompt({ guidelines, inputs, primaryFailure }) {
   return [
     "You are Codex acting as a degraded fallback reviewer because Claude cc-review is unavailable.",
     "This is a read-only review. Do not edit files, write files, apply patches, commit, or continue into implementation.",
-    "Review the same target Claude cc-review would have reviewed and return only structured findings matching the requested schema.",
-    "Use the requested severity and category fields so the existing cc-review gate policy can decide whether findings block.",
-    "",
-    `Review mode: ${mode}`,
+    "Review the same generic inputs Claude cc-review would have reviewed and return only structured findings matching the requested reviewer-output schema.",
     "",
     "Claude cc-review failure context, sanitized:",
     redact(primaryFailure),
@@ -715,8 +666,8 @@ function buildFallbackPrompt({ kind, guidelines, target, primaryFailure }) {
     "Review guidelines:",
     guidelines.content,
     "",
-    "Review target:",
-    target.content,
+    "Review inputs:",
+    inputs.content,
   ].join("\n");
 }
 
@@ -729,10 +680,6 @@ function loadSchema(schemaPath) {
   return JSON.stringify(schema);
 }
 
-function loadReviewSchema() {
-  return loadSchema(SCHEMA_PATH);
-}
-
 async function runClaude(prompt, options = {}) {
   if (process.env.CC_REVIEW_FAKE_STRUCTURED_OUTPUT) {
     const structuredOutput = JSON.parse(process.env.CC_REVIEW_FAKE_STRUCTURED_OUTPUT);
@@ -741,7 +688,7 @@ async function runClaude(prompt, options = {}) {
 
   // Read-only context tools so the reviewer can see beyond the diff (the
   // enclosing function, callers, tests); plan mode prevents writes.
-  const args = ["-p", "--permission-mode", "plan", "--tools", "Read,Grep,Glob", "--output-format", "json", "--json-schema", loadSchema(options.schemaPath || SCHEMA_PATH)];
+  const args = ["-p", "--permission-mode", "plan", "--tools", "Read,Grep,Glob", "--output-format", "json", "--json-schema", loadSchema(options.schemaPath || REVIEWER_OUTPUT_SCHEMA_PATH)];
   const childEnv = { ...process.env };
   delete childEnv.CC_REVIEW_BACKGROUND_ARGS;
 
@@ -937,6 +884,7 @@ function collectGenericReviewInputs(repoRoot, args, cwd) {
     content: blocks.join("\n\n---\n\n"),
     reviewed_inputs: reviewedInputs,
     fingerprint: targetFingerprint(rawParts),
+    empty: !context && !artifact && target.scope !== "none" && target.empty,
   };
 }
 
@@ -1134,9 +1082,7 @@ async function runBackgroundJob(jobPath) {
   try {
     outcome.state = "completed";
     const runArgs = backgroundExecutionArgs(job.args);
-    const result = job.kind === "run"
-      ? await runGenericReview({ args: runArgs, cwd: job.cwd })
-      : await runReview({ kind: job.kind, args: runArgs, cwd: job.cwd });
+    const result = await runGenericReview({ args: runArgs, cwd: job.cwd });
     outcome.result = sanitizeResultForPersistence(result);
     outcome.exit_code = 0;
   } catch (error) {
@@ -1215,7 +1161,7 @@ async function resultCommand(args) {
   const job = jobs.find((candidate) => candidate.id === id);
   if (!job) throw new Error(`job not found: ${id}`);
   output(job, args.json, (value) => {
-    if (value.result) return renderAnyResult(value.result);
+    if (value.result) return renderGenericReviewResult(value.result);
     if (value.error) return `Job ${value.id} failed:\n${value.error}\n`;
     return `Job ${value.id} is ${value.state}.\n`;
   });
@@ -1282,15 +1228,10 @@ async function gateCommand(args) {
     return;
   }
 
-  // Base-threshold precedence: explicit per-repo setup choice, then the
-  // guidelines policy block, then the built-in default; category overrides
-  // from the guidelines always apply. Legacy configs (pre-policy) stored the
-  // default unconditionally, so without the explicit marker only a
-  // non-default value counts as a choice.
-  const explicitConfigBlockOn = config.block_on_explicit
-    ? config.block_on
-    : (config.block_on && config.block_on !== DEFAULT_BLOCK_ON ? config.block_on : null);
-  const configuredBlockOn = explicitConfigBlockOn || args.blockOn || null;
+  // Base-threshold precedence: per-repo setup choice, then the guidelines
+  // policy block, then the built-in default; category overrides from the
+  // guidelines always apply.
+  const configuredBlockOn = config.block_on || args.blockOn || null;
   if (configuredBlockOn) assertSeverity(configuredBlockOn, "gate block_on");
   const taskKey = gateTaskKey(hookPayload);
   const state = readGateState(repo.root);
@@ -1299,7 +1240,7 @@ async function gateCommand(args) {
   let reviewResult;
   let fallbackDisclosure = "";
   try {
-    reviewResult = await runReview({ kind: "review", args: { ...args, json: true, positional: [] }, cwd: process.cwd(), cache: true });
+    reviewResult = await runGenericReview({ args: { ...args, json: true, positional: [], scope: args.scope || "auto", blockOn: configuredBlockOn || undefined, onReviewerFailure: "throw" }, cwd: process.cwd(), cache: true });
   } catch (error) {
     const message = redact(error instanceof Error ? error.message : String(error));
     if (!(error instanceof ReviewToolFailure)) {
@@ -1309,7 +1250,7 @@ async function gateCommand(args) {
       return;
     }
     try {
-      const fallback = await runFallbackReview({ kind: "review", args: { ...args, json: true, positional: [] }, cwd: process.cwd(), primaryFailure: message });
+      const fallback = await runFallbackReview({ args: { ...args, json: true, positional: [], scope: args.scope || "auto", blockOn: configuredBlockOn || undefined }, cwd: process.cwd(), primaryFailure: message });
       reviewResult = fallback;
       fallbackDisclosure = [
         "Claude cc-review was unavailable; used degraded Codex fallback review.",
@@ -1332,9 +1273,7 @@ async function gateCommand(args) {
 
   let blocking;
   try {
-    const policy = guidelinePolicy(reviewResult.guidelines);
-    const blockOn = configuredBlockOn || policy.blockOn || DEFAULT_BLOCK_ON;
-    blocking = blockingFindings(reviewResult.decision, blockOn, policy);
+    blocking = reviewResult.result.blocking_findings;
   } catch (error) {
     const message = redact(error instanceof Error ? error.message : String(error));
     state.tasks[taskKey] = taskState;
@@ -1360,7 +1299,7 @@ async function gateCommand(args) {
   taskState.updated_at = taskState.last_blocked_at;
   taskState.last_findings = blocking.map((finding) => finding.id);
 
-  const reason = blocking.map((finding) => `[${finding.severity}] ${finding.location}: ${finding.summary}`).join("\n");
+  const reason = blocking.map((finding) => `[${finding.severity}] ${finding.locations[0] || ""}: ${finding.message}`).join("\n");
   const cap = taskState.block_count > GATE_FINGERPRINT_BLOCK_LIMIT
     ? "cc-review reached the three-block convergence cap."
     : taskState.total_blocks > GATE_TOTAL_BLOCK_LIMIT
@@ -1376,7 +1315,7 @@ async function gateCommand(args) {
   }
   state.tasks[taskKey] = taskState;
   writeGateState(repo.root, state);
-  outputHookBlock(`${fallbackDisclosure ? `${fallbackDisclosure}\n\nFallback review needs_changes` : "cc-review needs_changes"}:\n${reason}`);
+  outputHookBlock(`${fallbackDisclosure ? `${fallbackDisclosure}\n\nFallback review changes_requested` : "cc-review changes_requested"}:\n${reason}`);
 }
 
 function freshTaskState(taskState) {
@@ -1390,15 +1329,6 @@ function freshTaskState(taskState) {
   const updatedAt = Date.parse(taskState.updated_at || taskState.last_blocked_at || "");
   if (!Number.isFinite(updatedAt) || Date.now() - updatedAt > gap) return empty;
   return taskState;
-}
-
-function blockingFindings(decision, blockOn, policy = { categories: {} }) {
-  return decision.needs_changes.filter((finding) => {
-    const categoryThreshold = finding.category ? policy.categories[finding.category] : undefined;
-    const threshold = categoryThreshold !== undefined ? categoryThreshold : blockOn;
-    if (threshold === "never") return false;
-    return SEVERITIES.indexOf(finding.severity) >= SEVERITIES.indexOf(threshold);
-  });
 }
 
 // Guidelines may carry a machine-readable policy in a fenced block:
@@ -1502,7 +1432,6 @@ function normalizeReviewOutput(reviewerOutput, { policy, blockOn, reviewedInputs
     ...blocking.map((finding) => finding.required_action),
     ...(reviewerOutput.required_next_actions || []),
   ].filter(Boolean);
-  const maxSeverity = maxFindingSeverity([...blocking, ...advisory]);
   return {
     schema_version: "2",
     decision: blocking.length ? "changes_requested" : "approved",
@@ -1513,7 +1442,6 @@ function normalizeReviewOutput(reviewerOutput, { policy, blockOn, reviewedInputs
     reviewed_inputs: reviewedInputs,
     reviewer_mechanism: reviewerMechanism || "claude-code",
     read_only: true,
-    max_severity: maxSeverity,
   };
 }
 
@@ -1553,7 +1481,6 @@ function syntheticNormalizedFailure(decision, summary, reviewedInputs = [], requ
     reviewed_inputs: reviewedInputs,
     reviewer_mechanism: reviewerMechanism,
     read_only: true,
-    max_severity: "high",
   };
 }
 
@@ -1587,7 +1514,6 @@ function validateNormalizedResult(value) {
     }
   }
   if (value.read_only !== true) throw new Error("normalized result read_only must be true");
-  assertSeverity(value.max_severity, "normalized result max_severity");
   return value;
 }
 
@@ -1611,41 +1537,6 @@ function summarizeGuidelines(guidelines) {
     path: guidelines.path,
     display_path: guidelines.displayPath,
   };
-}
-
-function validateDecision(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("structured_output must be an object");
-  }
-  if (!["approved", "needs_changes"].includes(value.decision)) {
-    throw new Error("structured_output.decision must be approved or needs_changes");
-  }
-  if (typeof value.approved !== "boolean") {
-    throw new Error("structured_output.approved must be boolean");
-  }
-  assertSeverity(value.max_severity, "structured_output.max_severity");
-  if (!Array.isArray(value.needs_changes)) {
-    throw new Error("structured_output.needs_changes must be an array");
-  }
-  for (const finding of value.needs_changes) {
-    if (!finding || typeof finding !== "object") throw new Error("finding must be an object");
-    if (!finding.id) throw new Error("finding.id is required");
-    assertSeverity(finding.severity, "finding.severity");
-    if (typeof finding.location !== "string") throw new Error("finding.location must be a string");
-    if (typeof finding.category !== "string" || !finding.category) {
-      throw new Error("finding.category is required");
-    }
-    if (!finding.summary) throw new Error("finding.summary is required");
-    if (!finding.required_action) throw new Error("finding.required_action is required");
-  }
-  if (!Array.isArray(value.notes)) {
-    throw new Error("structured_output.notes must be an array");
-  }
-  return value;
-}
-
-function approvedDecision(notes = []) {
-  return { decision: "approved", approved: true, max_severity: "info", needs_changes: [], notes };
 }
 
 function assertSeverity(value, label) {
@@ -1758,31 +1649,6 @@ function renderSetup(value) {
   return lines.join("\n") + "\n";
 }
 
-function renderReviewResult(value) {
-  const lines = [];
-  if (value.guidelines.source === "bundled") {
-    lines.push("Using bundled review guidelines. Run `cc-review-setup --init-guidelines` to customize.");
-  } else {
-    lines.push(`Using review guidelines: ${value.guidelines.displayPath}`);
-  }
-  lines.push(`Decision: ${value.decision.decision}`);
-  lines.push(`Max severity: ${value.decision.max_severity}`);
-  if (value.decision.needs_changes.length) {
-    lines.push("");
-    lines.push("Needs changes:");
-    for (const finding of value.decision.needs_changes) {
-      lines.push(`- [${finding.severity}] ${finding.location}: ${finding.summary}`);
-      lines.push(`  Required action: ${finding.required_action}`);
-    }
-  }
-  if (value.decision.notes?.length) {
-    lines.push("");
-    lines.push("Notes:");
-    for (const note of value.decision.notes) lines.push(`- ${note}`);
-  }
-  return lines.join("\n") + "\n";
-}
-
 function renderGenericReviewResult(value) {
   const result = value.result;
   const lines = [];
@@ -1792,7 +1658,7 @@ function renderGenericReviewResult(value) {
     lines.push(`Using review guidelines: ${value.guidelines.display_path}`);
   }
   lines.push(`Decision: ${result.decision}`);
-  lines.push(`Max severity: ${result.max_severity}`);
+  lines.push(`Max severity: ${maxFindingSeverity([...result.blocking_findings, ...result.advisory_findings])}`);
   if (result.blocking_findings.length) {
     lines.push("");
     lines.push("Blocking findings:");
@@ -1814,10 +1680,6 @@ function renderGenericReviewResult(value) {
     for (const action of result.required_next_actions) lines.push(`- ${action}`);
   }
   return lines.join("\n") + "\n";
-}
-
-function renderAnyResult(value) {
-  return value?.result?.schema_version === "2" ? renderGenericReviewResult(value) : renderReviewResult(value);
 }
 
 function output(value, json, renderer) {

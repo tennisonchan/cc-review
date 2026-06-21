@@ -10,14 +10,17 @@ Use this skill when the agent needs Claude Code to challenge a specific design, 
 Run:
 
 ```bash
-node "<skill-root>/../../scripts/cc-review-companion.mjs" adversarial-review $ARGUMENTS
+node "<skill-root>/../../scripts/cc-review-companion.mjs" run --scope auto --stance adversarial $ARGUMENTS
 ```
 
 Supported arguments:
 
 - `--background`
 - `--base <ref>`
-- `--scope auto|working-tree|branch`
+- `--scope none|auto|working-tree|branch`
+- `--context <path>`
+- `--artifact <path>`
+- `--focus <text>`
 - `--guidelines <path>`
 - `--json`
 - trailing focus text
