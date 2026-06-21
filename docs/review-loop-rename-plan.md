@@ -118,7 +118,7 @@ Behavior:
    - README and plugin README should describe `review-loop` as a multi-agent review loop engine.
    - Document `--counter` as the counter-review stance.
    - State that old `cc-review` command names are intentionally not preserved.
-   - Update install examples while noting the GitHub repo URL may still be `tennisonchan/cc-review` until the repository itself is renamed externally.
+   - Update install examples to use the renamed GitHub repository URL `tennisonchan/review-loop`.
    - Update templates and live `.claude/rules/review-guidelines.md` fence names.
    - Update the parser to recognize only `json review-loop`.
    - Add a changelog/migration note that old `json cc-review` policy blocks are intentionally no longer honored.
@@ -141,7 +141,7 @@ Behavior:
 - `node --check tests/companion.test.mjs`
 - `npm test`
 - Residual token scan must pass with only documented exceptions:
-  - Allowed: GitHub repository URL examples such as `tennisonchan/cc-review` until the remote is renamed externally.
+  - Allowed: migration/history references that explain the old repository name.
   - Allowed: migration notes and tests explicitly describing removed `cc-review` names and ignored old policy fences.
   - Allowed: this design plan when describing old-to-new rename intent.
   - Not allowed: active bin names, skill names, env vars, state dirs, prompt strings, policy parser names, or docs commands using `cc-review`, `cc-adversarial-review`, `adversarial`, `cc_review`, `ccr-`, or `CC_REVIEW_`.

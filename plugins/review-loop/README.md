@@ -67,7 +67,7 @@ Use `review-loop run --context ...` or `review-loop run --artifact ...` for cont
 Add the marketplace:
 
 ```bash
-codex plugin marketplace add tennisonchan/cc-review --ref main
+codex plugin marketplace add tennisonchan/review-loop --ref main
 ```
 
 Install the plugin:
@@ -86,7 +86,7 @@ codex plugin add review-loop@review-loop
 Inside Codex, `review-loop`, `review-loop-setup`, and the other commands are plugin skills — ask the agent to run them. To use the same commands from your own shell, install the binaries globally:
 
 ```bash
-npm install -g github:tennisonchan/cc-review
+npm install -g github:tennisonchan/review-loop
 review-loop-setup --init-guidelines
 ```
 
