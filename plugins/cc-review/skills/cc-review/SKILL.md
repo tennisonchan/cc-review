@@ -10,14 +10,17 @@ Use this skill before a final response, implementation-ready claim, or PR submis
 Run:
 
 ```bash
-node "<skill-root>/../../scripts/cc-review-companion.mjs" review $ARGUMENTS
+node "<skill-root>/../../scripts/cc-review-companion.mjs" run --scope auto $ARGUMENTS
 ```
 
 Supported arguments:
 
 - `--background`
 - `--base <ref>`
-- `--scope auto|working-tree|branch`
+- `--scope none|auto|working-tree|branch`
+- `--context <path>`
+- `--artifact <path>`
+- `--focus <text>`
 - `--guidelines <path>`
 - `--json`
 

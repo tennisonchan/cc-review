@@ -9,7 +9,7 @@ cc-review-setup --init-guidelines
 cc-review
 ```
 
-`cc-review` asks Claude Code to review supplied material without editing files. The public `cc-review` binary maps to the generic `run` engine over the current working tree. Legacy `review` and `adversarial-review` subcommands remain available for compatibility with existing hooks and skills.
+`cc-review` asks Claude Code to review supplied material without editing files. `run` is the canonical engine; `review` and `adversarial-review` are thin aliases that return the same normalized result shape.
 
 ## Features
 
@@ -47,12 +47,12 @@ Useful options:
 - `--scope none|auto|working-tree|branch` selects repository diff input. For `run`, context/artifact-only reviews default to `none`; otherwise the default is `auto`.
 - `--focus <text>` supplies the reviewer ask.
 - `--stance standard|adversarial` changes the review stance without introducing gate-specific modes.
-- `--on-reviewer-failure block|allow` controls mechanism failure behavior. The generic engine defaults to `block`; the legacy Stop hook keeps its historical report-only fallback path.
+- `--on-reviewer-failure block|allow` controls direct-run mechanism failure behavior. The generic engine defaults to `block`; the Stop hook uses the same v2 result shape and can invoke a degraded read-only Codex fallback when Claude Code is unavailable.
 - `--background`, `status`, `result`, and `cancel` work with generic reviews. Persisted job metadata is sanitized; free-form focus text, logs, and errors are not returned raw through status/result JSON.
 
 JSON output uses snake_case fields. The normalized result is under `result` and includes `decision`, `blocking_findings`, `advisory_findings`, `required_next_actions`, `reviewed_inputs`, `reviewer_mechanism`, and `read_only`.
 
-Use `cc-review run --context ...` or `cc-review run --artifact ...` for context/artifact-only reviews. Bare `cc-review --context ...` keeps the compatibility wrapper's working-tree default and reviews the diff too. The normalized `decision` is derived from normalized blocking findings; reviewer `approved`/`changes_requested` proposals are advisory except for `invalid_input` and `blocked`.
+Use `cc-review run --context ...` or `cc-review run --artifact ...` for context/artifact-only reviews. Bare `cc-review --context ...` uses the `cc-review` alias default of `--scope auto` and reviews the diff too. The normalized `decision` is derived from normalized blocking findings; reviewer `approved`/`changes_requested` proposals are advisory except for `invalid_input` and `blocked`.
 
 `cc-review` does not know whether the caller is satisfying an execution, design, merge, or audit gate. For agent-kernel integration, agent-kernel prepares the context packet, calls `cc-review run`, records the generic result, and maps that result back to its own gate semantics.
 
@@ -125,7 +125,7 @@ Enable the blocking gate for the current repository:
 cc-review-setup --enable-review-gate
 ```
 
-The gate blocks finalization when Claude Code returns `needs_changes` at or above the configured threshold. Each blocked stop is re-reviewed, so fixes are verified before finalization. Loop prevention is bounded per task: three blocks for the same finding set, five blocks total, and two blocks for review infrastructure failures; past those caps the gate allows finalization and reports the unresolved findings instead. A stop that changed nothing reuses the previous review decision instead of invoking Claude again. Disable it with:
+The gate blocks finalization when the normalized result contains `blocking_findings`. Each blocked stop is re-reviewed, so fixes are verified before finalization. Loop prevention is bounded per task: three blocks for the same finding set and five blocks total; past those caps the gate allows finalization and reports the unresolved findings instead. A stop that changed nothing reuses the previous review decision instead of invoking Claude again. Disable it with:
 
 ```bash
 cc-review-setup --disable-review-gate

@@ -9,7 +9,7 @@ Use these severities:
 - `low`: minor issue, edge case, or localized cleanup.
 - `info`: non-blocking observation.
 
-Return `needs_changes` only for findings that require action before the work is finalized. Avoid style-only findings unless they affect correctness or maintainability.
+Mark findings as `blocking` only when they require action before the work is finalized. Avoid style-only findings unless they affect correctness or maintainability.
 
 ## Categories
 
