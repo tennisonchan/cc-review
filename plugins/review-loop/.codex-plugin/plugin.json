@@ -1,7 +1,7 @@
 {
-  "name": "cc-review",
+  "name": "review-loop",
   "version": "0.3.0",
-  "description": "Run read-only Claude Code reviews from Codex before finalization.",
+  "description": "Run read-only multi-agent review loops from Codex before finalization.",
   "author": {
     "name": "Tennison Chan"
   },
@@ -16,9 +16,9 @@
   "skills": "./skills/",
   "hooks": "./hooks/codex-hooks.json",
   "interface": {
-    "displayName": "cc-review",
-    "shortDescription": "Run read-only Claude Code reviews before Codex finalizes work",
-    "longDescription": "Use cc-review to connect Codex to Claude Code for read-only reviews, normalized approved/changes_requested decisions, customizable review guidelines, and conditional agent-finalization review gates.",
+    "displayName": "review-loop",
+    "shortDescription": "Run read-only multi-agent review loops before Codex finalizes work",
+    "longDescription": "Use review-loop to run read-only independent reviews, normalized approved/changes_requested decisions, customizable review guidelines, counter-review with --counter, and conditional agent-finalization review gates.",
     "developerName": "Tennison Chan",
     "category": "Developer Tools",
     "capabilities": [
@@ -27,9 +27,9 @@
     ],
     "websiteURL": "https://github.com/tennisonchan/cc-review",
     "defaultPrompt": [
-      "Run a read-only Claude Code review before finalizing this change",
+      "Run a read-only review loop before finalizing this change",
       "Initialize review guidelines for this project",
-      "Check whether the cc-review gate can be enabled"
+      "Check whether the review-loop gate can be enabled"
     ],
     "screenshots": [],
     "brandColor": "#111827"

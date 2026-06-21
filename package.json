@@ -1,7 +1,7 @@
 {
-  "name": "cc-review",
+  "name": "review-loop",
   "version": "0.3.0",
-  "description": "Codex plugin for running read-only Claude Code reviews and review gates.",
+  "description": "Multi-agent review loop engine for read-only independent reviews and review gates.",
   "type": "module",
   "private": false,
   "license": "Apache-2.0",
@@ -9,17 +9,16 @@
     "node": ">=18.18.0"
   },
   "bin": {
-    "cc-review-companion": "./plugins/cc-review/scripts/cc-review-companion.mjs",
-    "cc-review": "./plugins/cc-review/scripts/bin/cc-review.mjs",
-    "cc-review-setup": "./plugins/cc-review/scripts/bin/cc-review-setup.mjs",
-    "cc-review-status": "./plugins/cc-review/scripts/bin/cc-review-status.mjs",
-    "cc-review-result": "./plugins/cc-review/scripts/bin/cc-review-result.mjs",
-    "cc-review-cancel": "./plugins/cc-review/scripts/bin/cc-review-cancel.mjs",
-    "cc-adversarial-review": "./plugins/cc-review/scripts/bin/cc-adversarial-review.mjs"
+    "review-loop-companion": "./plugins/review-loop/scripts/review-loop-companion.mjs",
+    "review-loop": "./plugins/review-loop/scripts/bin/review-loop.mjs",
+    "review-loop-setup": "./plugins/review-loop/scripts/bin/review-loop-setup.mjs",
+    "review-loop-status": "./plugins/review-loop/scripts/bin/review-loop-status.mjs",
+    "review-loop-result": "./plugins/review-loop/scripts/bin/review-loop-result.mjs",
+    "review-loop-cancel": "./plugins/review-loop/scripts/bin/review-loop-cancel.mjs"
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "validate": "node --test tests/*.test.mjs && node plugins/cc-review/scripts/cc-review-companion.mjs setup --json"
+    "validate": "node --test tests/*.test.mjs && node plugins/review-loop/scripts/review-loop-companion.mjs setup --json"
   },
   "keywords": [
     "codex",

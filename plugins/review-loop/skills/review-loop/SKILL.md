@@ -1,16 +1,16 @@
 ---
-name: cc-review
+name: review-loop
 description: Run a read-only Claude Code review over local changes before Codex finalizes work.
 ---
 
-# cc-review
+# review-loop
 
 Use this skill before a final response, implementation-ready claim, or PR submission.
 
 Run:
 
 ```bash
-node "<skill-root>/../../scripts/cc-review-companion.mjs" run --scope auto $ARGUMENTS
+node "<skill-root>/../../scripts/review-loop-companion.mjs" run --scope auto $ARGUMENTS
 ```
 
 Supported arguments:
@@ -22,6 +22,7 @@ Supported arguments:
 - `--artifact <path>`
 - `--focus <text>`
 - `--guidelines <path>`
+- `--counter`
 - `--json`
 
 The review is read-only. Do not ask Claude Code to patch, edit, commit, or continue into implementation.

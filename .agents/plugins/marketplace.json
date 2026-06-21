@@ -1,14 +1,14 @@
 {
-  "name": "cc-review",
+  "name": "review-loop",
   "interface": {
-    "displayName": "cc-review"
+    "displayName": "review-loop"
   },
   "plugins": [
     {
-      "name": "cc-review",
+      "name": "review-loop",
       "source": {
         "source": "local",
-        "path": "./plugins/cc-review"
+        "path": "./plugins/review-loop"
       },
       "policy": {
         "installation": "AVAILABLE",
