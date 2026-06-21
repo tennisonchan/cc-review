@@ -129,6 +129,195 @@ process.stdin.on("end", () => {
   assert.deepEqual(schema.properties.decision.enum, ["approved", "needs_changes"]);
 });
 
+test("run normalizes policy-promoted advisory findings into blocking findings", () => {
+  const repo = makeGitRepo();
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+
+\`\`\`json cc-review
+{ "block_on": "high", "category_block_on": { "security": "medium" } }
+\`\`\`
+`);
+  const context = join(repo, "review-context.md");
+  writeFileSync(context, "Problem: test policy promotion\n");
+  const reviewerOutput = {
+    decision: "approved",
+    summary: "Security issue is advisory from the reviewer but blocks by policy.",
+    findings: [{
+      id: "sec-medium",
+      severity: "medium",
+      category: "security",
+      message: "Token handling is underspecified.",
+      locations: ["review-context.md:1"],
+      required_action: "Document token handling.",
+      reviewer_disposition: "advisory",
+    }],
+    required_next_actions: [],
+  };
+
+  const result = run(["run", "--context", context, "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(reviewerOutput) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "changes_requested");
+  assert.equal(parsed.result.blocking_findings.length, 1);
+  assert.equal(parsed.result.blocking_findings[0].blocking_reason, "category_policy");
+  assert.equal(parsed.result.advisory_findings.length, 0);
+  assert.equal(parsed.result.read_only, true);
+});
+
+test("run defaults context-only reviews to scope none and uses reviewer-output schema", () => {
+  const repo = makeGitRepo();
+  const context = join(repo, "review-context.md");
+  writeFileSync(context, "Problem: review this design only\n");
+  writeFileSync(join(repo, "dirty.txt"), "should not be reviewed by default\n");
+  const argvFile = join(repo, "argv.json");
+  const stdinFile = join(repo, "stdin.txt");
+  const fakeClaude = join(repo, "bin", "claude-capture");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeClaude, `#!/usr/bin/env node
+const fs = require("fs");
+fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));
+let input = "";
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
+  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }, result: "ok" }));
+});
+`, { mode: 0o755 });
+
+  const result = run(["run", "--context", context, "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: fakeClaude },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.reviewed_inputs.find((input) => input.kind === "scope").scope, "none");
+  const prompt = readFileSync(stdinFile, "utf8");
+  assert.match(prompt, /scope: none/);
+  assert.doesNotMatch(prompt, /dirty\.txt/);
+  const argv = JSON.parse(readFileSync(argvFile, "utf8"));
+  const schema = JSON.parse(argv[argv.indexOf("--json-schema") + 1]);
+  assert.deepEqual(schema.properties.decision.enum, ["approved", "changes_requested", "invalid_input", "blocked"]);
+  assert.ok(schema.properties.findings);
+});
+
+test("run uses fallback threshold for high advisory findings", () => {
+  const repo = makeGitRepo();
+  const guidelines = join(repo, "guidelines.md");
+  writeFileSync(guidelines, "# Human-only guidelines\n");
+  const reviewerOutput = {
+    decision: "approved",
+    summary: "High risk should block by fallback threshold.",
+    findings: [{
+      id: "risk-high",
+      severity: "high",
+      category: "risk",
+      message: "The artifact omits rollback behavior.",
+      locations: ["plan.md:1"],
+      required_action: "Add rollback behavior.",
+      reviewer_disposition: "advisory",
+    }],
+  };
+  const plan = join(repo, "plan.md");
+  writeFileSync(plan, "Plan\n");
+  const result = run(["run", "--artifact", plan, "--guidelines", guidelines, "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(reviewerOutput) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "changes_requested");
+  assert.equal(parsed.result.blocking_findings[0].blocking_reason, "fallback_threshold");
+});
+
+test("run labels explicit base policy promotions as severity_policy", () => {
+  const repo = makeGitRepo();
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+
+\`\`\`json cc-review
+{ "block_on": "high" }
+\`\`\`
+`);
+  const plan = join(repo, "plan.md");
+  writeFileSync(plan, "Plan\n");
+  const result = run(["run", "--artifact", plan, "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      decision: "approved",
+      summary: "High issue blocks by explicit policy.",
+      findings: [{
+        id: "high-policy",
+        severity: "high",
+        category: "correctness",
+        message: "A high issue.",
+        locations: ["plan.md:1"],
+        required_action: "Fix the high issue.",
+        reviewer_disposition: "advisory",
+      }],
+    }) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).result.blocking_findings[0].blocking_reason, "severity_policy");
+});
+
+test("run fails closed on reviewer mechanism failure by default", () => {
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", findings: [] }) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "blocked");
+  assert.match(parsed.result.summary, /Reviewer mechanism failed/);
+});
+
+test("run can fail open explicitly on reviewer mechanism failure", () => {
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--on-reviewer-failure", "allow", "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", findings: [] }) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "approved");
+  assert.match(parsed.result.summary, /on-reviewer-failure=allow/);
+});
+
+test("run rejects legacy --block-on policy override", () => {
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--block-on", "medium", "--json"], {
+    cwd: repo,
+    env: testEnv(repo),
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--block-on is only supported/);
+});
+
+test("run preserves reviewer invalid_input and blocked decisions without synthetic findings", () => {
+  const repo = makeGitRepo();
+  for (const decision of ["invalid_input", "blocked"]) {
+    const result = run(["run", "--scope", "none", "--json"], {
+      cwd: repo,
+      env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+        decision,
+        summary: `${decision} from reviewer`,
+        findings: [],
+        required_next_actions: ["Try again."],
+      }) },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.result.decision, decision);
+    assert.deepEqual(parsed.result.blocking_findings, []);
+    assert.deepEqual(parsed.result.required_next_actions, ["Try again."]);
+  }
+});
+
 test("oversized diffs are truncated in the review prompt", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "small\n");
@@ -1139,6 +1328,55 @@ test("background review job can be started, listed, and read", async () => {
   assert.equal(typeof completed.pid, "number");
 });
 
+test("run background jobs return normalized results with sanitized metadata", async () => {
+  const repo = makeGitRepo();
+  const context = join(repo, "context.md");
+  writeFileSync(context, "Problem: background review\n");
+  const stdinFile = join(repo, "background-stdin.txt");
+  const envFile = join(repo, "background-env.json");
+  const fakeClaude = join(repo, "bin", "claude-background-capture");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeClaude, `#!/usr/bin/env node
+const fs = require("fs");
+let input = "";
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
+  fs.writeFileSync(${JSON.stringify(envFile)}, JSON.stringify({ backgroundArgs: process.env.CC_REVIEW_BACKGROUND_ARGS || "" }));
+  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }, result: "reviewer raw text" }));
+});
+`, { mode: 0o755 });
+  const env = {
+    ...testEnv(repo),
+    CC_REVIEW_CLAUDE_BIN: fakeClaude,
+  };
+
+  const started = run(["run", "--context", context, "--focus", "api_key=secret-value", "--background", "--json"], { cwd: repo, env });
+  assert.equal(started.status, 0, started.stderr);
+  const job = JSON.parse(started.stdout);
+  assert.equal(job.state, "running");
+  assert.equal(job.args.focus, "[redacted]");
+  assert.doesNotMatch(started.stdout, /secret-value/);
+
+  await waitFor(() => {
+    const status = run(["status", job.id, "--json"], { cwd: repo, env });
+    assert.doesNotMatch(status.stdout, /secret-value/);
+    return JSON.parse(status.stdout).jobs[0]?.state === "completed";
+  });
+
+  const result = run(["result", job.id, "--json"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stdout, /secret-value/);
+  const completed = JSON.parse(result.stdout);
+  assert.equal(completed.result.result.schema_version, "2");
+  assert.equal(completed.result.result.decision, "approved");
+  assert.equal(completed.result.raw, "[redacted]");
+  const prompt = readFileSync(stdinFile, "utf8");
+  assert.match(prompt, /Focus: api_key=secret-value/);
+  assert.doesNotMatch(prompt, /Focus: \[redacted\]/);
+  assert.equal(JSON.parse(readFileSync(envFile, "utf8")).backgroundArgs, "");
+});
+
 test("cancel of a completed job preserves the result", async () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
@@ -1279,11 +1517,44 @@ test("bin aliases dispatch to their subcommand", () => {
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   const review = spawnSync(process.execPath, [reviewBin, "--json"], {
     cwd: repo,
-    env: { ...env, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", approved: true, max_severity: "info", needs_changes: [], notes: [] }) },
+    env: { ...env, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "ok", findings: [], required_next_actions: [] }) },
     encoding: "utf8",
   });
   assert.equal(review.status, 0, review.stderr);
-  assert.equal(JSON.parse(review.stdout).decision.approved, true);
+  assert.equal(JSON.parse(review.stdout).result.decision, "approved");
+
+  const context = join(repo, "context.md");
+  writeFileSync(context, "Problem: wrapper run passthrough\n");
+  const explicitRun = spawnSync(process.execPath, [reviewBin, "run", "--context", context, "--json"], {
+    cwd: repo,
+    env: { ...env, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "ok", findings: [], required_next_actions: [] }) },
+    encoding: "utf8",
+  });
+  assert.equal(explicitRun.status, 0, explicitRun.stderr);
+  assert.equal(JSON.parse(explicitRun.stdout).result.reviewed_inputs.find((input) => input.kind === "scope").scope, "none");
+
+  const adversarialBin = new URL("../plugins/cc-review/scripts/bin/cc-adversarial-review.mjs", import.meta.url).pathname;
+  const stdinFile = join(repo, "adversarial-stdin.txt");
+  const fakeClaude = join(repo, "bin", "claude-adversarial-capture");
+  writeFileSync(fakeClaude, `#!/usr/bin/env node
+const fs = require("fs");
+let input = "";
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
+  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }, result: "ok" }));
+});
+`, { mode: 0o755 });
+  const adversarial = spawnSync(process.execPath, [adversarialBin, "--json", "challenge", "this"], {
+    cwd: repo,
+    env: { ...env, CC_REVIEW_CLAUDE_BIN: fakeClaude },
+    encoding: "utf8",
+  });
+  assert.equal(adversarial.status, 0, adversarial.stderr);
+  assert.equal(JSON.parse(adversarial.stdout).result.decision, "approved");
+  const prompt = readFileSync(stdinFile, "utf8");
+  assert.match(prompt, /Review stance: adversarial/);
+  assert.match(prompt, /Focus: challenge this/);
 });
 
 test("alias --help prints usage instead of running the subcommand", () => {
@@ -1297,7 +1568,7 @@ test("alias --help prints usage instead of running the subcommand", () => {
   const env = { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: "/bin/false" };
   const result = spawnSync(process.execPath, [reviewBin, "--help"], { cwd: repo, env, encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Usage: cc-review-companion review/);
+  assert.match(result.stdout, /Usage: cc-review-companion run/);
   assert.doesNotMatch(result.stdout, /Decision:/);
 });
 
