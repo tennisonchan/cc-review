@@ -5,7 +5,7 @@ import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 
-const companion = new URL("../plugins/cc-review/scripts/cc-review-companion.mjs", import.meta.url).pathname;
+const companion = new URL("../plugins/review-loop/scripts/review-loop-companion.mjs", import.meta.url).pathname;
 
 test("setup initializes project review guidelines without overwriting", () => {
   const repo = makeGitRepo();
@@ -45,7 +45,7 @@ test("init-guidelines scaffolds a project profile from the tracked tree", () => 
   assert.match(content, /dedicated test directories/);
   assert.match(content, /npm test \(vitest run\)/);
   // The machine-read policy block from the template must survive scaffolding.
-  assert.match(content, /```json cc-review/);
+  assert.match(content, /```json review-loop/);
 });
 
 test("init-guidelines omits the profile section for an empty repo", () => {
@@ -55,10 +55,10 @@ test("init-guidelines omits the profile section for an empty repo", () => {
   const action = JSON.parse(result.stdout).actions.find((item) => item.action === "init-guidelines");
   const content = readFileSync(action.path, "utf8");
   assert.doesNotMatch(content, /## Project profile/);
-  assert.match(content, /```json cc-review/);
+  assert.match(content, /```json review-loop/);
 });
 
-test("review alias uses normalized structured output and renders blocking findings", () => {
+test("run uses normalized structured output and renders blocking findings", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
   runGit(["add", "file.txt"], repo);
@@ -69,16 +69,16 @@ test("review alias uses normalized structured output and renders blocking findin
     finding({ id: "file-txt-high", location: "file.txt:1", message: "The change is intentionally flagged.", required_action: "Fix the test fixture." }),
   ]);
 
-  const result = run(["review", "--wait"], {
+  const result = run(["run", "--scope", "auto"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(decision) },
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(decision) },
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Decision: changes_requested/);
   assert.match(result.stdout, /Required action: Fix the test fixture/);
 });
 
-test("review invokes Claude read-only via argv and sends prompt through stdin", () => {
+test("run invokes Claude read-only via argv and sends prompt through stdin", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
   runGit(["add", "file.txt"], repo);
@@ -99,9 +99,9 @@ process.stdin.on("end", () => {
 });
 `, { mode: 0o755 });
 
-  const result = run(["review", "--wait"], {
+  const result = run(["run", "--scope", "auto"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: fakeClaude },
+    env: { ...testEnv(repo), REVIEW_LOOP_CLAUDE_BIN: fakeClaude },
   });
   assert.equal(result.status, 0, result.stderr);
   const argv = JSON.parse(readFileSync(argvFile, "utf8"));
@@ -121,7 +121,7 @@ test("run normalizes policy-promoted advisory findings into blocking findings", 
   mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
   writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
 
-\`\`\`json cc-review
+\`\`\`json review-loop
 { "block_on": "high", "category_block_on": { "security": "medium" } }
 \`\`\`
 `);
@@ -144,7 +144,7 @@ test("run normalizes policy-promoted advisory findings into blocking findings", 
 
   const result = run(["run", "--context", context, "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(reviewerOutput) },
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(reviewerOutput) },
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
@@ -177,7 +177,7 @@ process.stdin.on("end", () => {
 
   const result = run(["run", "--context", context, "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: fakeClaude },
+    env: { ...testEnv(repo), REVIEW_LOOP_CLAUDE_BIN: fakeClaude },
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
@@ -212,7 +212,7 @@ test("run uses fallback threshold for high advisory findings", () => {
   writeFileSync(plan, "Plan\n");
   const result = run(["run", "--artifact", plan, "--guidelines", guidelines, "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(reviewerOutput) },
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(reviewerOutput) },
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
@@ -225,7 +225,7 @@ test("run labels explicit base policy promotions as severity_policy", () => {
   mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
   writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
 
-\`\`\`json cc-review
+\`\`\`json review-loop
 { "block_on": "high" }
 \`\`\`
 `);
@@ -233,7 +233,7 @@ test("run labels explicit base policy promotions as severity_policy", () => {
   writeFileSync(plan, "Plan\n");
   const result = run(["run", "--artifact", plan, "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
       decision: "approved",
       summary: "High issue blocks by explicit policy.",
       findings: [{
@@ -255,7 +255,7 @@ test("run fails closed on reviewer mechanism failure by default", () => {
   const repo = makeGitRepo();
   const result = run(["run", "--scope", "none", "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", findings: [] }) },
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", findings: [] }) },
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
@@ -267,7 +267,7 @@ test("run can fail open explicitly on reviewer mechanism failure", () => {
   const repo = makeGitRepo();
   const result = run(["run", "--scope", "none", "--on-reviewer-failure", "allow", "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", findings: [] }) },
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", findings: [] }) },
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
@@ -290,7 +290,7 @@ test("run preserves reviewer invalid_input and blocked decisions without synthet
   for (const decision of ["invalid_input", "blocked"]) {
     const result = run(["run", "--scope", "none", "--json"], {
       cwd: repo,
-      env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
         decision,
         summary: `${decision} from reviewer`,
         findings: [],
@@ -310,9 +310,9 @@ test("empty working-tree review approves without invoking reviewer", () => {
   const env = testEnv(repo);
   runGit(["add", "bin/claude"], repo);
   runGit(["commit", "-m", "test env"], repo);
-  const result = run(["review", "--json"], {
+  const result = run(["run", "--scope", "auto", "--json"], {
     cwd: repo,
-    env: { ...env, CC_REVIEW_CLAUDE_BIN: "/bin/false" },
+    env: { ...env, REVIEW_LOOP_CLAUDE_BIN: "/bin/false" },
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
@@ -340,9 +340,9 @@ process.stdin.on("end", () => {
 });
 `, { mode: 0o755 });
 
-  const result = run(["review"], {
+  const result = run(["run", "--scope", "auto"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: fakeClaude, CC_REVIEW_MAX_DIFF_CHARS: "500" },
+    env: { ...testEnv(repo), REVIEW_LOOP_CLAUDE_BIN: fakeClaude, REVIEW_LOOP_MAX_DIFF_CHARS: "500" },
   });
   assert.equal(result.status, 0, result.stderr);
   const prompt = readFileSync(stdinFile, "utf8");
@@ -365,9 +365,9 @@ test("hung claude invocation times out instead of hanging the review", () => {
   mkdirSync(join(repo, "bin"), { recursive: true });
   writeFileSync(fakeClaude, "#!/usr/bin/env sh\nsleep 30\n", { mode: 0o755 });
 
-  const result = run(["review", "--json"], {
+  const result = run(["run", "--scope", "auto", "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: fakeClaude, CC_REVIEW_CLAUDE_TIMEOUT_MS: "200" },
+    env: { ...testEnv(repo), REVIEW_LOOP_CLAUDE_BIN: fakeClaude, REVIEW_LOOP_CLAUDE_TIMEOUT_MS: "200" },
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
@@ -395,9 +395,9 @@ process.stdin.on("end", () => {
 });
 `, { mode: 0o755 });
 
-  const result = run(["review"], {
+  const result = run(["run", "--scope", "auto"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: fakeClaude },
+    env: { ...testEnv(repo), REVIEW_LOOP_CLAUDE_BIN: fakeClaude },
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(readFileSync(stdinFile, "utf8"), /locked\.txt\n\[unreadable; preview omitted\]/);
@@ -410,11 +410,11 @@ test("invalid structured severity fails closed", () => {
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
 
-  const result = run(["review", "--json"], {
+  const result = run(["run", "--scope", "auto", "--json"], {
     cwd: repo,
     env: {
       ...testEnv(repo),
-      CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
         decision: "approved",
         summary: "bad severity",
         findings: [finding({ severity: "catastrophic" })],
@@ -433,7 +433,7 @@ test("invalid branch base fails closed instead of approving empty review", () =>
   writeFileSync(join(repo, "file.txt"), "changed\n");
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
-  const result = run(["review", "--wait", "--scope", "branch", "--base", "missing-ref"], {
+  const result = run(["run", "--scope", "branch", "--base", "missing-ref"], {
     cwd: repo,
     env: testEnv(repo),
   });
@@ -445,7 +445,7 @@ test("enable-review-gate refuses misleading subagent-only gate", () => {
   const repo = makeGitRepo();
   const result = run(["setup", "--enable-review-gate", "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_HOOK_EVENTS: "subagent_stop" },
+    env: { ...testEnv(repo), REVIEW_LOOP_HOOK_EVENTS: "subagent_stop" },
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
@@ -475,8 +475,8 @@ test("gate re-reviews after a block instead of allowing on stop_hook_active", ()
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
       finding({ id: "blocker", locations: ["file.txt:1"], message: "Blocking issue.", required_action: "Fix it." }),
     ])),
   };
@@ -492,7 +492,7 @@ test("gate re-reviews after a block instead of allowing on stop_hook_active", ()
   assert.equal(JSON.parse(reentered.stdout).decision, "block");
 
   writeFileSync(join(repo, "file.txt"), "fixed content\n");
-  const cleanEnv = { ...env, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()) };
+  const cleanEnv = { ...env, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()) };
   const fixed = run(["gate", "--json"], { cwd: repo, env: cleanEnv, input: '{"stop_hook_active":true}' });
   assert.equal(fixed.status, 0, fixed.stderr);
   assert.deepEqual(JSON.parse(fixed.stdout), {});
@@ -504,13 +504,13 @@ test("gate reuses the cached decision for an unchanged tree", () => {
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
   assert.equal(setup.status, 0, setup.stderr);
 
   const blockingEnv = {
     ...baseEnv,
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
       finding({ id: "cached", locations: ["file.txt:1"], message: "Cached issue.", required_action: "Fix." }),
     ])),
   };
@@ -519,7 +519,7 @@ test("gate reuses the cached decision for an unchanged tree", () => {
 
   // Same tree, reviewer would now approve — but the cached verdict is reused,
   // proving no second review ran for identical input.
-  const approvingEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()) };
+  const approvingEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()) };
   const cachedRun = run(["gate", "--json"], { cwd: repo, env: approvingEnv, input: '{"turn_id":"cache"}' });
   assert.equal(JSON.parse(cachedRun.stdout).decision, "block");
 
@@ -538,13 +538,13 @@ test("gate cache misses on changes invisible to the rendered prompt", () => {
   // window do not change the rendered prompt, but must change cache identity.
   const longBody = Array.from({ length: 240 }, (_, i) => `line ${i}`);
   writeFileSync(join(repo, "long.txt"), longBody.join("\n"));
-  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
   assert.equal(setup.status, 0, setup.stderr);
 
   const blockingEnv = {
     ...baseEnv,
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
       finding({ id: "tail", locations: ["long.txt:230"], message: "Issue past the preview.", required_action: "Fix." }),
     ])),
   };
@@ -559,7 +559,7 @@ test("gate cache misses on changes invisible to the rendered prompt", () => {
   longBody[230] = "LINE 230";
   writeFileSync(join(repo, "long.txt"), longBody.join("\n"));
   utimesSync(join(repo, "long.txt"), before.atime, before.mtime);
-  const approvingEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()) };
+  const approvingEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()) };
   const fixed = run(["gate", "--json"], { cwd: repo, env: approvingEnv, input: '{"turn_id":"tail"}' });
   assert.deepEqual(JSON.parse(fixed.stdout), {});
 });
@@ -572,8 +572,8 @@ test("gate allows immediately on recursion sentinels", () => {
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
       finding({ id: "blocker", locations: ["file.txt:1"], message: "Blocking issue.", required_action: "Fix it." }),
     ])),
   };
@@ -581,7 +581,7 @@ test("gate allows immediately on recursion sentinels", () => {
   assert.equal(setup.status, 0, setup.stderr);
   const cases = [
     { env, payload: '{"hook_active":true}' },
-    { env, payload: '{"cc_review_active":true}' },
+    { env, payload: '{"review_loop_active":true}' },
   ];
   for (const item of cases) {
     const result = run(["gate", "--json"], { cwd: repo, env: item.env, input: item.payload });
@@ -598,9 +598,9 @@ test("gate does not bypass on an unrecognized fallback token", () => {
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
-    CC_REVIEW_FALLBACK_TOKEN: "00000000-0000-4000-8000-000000000000",
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_FALLBACK_TOKEN: "00000000-0000-4000-8000-000000000000",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
       finding({ id: "blocker", locations: ["file.txt:1"], message: "Blocking issue.", required_action: "Fix it." }),
     ])),
   };
@@ -620,8 +620,8 @@ test("gate state does not persist dead infra failure counters", () => {
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
       finding({ id: "blocker", locations: ["file.txt:1"], message: "Blocking issue.", required_action: "Fix it." }),
     ])),
   };
@@ -631,7 +631,7 @@ test("gate state does not persist dead infra failure counters", () => {
   const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"no-infra"}' });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).decision, "block");
-  const stateDir = join(env.XDG_STATE_HOME, "cc-review", "gate-state");
+  const stateDir = join(env.XDG_STATE_HOME, "review-loop", "gate-state");
   const [stateFile] = readdirSync(stateDir);
   assert.ok(stateFile, "expected gate state file");
   const state = JSON.parse(readFileSync(join(stateDir, stateFile), "utf8"));
@@ -646,8 +646,8 @@ test("gate blocks review target preparation failures instead of using fallback",
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
-    CC_REVIEW_FAKE_FALLBACK_ERROR: "fallback should not run",
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback should not run",
   };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
   assert.equal(setup.status, 0, setup.stderr);
@@ -667,13 +667,13 @@ test("gate total block ceiling bounds churning finding sets", () => {
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
   assert.equal(setup.status, 0, setup.stderr);
 
   const findingEnv = (id) => ({
     ...baseEnv,
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
       finding({ id, locations: ["file.txt:1"], message: `Issue ${id}.`, required_action: "Fix." }),
     ])),
   });
@@ -703,13 +703,13 @@ test("gate default-key counters reset after the chain gap window", async () => {
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1", CC_REVIEW_GATE_CHAIN_GAP_MS: "1" };
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1", REVIEW_LOOP_GATE_CHAIN_GAP_MS: "1" };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
   assert.equal(setup.status, 0, setup.stderr);
 
   const findingEnv = (id) => ({
     ...baseEnv,
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
       finding({ id, locations: ["file.txt:1"], message: `Issue ${id}.`, required_action: "Fix." }),
     ])),
   });
@@ -728,20 +728,20 @@ test("gate uses degraded fallback review when Claude review is unavailable", () 
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
   assert.equal(setup.status, 0, setup.stderr);
 
   const brokenEnv = {
     ...baseEnv,
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
-    CC_REVIEW_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback ok")),
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
+    REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback ok")),
   };
   const result = run(["gate", "--json"], { cwd: repo, env: brokenEnv, input: '{"turn_id":"infra"}' });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.decision, undefined);
-  assert.match(parsed.systemMessage, /Claude cc-review was unavailable/);
+  assert.match(parsed.systemMessage, /Claude-backed review-loop was unavailable/);
   assert.match(parsed.systemMessage, /degraded Codex fallback review/);
   assert.match(parsed.systemMessage, /reviewer output summary is required/);
 });
@@ -754,9 +754,9 @@ test("gate uses fallback when Claude CLI is missing", () => {
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
-    CC_REVIEW_CLAUDE_BIN: join(repo, "bin", "missing-claude"),
-    CC_REVIEW_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback ok")),
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_CLAUDE_BIN: join(repo, "bin", "missing-claude"),
+    REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback ok")),
   };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
   assert.equal(setup.status, 0, setup.stderr);
@@ -784,7 +784,7 @@ test("gate invokes Codex fallback with supported read-only argv", () => {
 const fs = require("fs");
 const argv = process.argv.slice(2);
 fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(argv));
-fs.writeFileSync(${JSON.stringify(envFile)}, JSON.stringify({ fallbackToken: process.env.CC_REVIEW_FALLBACK_TOKEN || "" }));
+fs.writeFileSync(${JSON.stringify(envFile)}, JSON.stringify({ fallbackToken: process.env.REVIEW_LOOP_FALLBACK_TOKEN || "" }));
 let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
@@ -795,9 +795,9 @@ process.stdin.on("end", () => {
 `, { mode: 0o755 });
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
-    CC_REVIEW_CODEX_BIN: fakeCodex,
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_CODEX_BIN: fakeCodex,
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
   };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
   assert.equal(setup.status, 0, setup.stderr);
@@ -836,14 +836,14 @@ process.stdin.on("end", () => {
 `, { mode: 0o755 });
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
-    CC_REVIEW_CODEX_BIN: fakeCodex,
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_CODEX_BIN: fakeCodex,
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
   };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
   assert.equal(setup.status, 0, setup.stderr);
   const repoStateHash = basename(JSON.parse(setup.stdout).actions.find((item) => item.action === "enable-review-gate").artifact_root);
-  const staleDir = join(env.XDG_STATE_HOME, "cc-review", "fallback-sentinels");
+  const staleDir = join(env.XDG_STATE_HOME, "review-loop", "fallback-sentinels");
   mkdirSync(staleDir, { recursive: true });
   const stalePath = join(staleDir, `${repoStateHash}-00000000-0000-4000-8000-000000000000.json`);
   writeFileSync(stalePath, JSON.stringify({
@@ -868,9 +868,9 @@ test("gate blocks on degraded fallback review findings", () => {
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
-    CC_REVIEW_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
+    REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
       finding({ id: "fallback-blocker", locations: ["file.txt:1"], message: "Fallback found a blocker.", required_action: "Fix it." }),
     ])),
   };
@@ -881,7 +881,7 @@ test("gate blocks on degraded fallback review findings", () => {
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.decision, "block");
-  assert.match(parsed.reason, /Claude cc-review was unavailable/);
+  assert.match(parsed.reason, /Claude-backed review-loop was unavailable/);
   assert.match(parsed.reason, /Fallback review changes_requested/);
   assert.match(parsed.reason, /Fallback found a blocker/);
 });
@@ -894,9 +894,9 @@ test("gate allows report-only when Claude and fallback review are unavailable", 
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
-    CC_REVIEW_FAKE_FALLBACK_ERROR: "fallback failed with api_key=secret-value",
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
+    REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback failed with api_key=secret-value",
   };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
   assert.equal(setup.status, 0, setup.stderr);
@@ -918,11 +918,11 @@ test("gate does not invoke fallback for real Claude findings", () => {
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
       finding({ id: "claude-blocker", locations: ["file.txt:1"], message: "Claude found a blocker.", required_action: "Fix it." }),
     ])),
-    CC_REVIEW_FAKE_FALLBACK_ERROR: "fallback should not run",
+    REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback should not run",
   };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
   assert.equal(setup.status, 0, setup.stderr);
@@ -931,7 +931,7 @@ test("gate does not invoke fallback for real Claude findings", () => {
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.decision, "block");
-  assert.match(parsed.reason, /cc-review changes_requested/);
+  assert.match(parsed.reason, /review-loop changes_requested/);
   assert.match(parsed.reason, /Claude found a blocker/);
   assert.doesNotMatch(parsed.reason, /fallback should not run/);
 });
@@ -942,14 +942,14 @@ test("gate uses persisted block_on and resets after clean review", () => {
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
   const setup = run(["setup", "--enable-review-gate", "--block-on", "medium", "--json"], { cwd: repo, env: baseEnv });
   assert.equal(setup.status, 0, setup.stderr);
 
   const mediumFinding = blockingOutput([
     finding({ id: "m1", severity: "medium", locations: ["file.txt:1"], message: "Medium issue.", required_action: "Fix." }),
   ]);
-  const mediumEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(mediumFinding) };
+  const mediumEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(mediumFinding) };
   for (let i = 0; i < 3; i += 1) {
     const result = run(["gate", "--json"], { cwd: repo, env: mediumEnv, input: '{"turn_id":"t1"}' });
     assert.equal(JSON.parse(result.stdout).decision, "block");
@@ -961,7 +961,7 @@ test("gate uses persisted block_on and resets after clean review", () => {
   assert.doesNotMatch(cappedParsed.systemMessage, /decision/);
 
   writeFileSync(join(repo, "file.txt"), "fixed for clean review\n");
-  const cleanEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()) };
+  const cleanEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()) };
   const clean = run(["gate", "--json"], { cwd: repo, env: cleanEnv, input: '{"turn_id":"t1"}' });
   assert.deepEqual(JSON.parse(clean.stdout), {});
 
@@ -979,11 +979,11 @@ test("guidelines policy drives category-aware blocking", () => {
   mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
   writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
 
-\`\`\`json cc-review
+\`\`\`json review-loop
 { "block_on": "high", "category_block_on": { "security": "low", "style": "never" } }
 \`\`\`
 `);
-  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
   assert.equal(setup.status, 0, setup.stderr);
 
@@ -997,7 +997,7 @@ test("guidelines policy drives category-aware blocking", () => {
   }))));
 
   // A low-severity security finding blocks because the category threshold is low.
-  const securityEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: decisionWith([
+  const securityEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: decisionWith([
     { id: "sec1", severity: "low", category: "security", location: "file.txt:1", summary: "Leaky.", required_action: "Fix." },
   ]) };
   const secBlock = run(["gate", "--json"], { cwd: repo, env: securityEnv, input: '{"turn_id":"sec"}' });
@@ -1006,7 +1006,7 @@ test("guidelines policy drives category-aware blocking", () => {
 
   // A high-severity style finding never blocks.
   writeFileSync(join(repo, "file.txt"), "style change\n");
-  const styleEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: decisionWith([
+  const styleEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: decisionWith([
     { id: "style1", severity: "high", category: "style", location: "file.txt:1", summary: "Ugly.", required_action: "Prettify." },
   ]) };
   const styleAllow = run(["gate", "--json"], { cwd: repo, env: styleEnv, input: '{"turn_id":"style"}' });
@@ -1014,11 +1014,37 @@ test("guidelines policy drives category-aware blocking", () => {
 
   // Categories absent from the policy map use the base threshold.
   writeFileSync(join(repo, "file.txt"), "medium change\n");
-  const mediumEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: decisionWith([
+  const mediumEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: decisionWith([
     { id: "m1", severity: "medium", category: "maintainability", location: "file.txt:1", summary: "Meh.", required_action: "Fix." },
   ]) };
   const mediumAllow = run(["gate", "--json"], { cwd: repo, env: mediumEnv, input: '{"turn_id":"med"}' });
   assert.deepEqual(JSON.parse(mediumAllow.stdout), {});
+});
+
+test("old cc-review policy fence is not honored after rename", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+
+\`\`\`json cc-review
+{ "block_on": "high", "category_block_on": { "security": "low" } }
+\`\`\`
+`);
+  const env = {
+    ...testEnv(repo),
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(advisoryOutput([
+      finding({ id: "sec1", severity: "low", category: "security", locations: ["file.txt:1"], message: "Leaky.", required_action: "Fix." }),
+    ])),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  const allowed = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"old-fence"}' });
+  assert.deepEqual(JSON.parse(allowed.stdout), {});
 });
 
 test("explicit setup block_on overrides the guidelines policy", () => {
@@ -1030,15 +1056,15 @@ test("explicit setup block_on overrides the guidelines policy", () => {
   mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
   writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
 
-\`\`\`json cc-review
+\`\`\`json review-loop
 { "block_on": "high" }
 \`\`\`
 `);
-  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
   const setup = run(["setup", "--enable-review-gate", "--block-on", "low", "--json"], { cwd: repo, env: baseEnv });
   assert.equal(setup.status, 0, setup.stderr);
 
-  const lowEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+  const lowEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
     ...advisoryOutput([
       finding({ id: "l1", severity: "low", locations: ["file.txt:1"], message: "Small.", required_action: "Fix." }),
     ]),
@@ -1056,16 +1082,16 @@ test("category overrides apply on top of an explicit block_on base", () => {
   mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
   writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
 
-\`\`\`json cc-review
+\`\`\`json review-loop
 { "block_on": "low", "category_block_on": { "security": "medium" } }
 \`\`\`
 `);
-  const baseEnv = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
   // Explicit high base overrides the policy's low base...
   const setup = run(["setup", "--enable-review-gate", "--block-on", "high", "--json"], { cwd: repo, env: baseEnv });
   assert.equal(setup.status, 0, setup.stderr);
 
-  const mediumSecurityEnv = { ...baseEnv, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+  const mediumSecurityEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
     ...advisoryOutput([
       finding({ id: "sec", severity: "medium", category: "security", locations: ["file.txt:1"], message: "Leaky.", required_action: "Fix." }),
       finding({ id: "plain", severity: "medium", category: "maintainability", locations: ["file.txt:2"], message: "Meh.", required_action: "Fix." }),
@@ -1088,11 +1114,11 @@ test("guidelines policy fence parses with CRLF line endings", () => {
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
   writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"),
-    '# Rules\r\n\r\n```json cc-review\r\n{ "block_on": "medium" }\r\n```\r\n');
+    '# Rules\r\n\r\n```json review-loop\r\n{ "block_on": "medium" }\r\n```\r\n');
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(advisoryOutput([
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(advisoryOutput([
       finding({ id: "m", severity: "medium", locations: ["file.txt:1"], message: "Medium issue.", required_action: "Fix." }),
     ])),
   };
@@ -1111,14 +1137,14 @@ test("malformed guidelines policy fails closed at the gate", () => {
   mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
   writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
 
-\`\`\`json cc-review
+\`\`\`json review-loop
 { "block_on": "catastrophic" }
 \`\`\`
 `);
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()),
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()),
   };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
   assert.equal(setup.status, 0, setup.stderr);
@@ -1136,8 +1162,8 @@ test("gate debug mode logs hook payloads to the state dir", () => {
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1",
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()),
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()),
   };
   const setup = run(["setup", "--enable-review-gate", "--enable-gate-debug", "--json"], { cwd: repo, env });
   assert.equal(setup.status, 0, setup.stderr);
@@ -1156,7 +1182,7 @@ test("gate allows when not enabled", () => {
   const repo = makeGitRepo();
   const result = run(["gate", "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
       finding({ id: "h1", locations: ["x"], message: "x", required_action: "x" }),
     ])) },
     input: "{}",
@@ -1166,7 +1192,7 @@ test("gate allows when not enabled", () => {
 });
 
 test("gate allow paths never emit invalid approve decision", () => {
-  const source = readFileSync(new URL("../plugins/cc-review/scripts/cc-review-companion.mjs", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../plugins/review-loop/scripts/review-loop-companion.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(source, /decision:\s*["']approve["']/);
 });
 
@@ -1176,19 +1202,19 @@ test("gate infrastructure errors allow report-only when fallback also fails", ()
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  const env = { ...testEnv(repo), CC_REVIEW_FORCE_MAIN_AGENT_HOOK: "1" };
+  const env = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
   assert.equal(setup.status, 0, setup.stderr);
   const result = run(["gate", "--json"], {
     cwd: repo,
     env: {
       ...env,
-      CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
         decision: "approved",
         summary: "",
         findings: [],
       }),
-      CC_REVIEW_FAKE_FALLBACK_ERROR: "fallback unavailable",
+      REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback unavailable",
     },
     input: "{}",
   });
@@ -1208,10 +1234,10 @@ test("background review job can be started, listed, and read", async () => {
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("ok")),
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("ok")),
   };
 
-  const started = run(["review", "--background", "--json"], { cwd: repo, env });
+  const started = run(["run", "--scope", "auto", "--background", "--json"], { cwd: repo, env });
   assert.equal(started.status, 0, started.stderr);
   const job = JSON.parse(started.stdout);
   assert.equal(job.state, "running");
@@ -1243,13 +1269,13 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  fs.writeFileSync(${JSON.stringify(envFile)}, JSON.stringify({ backgroundArgs: process.env.CC_REVIEW_BACKGROUND_ARGS || "" }));
+  fs.writeFileSync(${JSON.stringify(envFile)}, JSON.stringify({ backgroundArgs: process.env.REVIEW_LOOP_BACKGROUND_ARGS || "" }));
   console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }, result: "reviewer raw text" }));
 });
 `, { mode: 0o755 });
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_CLAUDE_BIN: fakeClaude,
+    REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
   };
 
   const started = run(["run", "--context", context, "--focus", "api_key=secret-value", "--background", "--json"], { cwd: repo, env });
@@ -1286,9 +1312,9 @@ test("cancel of a completed job preserves the result", async () => {
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   const env = {
     ...testEnv(repo),
-    CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()),
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()),
   };
-  const started = run(["review", "--background", "--json"], { cwd: repo, env });
+  const started = run(["run", "--scope", "auto", "--background", "--json"], { cwd: repo, env });
   const job = JSON.parse(started.stdout);
   await waitFor(() => {
     const status = run(["status", job.id, "--json"], { cwd: repo, env });
@@ -1314,8 +1340,8 @@ if [ "$1" = "--version" ]; then echo "2.1.167 (Claude Code)"; exit 0; fi
 if [ "$1" = "auth" ]; then echo "ok"; exit 0; fi
 sleep 10
 `, { mode: 0o755 });
-  const env = { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: fakeClaude, CC_REVIEW_CANCEL_GRACE_MS: "300" };
-  const started = run(["review", "--background", "--json"], { cwd: repo, env });
+  const env = { ...testEnv(repo), REVIEW_LOOP_CLAUDE_BIN: fakeClaude, REVIEW_LOOP_CANCEL_GRACE_MS: "300" };
+  const started = run(["run", "--scope", "auto", "--background", "--json"], { cwd: repo, env });
   const job = JSON.parse(started.stdout);
   await waitFor(() => {
     const status = run(["status", job.id, "--json"], { cwd: repo, env });
@@ -1343,8 +1369,8 @@ trap '' TERM
 : > started.marker
 while :; do sleep 1; done
 `, { mode: 0o755 });
-  const env = { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: fakeClaude, CC_REVIEW_CANCEL_GRACE_MS: "50" };
-  const started = run(["review", "--background", "--json"], { cwd: repo, env });
+  const env = { ...testEnv(repo), REVIEW_LOOP_CLAUDE_BIN: fakeClaude, REVIEW_LOOP_CANCEL_GRACE_MS: "50" };
+  const started = run(["run", "--scope", "auto", "--background", "--json"], { cwd: repo, env });
   assert.equal(started.status, 0, started.stderr);
   const job = JSON.parse(started.stdout);
   await waitFor(() => existsSync(join(repo, "started.marker")));
@@ -1360,20 +1386,20 @@ test("bundled guidelines render customization hint", () => {
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  const result = run(["review", "--wait"], {
+  const result = run(["run", "--scope", "auto"], {
     cwd: repo,
-    env: { ...testEnv(repo), CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()) },
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()) },
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Using bundled review guidelines/);
 });
 
 test("skills use skill-root companion path and unquoted arguments", () => {
-  const skillRoot = new URL("../plugins/cc-review/skills", import.meta.url).pathname;
+  const skillRoot = new URL("../plugins/review-loop/skills", import.meta.url).pathname;
   for (const skill of readdirSync(skillRoot)) {
     const content = readFileSync(join(skillRoot, skill, "SKILL.md"), "utf8");
-    assert.match(content, /<skill-root>\/\.\.\/\.\.\/scripts\/cc-review-companion\.mjs/);
-    assert.doesNotMatch(content, /"\$ARGUMENTS"|\$\(pwd\)|CC_REVIEW_PLUGIN_ROOT|<skill dir>/);
+    assert.match(content, /<skill-root>\/\.\.\/\.\.\/scripts\/review-loop-companion\.mjs/);
+    assert.doesNotMatch(content, /"\$ARGUMENTS"|\$\(pwd\)|REVIEW_LOOP_PLUGIN_ROOT|<skill dir>/);
   }
 });
 
@@ -1383,9 +1409,9 @@ test("skill shell invocation preserves flags in ARGUMENTS", () => {
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
 
-  const skillRoot = new URL("../plugins/cc-review/skills/cc-review", import.meta.url).pathname;
+  const skillRoot = new URL("../plugins/review-loop/skills/review-loop", import.meta.url).pathname;
   const content = readFileSync(join(skillRoot, "SKILL.md"), "utf8");
-  const command = content.match(/node "<skill-root>\/\.\.\/\.\.\/scripts\/cc-review-companion\.mjs" run --scope auto \$ARGUMENTS/)?.[0];
+  const command = content.match(/node "<skill-root>\/\.\.\/\.\.\/scripts\/review-loop-companion\.mjs" run --scope auto \$ARGUMENTS/)?.[0];
   assert.ok(command);
   const expanded = command.replace("<skill-root>", skillRoot);
   const result = spawnSync("sh", ["-c", expanded], {
@@ -1403,23 +1429,23 @@ test("skill shell invocation preserves flags in ARGUMENTS", () => {
   assert.equal(scopeInput.base, "HEAD");
 });
 
-test("bin aliases dispatch to their subcommand", () => {
+test("bin wrappers dispatch to their subcommand", () => {
   const repo = makeGitRepo();
   const env = testEnv(repo);
-  const setupBin = new URL("../plugins/cc-review/scripts/bin/cc-review-setup.mjs", import.meta.url).pathname;
+  const setupBin = new URL("../plugins/review-loop/scripts/bin/review-loop-setup.mjs", import.meta.url).pathname;
   const result = spawnSync(process.execPath, [setupBin, "--json"], { cwd: repo, env, encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
   assert.ok(parsed.checks.node.ok);
 
-  const reviewBin = new URL("../plugins/cc-review/scripts/bin/cc-review.mjs", import.meta.url).pathname;
+  const reviewBin = new URL("../plugins/review-loop/scripts/bin/review-loop.mjs", import.meta.url).pathname;
   writeFileSync(join(repo, "file.txt"), "changed\n");
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   const review = spawnSync(process.execPath, [reviewBin, "--json"], {
     cwd: repo,
-    env: { ...env, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "ok", findings: [], required_next_actions: [] }) },
+    env: { ...env, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "ok", findings: [], required_next_actions: [] }) },
     encoding: "utf8",
   });
   assert.equal(review.status, 0, review.stderr);
@@ -1429,15 +1455,14 @@ test("bin aliases dispatch to their subcommand", () => {
   writeFileSync(context, "Problem: wrapper run passthrough\n");
   const explicitRun = spawnSync(process.execPath, [reviewBin, "run", "--context", context, "--json"], {
     cwd: repo,
-    env: { ...env, CC_REVIEW_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "ok", findings: [], required_next_actions: [] }) },
+    env: { ...env, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "ok", findings: [], required_next_actions: [] }) },
     encoding: "utf8",
   });
   assert.equal(explicitRun.status, 0, explicitRun.stderr);
   assert.equal(JSON.parse(explicitRun.stdout).result.reviewed_inputs.find((input) => input.kind === "scope").scope, "none");
 
-  const adversarialBin = new URL("../plugins/cc-review/scripts/bin/cc-adversarial-review.mjs", import.meta.url).pathname;
-  const stdinFile = join(repo, "adversarial-stdin.txt");
-  const fakeClaude = join(repo, "bin", "claude-adversarial-capture");
+  const stdinFile = join(repo, "counter-stdin.txt");
+  const fakeClaude = join(repo, "bin", "claude-counter-capture");
   writeFileSync(fakeClaude, `#!/usr/bin/env node
 const fs = require("fs");
 let input = "";
@@ -1447,45 +1472,48 @@ process.stdin.on("end", () => {
   console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }, result: "ok" }));
 });
 `, { mode: 0o755 });
-  const adversarial = spawnSync(process.execPath, [adversarialBin, "--json", "challenge", "this"], {
+  const counter = spawnSync(process.execPath, [reviewBin, "run", "--scope", "auto", "--counter", "--json", "challenge", "this"], {
     cwd: repo,
-    env: { ...env, CC_REVIEW_CLAUDE_BIN: fakeClaude },
+    env: { ...env, REVIEW_LOOP_CLAUDE_BIN: fakeClaude },
     encoding: "utf8",
   });
-  assert.equal(adversarial.status, 0, adversarial.stderr);
-  assert.equal(JSON.parse(adversarial.stdout).result.decision, "approved");
+  assert.equal(counter.status, 0, counter.stderr);
+  assert.equal(JSON.parse(counter.stdout).result.decision, "approved");
   const prompt = readFileSync(stdinFile, "utf8");
-  assert.match(prompt, /Review stance: adversarial/);
+  assert.match(prompt, /Review stance: counter/);
   assert.match(prompt, /Focus: challenge this/);
 });
 
-test("alias --help prints usage instead of running the subcommand", () => {
+test("review-loop --help prints run usage instead of running review", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  const reviewBin = new URL("../plugins/cc-review/scripts/bin/cc-review.mjs", import.meta.url).pathname;
+  const reviewBin = new URL("../plugins/review-loop/scripts/bin/review-loop.mjs", import.meta.url).pathname;
   // A fake claude that fails loudly, so a real review attempt would be visible.
-  const env = { ...testEnv(repo), CC_REVIEW_CLAUDE_BIN: "/bin/false" };
+  const env = { ...testEnv(repo), REVIEW_LOOP_CLAUDE_BIN: "/bin/false" };
   const result = spawnSync(process.execPath, [reviewBin, "--help"], { cwd: repo, env, encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Usage: cc-review-companion run/);
+  assert.match(result.stdout, /Usage: review-loop-companion run/);
   assert.doesNotMatch(result.stdout, /Decision:/);
 });
 
 test("package bin map covers the documented commands", () => {
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-  for (const name of ["cc-review", "cc-review-setup", "cc-review-status", "cc-review-result", "cc-review-cancel", "cc-adversarial-review", "cc-review-companion"]) {
+  for (const name of ["review-loop", "review-loop-setup", "review-loop-status", "review-loop-result", "review-loop-cancel", "review-loop-companion"]) {
     assert.ok(pkg.bin[name], `missing bin: ${name}`);
     assert.ok(existsSync(new URL(`../${pkg.bin[name]}`, import.meta.url)), `bin target missing: ${pkg.bin[name]}`);
+  }
+  for (const removedName of ["cc-review", "cc-review-setup", "cc-review-status", "cc-review-result", "cc-review-cancel", "cc-adversarial-review"]) {
+    assert.equal(pkg.bin[removedName], undefined, `removed bin still present: ${removedName}`);
   }
 });
 
 test("manifest wires Codex Stop hook", () => {
-  const manifest = JSON.parse(readFileSync(new URL("../plugins/cc-review/.codex-plugin/plugin.json", import.meta.url), "utf8"));
+  const manifest = JSON.parse(readFileSync(new URL("../plugins/review-loop/.codex-plugin/plugin.json", import.meta.url), "utf8"));
   assert.equal(manifest.hooks, "./hooks/codex-hooks.json");
-  const hooks = JSON.parse(readFileSync(new URL("../plugins/cc-review/hooks/codex-hooks.json", import.meta.url), "utf8"));
+  const hooks = JSON.parse(readFileSync(new URL("../plugins/review-loop/hooks/codex-hooks.json", import.meta.url), "utf8"));
   const command = hooks.hooks.Stop[0].hooks[0].command;
   assert.match(command, /\$\{PLUGIN_ROOT\}\/scripts\/stop-review-gate-hook\.mjs/);
 });
@@ -1500,7 +1528,7 @@ function run(args, { cwd, env, input } = {}) {
 }
 
 function makeGitRepo() {
-  const dir = mkdtempSync(join(tmpdir(), "cc-review-test-"));
+  const dir = mkdtempSync(join(tmpdir(), "review-loop-test-"));
   runGit(["init"], dir);
   runGit(["config", "user.email", "test@example.com"], dir);
   runGit(["config", "user.name", "Test User"], dir);
@@ -1528,8 +1556,8 @@ function testEnv(repo) {
   return {
     ...process.env,
     HOME: join(repo, ".home"),
-    CC_REVIEW_CLAUDE_BIN: fakeClaude,
-    XDG_STATE_HOME: mkdtempSync(join(tmpdir(), "cc-review-state-")),
+    REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
+    XDG_STATE_HOME: mkdtempSync(join(tmpdir(), "review-loop-state-")),
   };
 }
 

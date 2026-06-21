@@ -1,16 +1,16 @@
 ---
-name: cc-review-setup
-description: Verify Claude Code readiness, initialize review guidelines, and configure the conditional cc-review gate.
+name: review-loop-setup
+description: Verify Claude Code readiness, initialize review guidelines, and configure the conditional review-loop gate.
 ---
 
-# cc-review setup
+# review-loop setup
 
-Use this skill when the user or agent needs to prepare `cc-review`.
+Use this skill when the user or agent needs to prepare `review-loop`.
 
 Run:
 
 ```bash
-node "<skill-root>/../../scripts/cc-review-companion.mjs" setup $ARGUMENTS
+node "<skill-root>/../../scripts/review-loop-companion.mjs" setup $ARGUMENTS
 ```
 
 Supported arguments:

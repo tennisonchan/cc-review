@@ -19,7 +19,7 @@ Tag each finding with the best-matching category: `security`, `correctness`, `da
 
 This block is machine-read by the review gate. `block_on` is the base severity threshold; `category_block_on` overrides it per category (`"never"` exempts a category from blocking).
 
-```json cc-review
+```json review-loop
 {
   "block_on": "high",
   "category_block_on": {
@@ -33,7 +33,7 @@ This block is machine-read by the review gate. `block_on` is the base severity t
 
 ## Project profile
 
-Detected by `cc-review-setup --init-guidelines`; edit freely.
+Detected by `review-loop-setup --init-guidelines`; edit freely.
 
 - JavaScript (ESM): pay extra attention to unhandled promise rejections, missing await, loose equality on user input.
 - Tests live in dedicated test directories; flag changed behavior that lacks matching test updates.

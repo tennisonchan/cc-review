@@ -4,7 +4,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const companion = resolve(root, "scripts", "cc-review-companion.mjs");
+const companion = resolve(root, "scripts", "review-loop-companion.mjs");
 const result = spawnSync(process.execPath, [companion, "gate", "--json"], {
   cwd: process.cwd(),
   encoding: "utf8",

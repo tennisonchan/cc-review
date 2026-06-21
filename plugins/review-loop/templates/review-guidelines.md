@@ -19,7 +19,7 @@ Tag each finding with the best-matching category: `security`, `correctness`, `da
 
 This block is machine-read by the review gate. `block_on` is the base severity threshold; `category_block_on` overrides it per category (`"never"` exempts a category from blocking).
 
-```json cc-review
+```json review-loop
 {
   "block_on": "high",
   "category_block_on": {

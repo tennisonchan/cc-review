@@ -2,10 +2,12 @@
 
 ## Unreleased
 
-- Added the gate-agnostic `run` review engine with `--context`, `--artifact`, `--focus`, `--stance`, `--scope none|auto|working-tree|branch`, `--on-reviewer-failure`, JSON output, and background job support. Public `cc-review` and `cc-adversarial-review` binaries now dispatch through `run`.
-- Removed the legacy review output schema and legacy `needs_changes` execution path. `run`, `review`, `adversarial-review`, gate, fallback, background jobs, and bundled skills now use the normalized v2 result shape.
-- Added separate reviewer-output and normalized-result schemas. Reviewer output is validated structurally first; cc-review then applies deterministic machine policy/fallback threshold normalization to return snake_case `blocking_findings`, `advisory_findings`, `required_next_actions`, and `reviewed_inputs`.
-- Removed old gate-config compatibility markers; existing repositories should rerun `cc-review-setup --enable-review-gate` if they want the current null-by-default `block_on` config shape.
+- Renamed the product, package, plugin, CLI, skills, state directory, and environment namespace from `cc-review` to `review-loop`; old `cc-review*` command names and `CC_REVIEW_*` environment variables are intentionally not preserved.
+- Removed the separate counter-review command surface; use `review-loop run --counter` for counter-review stance. Gate, fallback, background jobs, and bundled skills use the normalized v2 result shape.
+- Renamed the machine policy fence to `json review-loop`; old `json cc-review` policy blocks are intentionally no longer honored.
+- Existing repositories that previously enabled the gate should rerun `review-loop-setup --enable-review-gate` because gate state now lives under the `review-loop` state directory.
+- Added separate reviewer-output and normalized-result schemas. Reviewer output is validated structurally first; review-loop then applies deterministic machine policy/fallback threshold normalization to return snake_case `blocking_findings`, `advisory_findings`, `required_next_actions`, and `reviewed_inputs`.
+- Removed old gate-config compatibility markers; existing repositories should rerun `review-loop-setup --enable-review-gate` if they want the current null-by-default `block_on` config shape.
 - Background job metadata for generic reviews redacts free-form focus text in persisted status/result records.
 - Branch-scope reviews now auto-detect the default branch before falling back to `main`/`master`.
 
@@ -14,9 +16,9 @@
 - Gate infrastructure failures now degrade to a Codex fallback review instead of blocking solely on Claude Code tool/provider failure. Fallback findings still use the existing blocking policy; if both review paths fail, the gate allows finalization with an explicit missing-review-coverage warning.
 - Fixed structured output against real Claude Code: the `$schema` meta key made `claude --json-schema` silently skip structured output, so every real review failed as an infrastructure error; the key is now stripped before invocation. Verified end-to-end through real Codex Stop hooks (allow and block paths).
 - Gate reviews are cached per full-fidelity target fingerprint (content-hashed untracked files, full diff text), so a stop that changed nothing reuses the previous verdict instead of invoking Claude again.
-- Review guidelines can declare the gate blocking policy in a `json cc-review` fenced block: `block_on` sets the base severity threshold and `category_block_on` overrides it per finding category (`"never"` exempts a category). Findings now require a `category`, and explicit `--block-on` choices override only the policy's base threshold. Legacy configs that stored the default threshold no longer shadow guidelines policies.
+- Review guidelines can declare the gate blocking policy in a `json review-loop` fenced block: `block_on` sets the base severity threshold and `category_block_on` overrides it per finding category (`"never"` exempts a category). Findings now require a `category`, and explicit `--block-on` choices override only the policy's base threshold. Legacy configs that stored the default threshold no longer shadow guidelines policies.
 - `--init-guidelines` scaffolds a project-aware rubric: detected languages with review focus areas, test conventions, and manifest-derived test entry points.
-- `cc-review-setup --enable-gate-debug` logs hook payloads to the state dir for diagnosing host integrations.
+- `review-loop-setup --enable-gate-debug` logs hook payloads to the state dir for diagnosing host integrations.
 
 ## 0.2.0
 
