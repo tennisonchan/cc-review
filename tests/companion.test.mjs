@@ -1514,8 +1514,12 @@ test("manifest wires Codex Stop hook", () => {
   const manifest = JSON.parse(readFileSync(new URL("../plugins/review-loop/.codex-plugin/plugin.json", import.meta.url), "utf8"));
   assert.equal(manifest.hooks, "./hooks/codex-hooks.json");
   const hooks = JSON.parse(readFileSync(new URL("../plugins/review-loop/hooks/codex-hooks.json", import.meta.url), "utf8"));
-  const command = hooks.hooks.Stop[0].hooks[0].command;
-  assert.match(command, /\$\{PLUGIN_ROOT\}\/scripts\/stop-review-gate-hook\.mjs/);
+  assert.equal(hooks.hooks.Stop[0].name, "review-loop finalization gate");
+  assert.match(hooks.hooks.Stop[0].description, /review-loop stop hook/);
+  const commandHook = hooks.hooks.Stop[0].hooks[0];
+  assert.equal(commandHook.name, "review-loop finalization gate");
+  assert.match(commandHook.description, /review-loop stop hook/);
+  assert.match(commandHook.command, /\$\{PLUGIN_ROOT\}\/scripts\/stop-review-gate-hook\.mjs/);
 });
 
 function run(args, { cwd, env, input } = {}) {
