@@ -157,6 +157,10 @@ process.stdin.on("end", () => {
   assert.deepEqual(argv.slice(argv.indexOf("--sandbox"), argv.indexOf("--sandbox") + 2), ["--sandbox", "read-only"]);
   assert.ok(argv.includes("--output-schema"));
   assert.ok(argv.includes("--output-last-message"));
+  const schemaPath = argv[argv.indexOf("--output-schema") + 1];
+  const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
+  assert.deepEqual(schema.required, ["decision", "summary", "findings", "required_next_actions"]);
+  assert.ok(schema.properties.findings.items.required.includes("reviewer_disposition"));
   const envCapture = JSON.parse(readFileSync(envFile, "utf8"));
   assert.equal(envCapture.terminalReviewer, "1");
   assert.equal(envCapture.fallbackToken, "");

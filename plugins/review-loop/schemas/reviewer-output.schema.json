@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["summary", "findings"],
+  "required": ["decision", "summary", "findings", "required_next_actions"],
   "properties": {
     "decision": {
       "type": "string",
@@ -17,7 +17,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "severity", "category", "message", "locations", "required_action"],
+        "required": ["id", "severity", "category", "message", "locations", "required_action", "reviewer_disposition"],
         "properties": {
           "id": {
             "type": "string",
