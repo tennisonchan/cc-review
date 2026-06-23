@@ -2,7 +2,7 @@
 
 Multi-agent review loops for structured, policy-aware code gates.
 
-`review-loop` is a gate-agnostic, read-only review execution engine: callers provide context, artifacts, focus, and optional guidelines; higher-level agents decide when a review is needed and what gate or policy the result satisfies.
+`review-loop` is a gate-agnostic, read-only review execution engine: callers provide context, artifacts, focus, and optional guidelines; higher-level agents decide when a review is needed and what gate or policy the result satisfies. Codex and Claude Code surfaces are host adapters over the same engine.
 
 The core workflow is agent-first:
 
@@ -11,16 +11,17 @@ review-loop-setup --init-guidelines
 review-loop
 ```
 
-`review-loop` asks an independent reviewer to evaluate supplied material without editing files. `run` is the canonical engine; counter-review is selected with `--counter`, not a separate command. Old `cc-review` command names are intentionally not preserved.
+`review-loop` asks an independent opposite-agent reviewer to evaluate supplied material without editing files. Codex-hosted runs use Claude Code by default; Claude Code-hosted runs use Codex by default. `run` is the canonical engine; counter-review is selected with `--counter`, not a separate command. Old `cc-review` command names are intentionally not preserved.
 
 ## Features
 
-- Read-only Claude Code invocation: plan mode plus a Read/Grep/Glob-only tool list, so the reviewer can inspect surrounding code but never modify it.
+- Read-only opposite-agent reviewer invocation: Claude Code runs in plan mode with Read/Grep/Glob-only tools; Codex runs with a read-only sandbox and schema-bound output.
 - Project-customizable review rubric at `.claude/rules/review-guidelines.md`.
 - Structured generic review results via `--output-format json --json-schema`.
 - Context packet, artifact, working-tree, and base-branch review target selection.
 - Optional background review jobs with status/result/cancel.
-- Optional automatic Stop-hook review gate for Codex finalization.
+- Optional automatic Stop-hook review gate for Codex or Claude Code finalization.
+- Terminal reviewer mode prevents reviewer subprocesses from starting nested review loops.
 
 ## Generic Review Engine
 
@@ -64,7 +65,20 @@ Use `review-loop run --context ...` or `review-loop run --artifact ...` for cont
 
 `review-loop` does not know whether the caller is satisfying an execution, design, merge, or audit gate. For agent-kernel integration, agent-kernel prepares the context packet, calls `review-loop run`, records the generic result, and maps that result back to its own gate semantics.
 
+## Reviewer Hosts
+
+Host plugins select the opposite reviewer by default:
+
+- Codex host: Claude Code reviewer.
+- Claude Code host: Codex reviewer.
+
+Reviewer agents are terminal. A reviewer may inspect code and return structured findings, but must not invoke `review-loop`, run another reviewer, delegate work, or modify files. Internally, reviewer subprocesses receive `REVIEW_LOOP_TERMINAL_REVIEWER=1`; `review-loop run` refuses nested review execution and the Stop hook allows/no-ops in that mode.
+
+`REVIEW_LOOP_REVIEWER=claude|codex` and `--reviewer claude|codex` exist for internal/plugin routing and tests. Normal users should rely on the host defaults.
+
 ## Install
+
+### Codex
 
 Add the marketplace:
 
@@ -91,6 +105,20 @@ Inside Codex, `review-loop`, `review-loop-setup`, and the other commands are plu
 npm install -g github:tennisonchan/review-loop
 review-loop-setup --init-guidelines
 ```
+
+### Claude Code
+
+The same plugin also includes Claude Code slash-command metadata. Install it through Claude Code's plugin flow, ensure `codex` is available for opposite-agent review, then use:
+
+```bash
+/review-loop:setup
+/review-loop:run
+/review-loop:status
+/review-loop:result
+/review-loop:cancel
+```
+
+The Claude Code commands run from `CLAUDE_PLUGIN_ROOT`, so the shared runtime uses Codex as the default reviewer.
 
 ## Migration Notes
 
@@ -134,7 +162,7 @@ Guidelines tune review behavior but cannot override read-only safety: the review
 
 ## Automatic Gate
 
-The plugin ships a Codex `Stop` hook. The hook is always registered with the plugin, but it approves immediately until a repository opts in.
+The plugin ships host-specific `Stop` hook metadata. The hook is always registered with the plugin, but it approves immediately until a repository opts in.
 
 Enable the blocking gate for the current repository:
 
@@ -142,9 +170,9 @@ Enable the blocking gate for the current repository:
 review-loop-setup --enable-review-gate
 ```
 
-The gate blocks finalization when the normalized result contains `blocking_findings`. Each blocked stop is re-reviewed, so fixes are verified before finalization. Loop prevention is bounded per task: three blocks for the same finding set and five blocks total; past those caps the gate allows finalization and reports the unresolved findings instead. A stop that changed nothing reuses the previous review decision instead of invoking Claude again.
+The gate blocks finalization when the normalized result contains `blocking_findings`. Each blocked stop is re-reviewed, so fixes are verified before finalization. Loop prevention is bounded per task: three blocks for the same finding set and five blocks total; past those caps the gate allows finalization and reports the unresolved findings instead. A stop that changed nothing reuses the previous review decision instead of invoking the reviewer again.
 
-When Claude Code cannot run because of a tool or provider failure, such as authentication, timeout, malformed output, or a missing CLI, the gate runs a degraded Codex fallback review over the same target instead of blocking solely on the tool failure. Findings from that fallback review still use the same `block_on` / `category_block_on` policy and can block finalization. If both Claude Code and the fallback review are unavailable, the gate allows finalization with an explicit missing-review-coverage warning. This MVP fallback is intentionally report-only for tool failure: inducing repeated Claude failures can downgrade review coverage until follow-up escalation/counter controls are added.
+When Claude Code is the primary reviewer, such as in Codex-hosted runs, a tool or provider failure can trigger a degraded read-only Codex fallback review. Findings from that fallback review still use the same `block_on` / `category_block_on` policy and can block finalization. If both Claude Code and the fallback review are unavailable, the gate allows finalization with an explicit missing-review-coverage warning. This fallback is not used for Claude Code-hosted runs where Codex is already the primary reviewer; those failures follow the configured reviewer-failure policy instead.
 
 Disable the gate with:
 

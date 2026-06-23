@@ -1,0 +1,21 @@
+{
+  "name": "review-loop",
+  "owner": {
+    "name": "Tennison Chan"
+  },
+  "metadata": {
+    "description": "Multi-agent review loops for structured, policy-aware code gates.",
+    "version": "0.3.0"
+  },
+  "plugins": [
+    {
+      "name": "review-loop",
+      "description": "Run structured, policy-aware review loops from Claude Code.",
+      "version": "0.3.0",
+      "author": {
+        "name": "Tennison Chan"
+      },
+      "source": "./plugins/review-loop"
+    }
+  ]
+}

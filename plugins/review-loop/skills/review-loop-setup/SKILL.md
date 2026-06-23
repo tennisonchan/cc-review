@@ -10,7 +10,7 @@ Use this skill when the user or agent needs to prepare `review-loop`.
 Run:
 
 ```bash
-node "<skill-root>/../../scripts/review-loop-companion.mjs" setup $ARGUMENTS
+REVIEW_LOOP_HOST=codex node "<skill-root>/../../scripts/review-loop-companion.mjs" setup $ARGUMENTS
 ```
 
 Supported arguments:

@@ -116,6 +116,102 @@ process.stdin.on("end", () => {
   assert.deepEqual(schema.properties.decision.enum, ["approved", "changes_requested", "invalid_input", "blocked"]);
 });
 
+test("run can select Codex reviewer with read-only argv, schema, terminal env, and mechanism label", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const argvFile = join(repo, "codex-argv.json");
+  const envFile = join(repo, "codex-env.json");
+  const stdinFile = join(repo, "codex-stdin.txt");
+  const fakeCodex = join(repo, "bin", "codex-capture");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeCodex, `#!/usr/bin/env node
+const fs = require("fs");
+const argv = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(argv));
+fs.writeFileSync(${JSON.stringify(envFile)}, JSON.stringify({
+  terminalReviewer: process.env.REVIEW_LOOP_TERMINAL_REVIEWER || "",
+  fallbackToken: process.env.REVIEW_LOOP_FALLBACK_TOKEN || ""
+}));
+let input = "";
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
+  const out = argv[argv.indexOf("--output-last-message") + 1];
+  fs.writeFileSync(out, JSON.stringify({ decision: "approved", summary: "codex ok", findings: [], required_next_actions: [] }));
+});
+`, { mode: 0o755 });
+
+  const result = run(["run", "--scope", "auto", "--reviewer", "codex", "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), REVIEW_LOOP_CODEX_BIN: fakeCodex },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "approved");
+  assert.equal(parsed.result.reviewer_mechanism, "codex");
+  const argv = JSON.parse(readFileSync(argvFile, "utf8"));
+  assert.equal(argv[0], "exec");
+  assert.deepEqual(argv.slice(argv.indexOf("--sandbox"), argv.indexOf("--sandbox") + 2), ["--sandbox", "read-only"]);
+  assert.ok(argv.includes("--output-schema"));
+  assert.ok(argv.includes("--output-last-message"));
+  const envCapture = JSON.parse(readFileSync(envFile, "utf8"));
+  assert.equal(envCapture.terminalReviewer, "1");
+  assert.equal(envCapture.fallbackToken, "");
+  assert.match(readFileSync(stdinFile, "utf8"), /You are Codex acting as a read-only independent reviewer/);
+});
+
+test("reviewer selection honors host defaults, explicit override, and validation", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+
+  const claudeHost = run(["run", "--scope", "auto", "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), REVIEW_LOOP_HOST: "claude", REVIEW_LOOP_FAKE_CODEX_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("codex default")) },
+  });
+  assert.equal(claudeHost.status, 0, claudeHost.stderr);
+  assert.equal(JSON.parse(claudeHost.stdout).result.reviewer_mechanism, "codex-fake");
+
+  const claudePluginHost = run(["run", "--scope", "auto", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      CLAUDE_PLUGIN_ROOT: join(repo, "fake-claude-plugin"),
+      REVIEW_LOOP_FAKE_CODEX_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("codex plugin default")),
+    },
+  });
+  assert.equal(claudePluginHost.status, 0, claudePluginHost.stderr);
+  assert.equal(JSON.parse(claudePluginHost.stdout).result.reviewer_mechanism, "codex-fake");
+
+  const override = run(["run", "--scope", "auto", "--reviewer", "claude", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "claude",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("explicit claude")),
+      REVIEW_LOOP_FAKE_CODEX_ERROR: "codex should not run",
+    },
+  });
+  assert.equal(override.status, 0, override.stderr);
+  assert.equal(JSON.parse(override.stdout).result.reviewer_mechanism, "fake");
+
+  const invalid = run(["run", "--scope", "auto", "--reviewer", "bogus", "--json"], { cwd: repo, env: testEnv(repo) });
+  assert.notEqual(invalid.status, 0);
+  assert.match(invalid.stderr, /--reviewer must be one of: claude, codex/);
+
+  const invalidHost = run(["run", "--scope", "auto", "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), REVIEW_LOOP_HOST: "bogus" },
+  });
+  assert.notEqual(invalidHost.status, 0);
+  assert.match(invalidHost.stderr, /REVIEW_LOOP_HOST must be one of: codex, claude/);
+});
+
 test("run normalizes policy-promoted advisory findings into blocking findings", () => {
   const repo = makeGitRepo();
   mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
@@ -590,6 +686,18 @@ test("gate allows immediately on recursion sentinels", () => {
   }
 });
 
+test("terminal reviewer mode blocks nested run and makes gate allow", () => {
+  const repo = makeGitRepo();
+  const env = { ...testEnv(repo), REVIEW_LOOP_TERMINAL_REVIEWER: "1" };
+  const runResult = run(["run", "--scope", "none", "--json"], { cwd: repo, env });
+  assert.notEqual(runResult.status, 0);
+  assert.match(runResult.stderr, /terminal reviewer mode/);
+
+  const gateResult = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"terminal"}' });
+  assert.equal(gateResult.status, 0, gateResult.stderr);
+  assert.deepEqual(JSON.parse(gateResult.stdout), {});
+});
+
 test("gate does not bypass on an unrecognized fallback token", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
@@ -767,6 +875,30 @@ test("gate uses fallback when Claude CLI is missing", () => {
   assert.equal(parsed.decision, undefined);
   assert.match(parsed.systemMessage, /failed to start/);
   assert.match(parsed.systemMessage, /degraded Codex fallback review/);
+});
+
+test("Claude-hosted primary Codex gate failure does not same-agent fallback", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const env = {
+    ...testEnv(repo),
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_HOST: "claude",
+    REVIEW_LOOP_FAKE_CODEX_ERROR: "primary codex unavailable",
+    REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback should not run")),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"codex-primary-fail"}' });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.decision, "block");
+  assert.match(parsed.reason, /primary codex unavailable/);
+  assert.doesNotMatch(parsed.reason, /degraded Codex fallback/);
 });
 
 test("gate invokes Codex fallback with supported read-only argv", () => {
@@ -1398,7 +1530,7 @@ test("skills use skill-root companion path and unquoted arguments", () => {
   const skillRoot = new URL("../plugins/review-loop/skills", import.meta.url).pathname;
   for (const skill of readdirSync(skillRoot)) {
     const content = readFileSync(join(skillRoot, skill, "SKILL.md"), "utf8");
-    assert.match(content, /<skill-root>\/\.\.\/\.\.\/scripts\/review-loop-companion\.mjs/);
+    assert.match(content, /REVIEW_LOOP_HOST=codex node "<skill-root>\/\.\.\/\.\.\/scripts\/review-loop-companion\.mjs/);
     assert.doesNotMatch(content, /"\$ARGUMENTS"|\$\(pwd\)|REVIEW_LOOP_PLUGIN_ROOT|<skill dir>/);
   }
 });
@@ -1411,7 +1543,7 @@ test("skill shell invocation preserves flags in ARGUMENTS", () => {
 
   const skillRoot = new URL("../plugins/review-loop/skills/review-loop", import.meta.url).pathname;
   const content = readFileSync(join(skillRoot, "SKILL.md"), "utf8");
-  const command = content.match(/node "<skill-root>\/\.\.\/\.\.\/scripts\/review-loop-companion\.mjs" run --scope auto \$ARGUMENTS/)?.[0];
+  const command = content.match(/REVIEW_LOOP_HOST=codex node "<skill-root>\/\.\.\/\.\.\/scripts\/review-loop-companion\.mjs" run --scope auto \$ARGUMENTS/)?.[0];
   assert.ok(command);
   const expanded = command.replace("<skill-root>", skillRoot);
   const result = spawnSync("sh", ["-c", expanded], {
@@ -1519,7 +1651,25 @@ test("manifest wires Codex Stop hook", () => {
   const commandHook = hooks.hooks.Stop[0].hooks[0];
   assert.equal(commandHook.name, "review-loop finalization gate");
   assert.match(commandHook.description, /review-loop stop hook/);
+  assert.match(commandHook.command, /REVIEW_LOOP_HOST=codex/);
   assert.match(commandHook.command, /\$\{PLUGIN_ROOT\}\/scripts\/stop-review-gate-hook\.mjs/);
+});
+
+test("Claude plugin surface routes commands and Stop hook through shared runtime", () => {
+  const marketplace = JSON.parse(readFileSync(new URL("../.claude-plugin/marketplace.json", import.meta.url), "utf8"));
+  assert.equal(marketplace.plugins[0].source, "./plugins/review-loop");
+  const manifest = JSON.parse(readFileSync(new URL("../plugins/review-loop/.claude-plugin/plugin.json", import.meta.url), "utf8"));
+  assert.equal(manifest.name, "review-loop");
+  const hooks = JSON.parse(readFileSync(new URL("../plugins/review-loop/hooks/hooks.json", import.meta.url), "utf8"));
+  const commandHook = hooks.hooks.Stop[0].hooks[0];
+  assert.doesNotMatch(commandHook.command, /REVIEW_LOOP_HOST=claude/);
+  assert.match(commandHook.command, /^node /);
+  assert.match(commandHook.command, /\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/stop-review-gate-hook\.mjs/);
+  for (const command of ["run", "setup", "status", "result", "cancel"]) {
+    const content = readFileSync(new URL(`../plugins/review-loop/commands/${command}.md`, import.meta.url), "utf8");
+    assert.doesNotMatch(content, /REVIEW_LOOP_HOST=claude/);
+    assert.match(content, /\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/review-loop-companion\.mjs/);
+  }
 });
 
 function run(args, { cwd, env, input } = {}) {

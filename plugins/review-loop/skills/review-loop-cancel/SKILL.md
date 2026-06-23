@@ -8,7 +8,7 @@ description: Cancel a running review-loop background job.
 Run:
 
 ```bash
-node "<skill-root>/../../scripts/review-loop-companion.mjs" cancel $ARGUMENTS
+REVIEW_LOOP_HOST=codex node "<skill-root>/../../scripts/review-loop-companion.mjs" cancel $ARGUMENTS
 ```
 
 Supported arguments:
