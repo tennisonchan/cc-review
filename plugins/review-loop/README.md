@@ -1,6 +1,8 @@
 # review-loop
 
-Codex plugin for running multi-agent read-only review loops. `review-loop` is a gate-agnostic review execution engine: callers provide context, artifacts, focus, and optional guidelines; higher-level agents decide when a review is needed and what gate or policy the result satisfies.
+Multi-agent review loops for structured, policy-aware code gates.
+
+`review-loop` is a gate-agnostic, read-only review execution engine: callers provide context, artifacts, focus, and optional guidelines; higher-level agents decide when a review is needed and what gate or policy the result satisfies.
 
 The core workflow is agent-first:
 
