@@ -13,6 +13,8 @@ const SEVERITIES = ["info", "low", "medium", "high"];
 const GENERIC_DECISIONS = ["approved", "changes_requested", "invalid_input", "blocked"];
 const REVIEWER_DISPOSITIONS = ["blocking", "advisory"];
 const BLOCKING_REASONS = ["reviewer", "category_policy", "severity_policy", "fallback_threshold"];
+const REVIEWERS = ["claude", "codex"];
+const HOSTS = ["codex", "claude"];
 const DEFAULT_BLOCK_ON = "high";
 const GATE_FINGERPRINT_BLOCK_LIMIT = 3;
 const GATE_TOTAL_BLOCK_LIMIT = 5;
@@ -129,7 +131,7 @@ Run "<subcommand> --help" for subcommand options.`);
 
 const SUBCOMMAND_HELP = {
   setup: "setup [--init-guidelines] [--force] [--enable-review-gate] [--disable-review-gate] [--block-on info|low|medium|high] [--enable-gate-debug] [--disable-gate-debug] [--json]",
-  run: "run [--background] [--counter] [--context <path>] [--artifact <path>] [--focus <text>] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--on-reviewer-failure block|allow] [--json]",
+  run: "run [--background] [--counter] [--context <path>] [--artifact <path>] [--focus <text>] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--reviewer claude|codex] [--on-reviewer-failure block|allow] [--json]",
   status: "status [job-id] [--all] [--json]",
   result: "result [job-id] [--json]",
   cancel: "cancel [job-id] [--json]",
@@ -159,6 +161,7 @@ function parseArgs(argv) {
     guidelines: null,
     initGuidelines: false,
     json: false,
+    reviewer: null,
     scope: "auto",
     scopeExplicit: false,
     onReviewerFailure: "block",
@@ -207,6 +210,7 @@ function parseArgs(argv) {
       case "--artifact":
       case "--focus":
       case "--guidelines":
+      case "--reviewer":
       case "--scope":
       case "--on-reviewer-failure":
       case "--block-on": {
@@ -217,6 +221,7 @@ function parseArgs(argv) {
         if (arg === "--artifact") args.artifact = value;
         if (arg === "--focus") args.focus = value;
         if (arg === "--guidelines") args.guidelines = value;
+        if (arg === "--reviewer") args.reviewer = value;
         if (arg === "--scope") {
           args.scope = value;
           args.scopeExplicit = true;
@@ -237,6 +242,7 @@ function parseArgs(argv) {
   if (!["block", "allow"].includes(args.onReviewerFailure)) {
     throw new Error(`invalid --on-reviewer-failure: ${args.onReviewerFailure}`);
   }
+  if (args.reviewer) assertReviewer(args.reviewer, "--reviewer");
   if (args.blockOn) assertSeverity(args.blockOn, "--block-on");
   return args;
 }
@@ -373,6 +379,9 @@ async function runCommand(args) {
   if (args.blockOn) {
     throw new Error("--block-on is only supported by setup/gate policy configuration; use a json review-loop policy block with run");
   }
+  if (isTerminalReviewerMode()) {
+    throw new Error("review-loop run is disabled in terminal reviewer mode");
+  }
   if (args.background) {
     const job = await startBackgroundReview("run", args);
     output(job, args.json, (value) => `Started review-loop job ${value.id}\nState: ${value.state}\n`);
@@ -388,9 +397,10 @@ async function runGenericReview({ args, cwd, cache = false }) {
   const policy = guidelinePolicy(guidelines);
   const inputs = collectGenericReviewInputs(repo.root, args, cwd);
   const stance = args.counter ? "counter" : "standard";
-  const prompt = buildGenericPrompt({ guidelines, inputs, focus: args.focus || args.positional.join(" ").trim(), stance, policy });
+  const reviewer = resolveReviewer(args);
+  const prompt = buildGenericPrompt({ guidelines, inputs, focus: args.focus || args.positional.join(" ").trim(), stance, policy, reviewer });
   const targetHash = createHash("sha256")
-    .update(JSON.stringify(["run", stance, args.focus || args.positional.join(" ").trim(), guidelines.content, inputs.fingerprint]))
+    .update(JSON.stringify(["run", stance, reviewer, args.focus || args.positional.join(" ").trim(), guidelines.content, inputs.fingerprint]))
     .digest("hex");
   if (inputs.empty) {
     const result = validateNormalizedResult(normalizeReviewOutput({
@@ -426,11 +436,11 @@ async function runGenericReview({ args, cwd, cache = false }) {
       };
     }
   }
-  let claude;
+  let reviewerResult;
   let reviewerOutput;
   try {
-    claude = await runClaude(prompt, { schemaPath: REVIEWER_OUTPUT_SCHEMA_PATH });
-    reviewerOutput = validateReviewerOutput(claude.structuredOutput);
+    reviewerResult = await runReviewer(prompt, { reviewer, schemaPath: REVIEWER_OUTPUT_SCHEMA_PATH, cwd: repo.root });
+    reviewerOutput = validateReviewerOutput(reviewerResult.structuredOutput);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (args.onReviewerFailure === "throw") {
@@ -443,7 +453,7 @@ async function runGenericReview({ args, cwd, cache = false }) {
         findings: [],
         required_next_actions: [],
       };
-      claude = { resultText: "", meta: { failed: true, on_reviewer_failure: "allow" } };
+      reviewerResult = { resultText: "", meta: { failed: true, reviewer_mechanism: "failed", on_reviewer_failure: "allow" } };
     } else {
       return {
         ok: false,
@@ -460,15 +470,15 @@ async function runGenericReview({ args, cwd, cache = false }) {
     policy,
     blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
     reviewedInputs: inputs.reviewed_inputs,
-    reviewerMechanism: mechanismName(claude.meta),
+    reviewerMechanism: mechanismName(reviewerResult.meta),
   });
   const normalized = validateNormalizedResult(result);
   if (cache) {
     writeJson(reviewCachePath(repo.root), {
       target_hash: targetHash,
       result: normalized,
-      raw: claude.resultText,
-      meta: claude.meta,
+      raw: reviewerResult.resultText,
+      meta: reviewerResult.meta,
       created_at: new Date().toISOString(),
     });
   }
@@ -477,8 +487,8 @@ async function runGenericReview({ args, cwd, cache = false }) {
     repo: repo.root,
     guidelines: summarizeGuidelines(guidelines),
     result: normalized,
-    raw: claude.resultText,
-    reviewer_mechanism: claude.meta,
+    raw: reviewerResult.resultText,
+    reviewer_mechanism: reviewerResult.meta,
   };
 }
 
@@ -488,80 +498,110 @@ async function runFallbackReview({ args, cwd, primaryFailure }) {
   const policy = guidelinePolicy(guidelines);
   const inputs = collectGenericReviewInputs(repo.root, args, cwd);
 
-  if (process.env.REVIEW_LOOP_FAKE_FALLBACK_ERROR) {
-    throw new Error(process.env.REVIEW_LOOP_FAKE_FALLBACK_ERROR);
-  }
-  if (process.env.REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT) {
-    const reviewerOutput = validateReviewerOutput(JSON.parse(process.env.REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT));
-    const result = validateNormalizedResult(normalizeReviewOutput(reviewerOutput, {
-      policy,
-      blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
-      reviewedInputs: inputs.reviewed_inputs,
-      reviewerMechanism: "codex-fallback-fake",
-    }));
-    return {
-      ok: result.decision === "approved",
-      repo: repo.root,
-      guidelines: summarizeGuidelines(guidelines),
-      result,
-      raw: "",
-      fallback: { fake: true },
-    };
-  }
-
   const prompt = buildFallbackPrompt({ guidelines, inputs, primaryFailure });
-  const outDir = join(stateRoot(), "fallback");
-  mkdirSync(outDir, { recursive: true });
-  pruneOldFiles(outDir);
-  const outPath = join(outDir, `${Date.now()}-${randomUUID().slice(0, 8)}.json`);
-  const fallbackToken = createFallbackSentinel(repo.root);
-  const timeoutMs = Number(process.env.REVIEW_LOOP_FALLBACK_TIMEOUT_MS || DEFAULT_FALLBACK_TIMEOUT_MS);
-  const result = spawnSync(codexBin(), [
-    "exec",
-    "--sandbox", "read-only",
-    "--cd", repo.root,
-    "--output-schema", REVIEWER_OUTPUT_SCHEMA_PATH,
-    "--output-last-message", outPath,
-    "-",
-  ], {
-    cwd: repo.root,
-    encoding: "utf8",
-    input: prompt,
-    timeout: timeoutMs,
-    env: { ...process.env, REVIEW_LOOP_FALLBACK_TOKEN: fallbackToken },
-    maxBuffer: 64 * 1024 * 1024,
+  const codex = runCodexReviewerPrimitive(prompt, {
+    repoRoot: repo.root,
+    fakeOutputEnv: "REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT",
+    fakeErrorEnv: "REVIEW_LOOP_FAKE_FALLBACK_ERROR",
+    timeoutEnv: "REVIEW_LOOP_FALLBACK_TIMEOUT_MS",
+    failureLabel: "codex fallback review",
+    mechanism: "codex-fallback",
+    fakeMechanism: "codex-fallback-fake",
+    useFallbackSentinel: true,
   });
-  clearFallbackSentinel(repo.root, fallbackToken);
-
-  if (result.error) {
-    throw new Error(`codex fallback review failed: ${result.error.message}`);
-  }
-  if (result.status !== 0) {
-    throw new Error(`codex fallback review failed with exit ${result.status}: ${redact(result.stderr || result.stdout)}`);
-  }
-  if (!existsSync(outPath)) {
-    throw new Error("codex fallback review did not produce structured output");
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(readFileSync(outPath, "utf8"));
-  } catch (error) {
-    throw new Error(`codex fallback structured output was not JSON: ${error.message}`);
-  }
-  const reviewerOutput = validateReviewerOutput(parsed);
+  const reviewerOutput = validateReviewerOutput(codex.structuredOutput);
   const normalized = validateNormalizedResult(normalizeReviewOutput(reviewerOutput, {
     policy,
     blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
     reviewedInputs: inputs.reviewed_inputs,
-    reviewerMechanism: "codex-fallback",
+    reviewerMechanism: mechanismName(codex.meta),
   }));
   return {
     ok: normalized.decision === "approved",
     repo: repo.root,
     guidelines: summarizeGuidelines(guidelines),
     result: normalized,
-    raw: readFileSync(outPath, "utf8"),
-    fallback: { status: result.status },
+    raw: codex.resultText,
+    fallback: codex.meta.fake ? { fake: true } : { status: codex.meta.status },
+  };
+}
+
+async function runReviewer(prompt, options = {}) {
+  const reviewer = options.reviewer || "claude";
+  if (reviewer === "codex") return runCodexReviewer(prompt, options);
+  return runClaudeReviewer(prompt, options);
+}
+
+function runCodexReviewer(prompt, options = {}) {
+  const repo = resolveWorkspace(options.cwd || process.cwd());
+  return runCodexReviewerPrimitive(prompt, {
+    repoRoot: repo.root,
+    fakeOutputEnv: "REVIEW_LOOP_FAKE_CODEX_STRUCTURED_OUTPUT",
+    fakeErrorEnv: "REVIEW_LOOP_FAKE_CODEX_ERROR",
+    timeoutEnv: "REVIEW_LOOP_CODEX_TIMEOUT_MS",
+    failureLabel: "codex review",
+    mechanism: "codex",
+    fakeMechanism: "codex-fake",
+    useFallbackSentinel: false,
+  });
+}
+
+function runCodexReviewerPrimitive(prompt, options) {
+  if (process.env[options.fakeErrorEnv]) {
+    throw new Error(process.env[options.fakeErrorEnv]);
+  }
+  if (process.env[options.fakeOutputEnv]) {
+    const structuredOutput = JSON.parse(process.env[options.fakeOutputEnv]);
+    return { structuredOutput, resultText: "", meta: { fake: true, reviewer_mechanism: options.fakeMechanism } };
+  }
+
+  const outDir = join(stateRoot(), "fallback");
+  mkdirSync(outDir, { recursive: true });
+  pruneOldFiles(outDir);
+  const outPath = join(outDir, `${Date.now()}-${randomUUID().slice(0, 8)}.json`);
+  const fallbackToken = options.useFallbackSentinel ? createFallbackSentinel(options.repoRoot) : null;
+  const timeoutMs = Number(process.env[options.timeoutEnv] || DEFAULT_FALLBACK_TIMEOUT_MS);
+  const childEnv = { ...process.env, REVIEW_LOOP_TERMINAL_REVIEWER: "1" };
+  if (fallbackToken) childEnv.REVIEW_LOOP_FALLBACK_TOKEN = fallbackToken;
+  const result = spawnSync(codexBin(), [
+    "exec",
+    "--sandbox", "read-only",
+    "--cd", options.repoRoot,
+    "--output-schema", REVIEWER_OUTPUT_SCHEMA_PATH,
+    "--output-last-message", outPath,
+    "-",
+  ], {
+    cwd: options.repoRoot,
+    encoding: "utf8",
+    input: prompt,
+    timeout: timeoutMs,
+    env: childEnv,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (fallbackToken) clearFallbackSentinel(options.repoRoot, fallbackToken);
+
+  if (result.error) {
+    throw new Error(`${options.failureLabel} failed: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(`${options.failureLabel} failed with exit ${result.status}: ${redact(result.stderr || result.stdout)}`);
+  }
+  if (!existsSync(outPath)) {
+    throw new Error(`${options.failureLabel} did not produce structured output`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(outPath, "utf8"));
+  } catch (error) {
+    throw new Error(`${options.failureLabel} structured output was not JSON: ${error.message}`);
+  }
+  return {
+    structuredOutput: parsed,
+    resultText: readFileSync(outPath, "utf8"),
+    meta: {
+      status: result.status,
+      reviewer_mechanism: options.mechanism,
+    },
   };
 }
 
@@ -590,14 +630,15 @@ function reviewCachePath(repoRoot) {
   return join(stateRoot(), "review-cache", `${repoHash(repoRoot)}.json`);
 }
 
-function buildGenericPrompt({ guidelines, inputs, focus, stance, policy }) {
+function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewer }) {
   const delimiter = `REVIEW_LOOP_INPUT_${randomUUID()}`;
+  const reviewerLabel = reviewer === "codex" ? "Codex" : "Claude Code";
   const policySummary = [
     `block_on: ${policy.blockOn || DEFAULT_BLOCK_ON}`,
     `category_block_on: ${JSON.stringify(policy.categories || {})}`,
   ].join("\n");
   return [
-    "You are Claude Code acting as a read-only independent reviewer.",
+    `You are ${reviewerLabel} acting as a read-only independent reviewer.`,
     "Prompt authority hierarchy:",
     "1. Engine safety and output schema are non-overridable.",
     "2. Machine-readable review-loop policy is deterministic policy material.",
@@ -655,7 +696,7 @@ function loadSchema(schemaPath) {
   return JSON.stringify(schema);
 }
 
-async function runClaude(prompt, options = {}) {
+async function runClaudeReviewer(prompt, options = {}) {
   if (process.env.REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT) {
     const structuredOutput = JSON.parse(process.env.REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT);
     return { structuredOutput, resultText: "", meta: { fake: true } };
@@ -664,7 +705,7 @@ async function runClaude(prompt, options = {}) {
   // Read-only context tools so the reviewer can see beyond the diff (the
   // enclosing function, callers, tests); plan mode prevents writes.
   const args = ["-p", "--permission-mode", "plan", "--tools", "Read,Grep,Glob", "--output-format", "json", "--json-schema", loadSchema(options.schemaPath || REVIEWER_OUTPUT_SCHEMA_PATH)];
-  const childEnv = { ...process.env };
+  const childEnv = { ...process.env, REVIEW_LOOP_TERMINAL_REVIEWER: "1" };
   delete childEnv.REVIEW_LOOP_BACKGROUND_ARGS;
 
   const child = spawn(claudeBin(), args, {
@@ -752,6 +793,7 @@ async function runClaude(prompt, options = {}) {
     structuredOutput: envelope.structured_output,
     resultText: envelope.result || "",
     meta: {
+      reviewer_mechanism: "claude-code",
       status,
       session_id: envelope.session_id,
       stop_reason: envelope.stop_reason,
@@ -1198,6 +1240,11 @@ async function gateCommand(args) {
     return;
   }
 
+  if (isTerminalReviewerMode()) {
+    outputHookAllow();
+    return;
+  }
+
   if (!config?.enabled) {
     outputHookAllow();
     return;
@@ -1214,8 +1261,9 @@ async function gateCommand(args) {
 
   let reviewResult;
   let fallbackDisclosure = "";
+  const gateArgs = { ...args, json: true, positional: [], scope: args.scope || "auto", blockOn: configuredBlockOn || undefined };
   try {
-    reviewResult = await runGenericReview({ args: { ...args, json: true, positional: [], scope: args.scope || "auto", blockOn: configuredBlockOn || undefined, onReviewerFailure: "throw" }, cwd: process.cwd(), cache: true });
+    reviewResult = await runGenericReview({ args: { ...gateArgs, onReviewerFailure: "throw" }, cwd: process.cwd(), cache: true });
   } catch (error) {
     const message = redact(error instanceof Error ? error.message : String(error));
     if (!(error instanceof ReviewToolFailure)) {
@@ -1224,8 +1272,15 @@ async function gateCommand(args) {
       outputHookBlock(`review-loop could not prepare review: ${message}`);
       return;
     }
+    const selectedReviewer = resolveReviewer(gateArgs);
+    if (selectedReviewer !== "claude") {
+      state.tasks[taskKey] = taskState;
+      writeGateState(repo.root, state);
+      outputHookBlock(`review-loop reviewer mechanism failed: ${message}`);
+      return;
+    }
     try {
-      const fallback = await runFallbackReview({ args: { ...args, json: true, positional: [], scope: args.scope || "auto", blockOn: configuredBlockOn || undefined }, cwd: process.cwd(), primaryFailure: message });
+      const fallback = await runFallbackReview({ args: gateArgs, cwd: process.cwd(), primaryFailure: message });
       reviewResult = fallback;
       fallbackDisclosure = [
         "Claude-backed review-loop was unavailable; used degraded Codex fallback review.",
@@ -1501,9 +1556,10 @@ function maxFindingSeverity(findings) {
 }
 
 function mechanismName(meta = {}) {
+  if (meta.reviewer_mechanism) return meta.reviewer_mechanism;
   if (meta.fake) return "fake";
   if (meta.failed) return "failed";
-  return "claude-code";
+  return "unknown";
 }
 
 function summarizeGuidelines(guidelines) {
@@ -1518,6 +1574,46 @@ function assertSeverity(value, label) {
   if (!SEVERITIES.includes(value)) {
     throw new Error(`${label} must be one of: ${SEVERITIES.join(", ")}`);
   }
+}
+
+function assertReviewer(value, label) {
+  if (!REVIEWERS.includes(value)) {
+    throw new Error(`${label} must be one of: ${REVIEWERS.join(", ")}`);
+  }
+}
+
+function assertHost(value, label) {
+  if (!HOSTS.includes(value)) {
+    throw new Error(`${label} must be one of: ${HOSTS.join(", ")}`);
+  }
+}
+
+function resolveReviewer(args = {}) {
+  const explicit = args.reviewer || process.env.REVIEW_LOOP_REVIEWER || "";
+  if (explicit) {
+    assertReviewer(explicit, args.reviewer ? "--reviewer" : "REVIEW_LOOP_REVIEWER");
+    return explicit;
+  }
+  const host = resolveHost();
+  if (host) {
+    return host === "claude" ? "codex" : "claude";
+  }
+  return "claude";
+}
+
+function resolveHost() {
+  const explicit = process.env.REVIEW_LOOP_HOST || "";
+  if (explicit) {
+    assertHost(explicit, "REVIEW_LOOP_HOST");
+    return explicit;
+  }
+  if (process.env.CLAUDE_PLUGIN_ROOT) return "claude";
+  if (process.env.PLUGIN_ROOT) return "codex";
+  return "";
+}
+
+function isTerminalReviewerMode() {
+  return process.env.REVIEW_LOOP_TERMINAL_REVIEWER === "1";
 }
 
 function detectMainAgentGateSupport() {

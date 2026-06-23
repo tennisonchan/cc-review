@@ -8,7 +8,7 @@ description: List running and recent review-loop background jobs for the current
 Run:
 
 ```bash
-node "<skill-root>/../../scripts/review-loop-companion.mjs" status $ARGUMENTS
+REVIEW_LOOP_HOST=codex node "<skill-root>/../../scripts/review-loop-companion.mjs" status $ARGUMENTS
 ```
 
 Supported arguments:

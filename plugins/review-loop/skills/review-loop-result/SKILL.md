@@ -8,7 +8,7 @@ description: Show a completed review-loop background job result.
 Run:
 
 ```bash
-node "<skill-root>/../../scripts/review-loop-companion.mjs" result $ARGUMENTS
+REVIEW_LOOP_HOST=codex node "<skill-root>/../../scripts/review-loop-companion.mjs" result $ARGUMENTS
 ```
 
 Supported arguments:

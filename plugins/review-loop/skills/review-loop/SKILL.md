@@ -10,7 +10,7 @@ Use this skill before a final response, implementation-ready claim, or PR submis
 Run:
 
 ```bash
-node "<skill-root>/../../scripts/review-loop-companion.mjs" run --scope auto $ARGUMENTS
+REVIEW_LOOP_HOST=codex node "<skill-root>/../../scripts/review-loop-companion.mjs" run --scope auto $ARGUMENTS
 ```
 
 Supported arguments:
