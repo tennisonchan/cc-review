@@ -355,12 +355,57 @@ test("run fails closed on reviewer mechanism failure by default", () => {
   const repo = makeGitRepo();
   const result = run(["run", "--scope", "none", "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", findings: [] }) },
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", findings: [] }),
+      REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback unavailable",
+    },
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.result.decision, "blocked");
   assert.match(parsed.result.summary, /Reviewer mechanism failed/);
+  assert.match(parsed.result.summary, /Codex fallback review also failed/);
+});
+
+test("run uses Codex fallback when Claude is rate limited", () => {
+  const repo = makeGitRepo();
+  const fakeClaude = join(repo, "bin", "claude-rate-limited");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeClaude, `#!/usr/bin/env sh
+echo "Claude session-limit 429. Try again after refill." >&2
+exit 1
+`, { mode: 0o755 });
+  const result = run(["run", "--scope", "none", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("codex fallback ok")),
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "approved");
+  assert.equal(parsed.result.summary, "codex fallback ok");
+  assert.equal(parsed.result.reviewer_mechanism, "codex-fallback-fake");
+});
+
+test("run does not use Codex fallback when Codex is the primary reviewer", () => {
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--reviewer", "codex", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_FAKE_CODEX_ERROR: "primary codex unavailable",
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback should not run")),
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "blocked");
+  assert.match(parsed.result.summary, /primary codex unavailable/);
+  assert.doesNotMatch(parsed.result.summary, /fallback should not run/);
 });
 
 test("run can fail open explicitly on reviewer mechanism failure", () => {
@@ -467,7 +512,12 @@ test("hung claude invocation times out instead of hanging the review", () => {
 
   const result = run(["run", "--scope", "auto", "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), REVIEW_LOOP_CLAUDE_BIN: fakeClaude, REVIEW_LOOP_CLAUDE_TIMEOUT_MS: "200" },
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
+      REVIEW_LOOP_CLAUDE_TIMEOUT_MS: "200",
+      REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback unavailable",
+    },
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
@@ -520,6 +570,7 @@ test("invalid structured severity fails closed", () => {
         findings: [finding({ severity: "catastrophic" })],
         required_next_actions: [],
       }),
+      REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback unavailable",
     },
   });
   assert.equal(result.status, 0, result.stderr);

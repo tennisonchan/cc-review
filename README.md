@@ -56,7 +56,7 @@ Useful options:
 - `--scope none|auto|working-tree|branch` selects repository diff input. For `run`, context/artifact-only reviews default to `none`; otherwise the default is `auto`.
 - `--focus <text>` supplies the reviewer ask.
 - `--counter` runs the loop in counter-review stance, focused on challenging an assumption, risk, or approach.
-- `--on-reviewer-failure block|allow` controls direct-run mechanism failure behavior. The generic engine defaults to `block`; the Stop hook uses the same v2 result shape and can invoke a degraded read-only Codex fallback when Claude Code is unavailable.
+- `--on-reviewer-failure block|allow` controls direct-run mechanism failure behavior. The generic engine defaults to `block`; when Claude Code is the selected reviewer, Claude mechanism failures use the same degraded read-only Codex fallback strategy as the Stop hook before returning a blocked missing-coverage result.
 - `--background`, `status`, `result`, and `cancel` work with generic reviews. Persisted job metadata is sanitized; free-form focus text, logs, and errors are not returned raw through status/result JSON.
 
 JSON output uses snake_case fields. The normalized result is under `result` and includes `decision`, `blocking_findings`, `advisory_findings`, `required_next_actions`, `reviewed_inputs`, `reviewer_mechanism`, and `read_only`.
@@ -172,7 +172,7 @@ review-loop-setup --enable-review-gate
 
 The gate blocks finalization when the normalized result contains `blocking_findings`. Each blocked stop is re-reviewed, so fixes are verified before finalization. Loop prevention is bounded per task: three blocks for the same finding set and five blocks total; past those caps the gate allows finalization and reports the unresolved findings instead. A stop that changed nothing reuses the previous review decision instead of invoking the reviewer again.
 
-When Claude Code is the primary reviewer, such as in Codex-hosted runs, a tool or provider failure can trigger a degraded read-only Codex fallback review. Findings from that fallback review still use the same `block_on` / `category_block_on` policy and can block finalization. If both Claude Code and the fallback review are unavailable, the gate allows finalization with an explicit missing-review-coverage warning. This fallback is not used for Claude Code-hosted runs where Codex is already the primary reviewer; those failures follow the configured reviewer-failure policy instead.
+When Claude Code is the primary reviewer, such as in Codex-hosted runs, a tool or provider failure can trigger a degraded read-only Codex fallback review. This includes auth failures, rate limits, session limits, missing CLI failures, timeouts, malformed envelopes, and other Claude mechanism blockers. Findings from that fallback review still use the same `block_on` / `category_block_on` policy and can block finalization. If both Claude Code and the fallback review are unavailable, the Stop hook allows finalization with an explicit missing-review-coverage warning, while direct `review-loop run` returns a blocked missing-coverage result. This fallback is not used for Claude Code-hosted runs where Codex is already the primary reviewer; those failures follow the configured reviewer-failure policy instead.
 
 Disable the gate with:
 
