@@ -454,6 +454,24 @@ async function runGenericReview({ args, cwd, cache = false }) {
         required_next_actions: [],
       };
       reviewerResult = { resultText: "", meta: { failed: true, reviewer_mechanism: "failed", on_reviewer_failure: "allow" } };
+    } else if (reviewer === "claude") {
+      try {
+        return await runFallbackReview({ args, cwd, primaryFailure: message });
+      } catch (fallbackError) {
+        const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+        return {
+          ok: false,
+          repo: repo.root,
+          guidelines: summarizeGuidelines(guidelines),
+          result: validateNormalizedResult(syntheticNormalizedFailure(
+            "blocked",
+            `Reviewer mechanism failed: ${redact(message)}. Codex fallback review also failed: ${redact(fallbackMessage)}`,
+            inputs.reviewed_inputs,
+          )),
+          raw: "",
+          reviewer_mechanism: { failed: true, on_reviewer_failure: "block", fallback_failed: true },
+        };
+      }
     } else {
       return {
         ok: false,
@@ -522,6 +540,7 @@ async function runFallbackReview({ args, cwd, primaryFailure }) {
     guidelines: summarizeGuidelines(guidelines),
     result: normalized,
     raw: codex.resultText,
+    reviewer_mechanism: codex.meta,
     fallback: codex.meta.fake ? { fake: true } : { status: codex.meta.status },
   };
 }

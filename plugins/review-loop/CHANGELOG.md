@@ -10,6 +10,7 @@
 - Removed old gate-config compatibility markers; existing repositories should rerun `review-loop-setup --enable-review-gate` if they want the current null-by-default `block_on` config shape.
 - Background job metadata for generic reviews redacts free-form focus text in persisted status/result records.
 - Branch-scope reviews now auto-detect the default branch before falling back to `main`/`master`.
+- Direct `review-loop run` now uses the degraded Codex fallback review when Claude Code is the selected reviewer and hits auth, rate-limit, session-limit, timeout, or other mechanism blockers.
 
 ## 0.3.0
 
