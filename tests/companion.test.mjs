@@ -357,6 +357,7 @@ test("run fails closed on reviewer mechanism failure by default", () => {
     cwd: repo,
     env: {
       ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
       REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", findings: [] }),
       REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback unavailable",
     },
@@ -380,6 +381,7 @@ exit 1
     cwd: repo,
     env: {
       ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
       REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
       REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("codex fallback ok")),
     },
@@ -391,7 +393,46 @@ exit 1
   assert.equal(parsed.result.reviewer_mechanism, "codex-fallback-fake");
 });
 
-test("run does not use Codex fallback when Codex is the primary reviewer", () => {
+test("run uses Claude fallback when Codex is unavailable under a Claude host", () => {
+  const repo = makeGitRepo();
+  const envFile = join(repo, "claude-fallback-env.json");
+  const stdinFile = join(repo, "claude-fallback-stdin.txt");
+  const fakeClaude = join(repo, "bin", "claude-fallback-capture");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeClaude, `#!/usr/bin/env node
+const fs = require("fs");
+fs.writeFileSync(${JSON.stringify(envFile)}, JSON.stringify({
+  terminalReviewer: process.env.REVIEW_LOOP_TERMINAL_REVIEWER || "",
+  fallbackToken: process.env.REVIEW_LOOP_FALLBACK_TOKEN || ""
+}));
+let input = "";
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
+  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "claude fallback ok", findings: [], required_next_actions: [] }, result: "ok" }));
+});
+`, { mode: 0o755 });
+  const result = run(["run", "--scope", "none", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "claude",
+      REVIEW_LOOP_FAKE_CODEX_ERROR: "primary codex unavailable",
+      REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "approved");
+  assert.equal(parsed.result.summary, "claude fallback ok");
+  assert.equal(parsed.result.reviewer_mechanism, "claude-fallback");
+  const envCapture = JSON.parse(readFileSync(envFile, "utf8"));
+  assert.equal(envCapture.terminalReviewer, "1");
+  assert.match(envCapture.fallbackToken, /^[0-9a-f-]{36}$/i);
+  assert.match(readFileSync(stdinFile, "utf8"), /primary Codex reviewer is unavailable/);
+});
+
+test("run does not fallback when no host fallback reviewer is available", () => {
   const repo = makeGitRepo();
   const result = run(["run", "--scope", "none", "--reviewer", "codex", "--json"], {
     cwd: repo,
@@ -514,6 +555,7 @@ test("hung claude invocation times out instead of hanging the review", () => {
     cwd: repo,
     env: {
       ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
       REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
       REVIEW_LOOP_CLAUDE_TIMEOUT_MS: "200",
       REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback unavailable",
@@ -564,6 +606,7 @@ test("invalid structured severity fails closed", () => {
     cwd: repo,
     env: {
       ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
       REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
         decision: "approved",
         summary: "bad severity",
@@ -655,7 +698,7 @@ test("gate reuses the cached decision for an unchanged tree", () => {
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1", REVIEW_LOOP_HOST: "codex" };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
   assert.equal(setup.status, 0, setup.stderr);
 
@@ -689,7 +732,7 @@ test("gate cache misses on changes invisible to the rendered prompt", () => {
   // window do not change the rendered prompt, but must change cache identity.
   const longBody = Array.from({ length: 240 }, (_, i) => `line ${i}`);
   writeFileSync(join(repo, "long.txt"), longBody.join("\n"));
-  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1", REVIEW_LOOP_HOST: "codex" };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
   assert.equal(setup.status, 0, setup.stderr);
 
@@ -891,7 +934,7 @@ test("gate uses degraded fallback review when Claude review is unavailable", () 
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1", REVIEW_LOOP_HOST: "codex" };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
   assert.equal(setup.status, 0, setup.stderr);
 
@@ -904,7 +947,7 @@ test("gate uses degraded fallback review when Claude review is unavailable", () 
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.decision, undefined);
-  assert.match(parsed.systemMessage, /Claude-backed review-loop was unavailable/);
+  assert.match(parsed.systemMessage, /Claude Code reviewer was unavailable/);
   assert.match(parsed.systemMessage, /degraded Codex fallback review/);
   assert.match(parsed.systemMessage, /reviewer output summary is required/);
 });
@@ -918,6 +961,7 @@ test("gate uses fallback when Claude CLI is missing", () => {
   const env = {
     ...testEnv(repo),
     REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_HOST: "codex",
     REVIEW_LOOP_CLAUDE_BIN: join(repo, "bin", "missing-claude"),
     REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback ok")),
   };
@@ -932,7 +976,30 @@ test("gate uses fallback when Claude CLI is missing", () => {
   assert.match(parsed.systemMessage, /degraded Codex fallback review/);
 });
 
-test("Claude-hosted primary Codex gate failure does not same-agent fallback", () => {
+test("gate fails closed when no distinct host fallback reviewer is available", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const env = {
+    ...testEnv(repo),
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
+    REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback should not run")),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"no-host-fallback"}' });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.decision, "block");
+  assert.match(parsed.reason, /reviewer output summary is required/);
+  assert.doesNotMatch(parsed.reason, /fallback should not run/);
+});
+
+test("Claude-hosted primary Codex gate failure uses degraded Claude fallback", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
   runGit(["add", "file.txt"], repo);
@@ -943,7 +1010,6 @@ test("Claude-hosted primary Codex gate failure does not same-agent fallback", ()
     REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
     REVIEW_LOOP_HOST: "claude",
     REVIEW_LOOP_FAKE_CODEX_ERROR: "primary codex unavailable",
-    REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback should not run")),
   };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
   assert.equal(setup.status, 0, setup.stderr);
@@ -951,9 +1017,10 @@ test("Claude-hosted primary Codex gate failure does not same-agent fallback", ()
   const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"codex-primary-fail"}' });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.decision, "block");
-  assert.match(parsed.reason, /primary codex unavailable/);
-  assert.doesNotMatch(parsed.reason, /degraded Codex fallback/);
+  assert.equal(parsed.decision, undefined);
+  assert.match(parsed.systemMessage, /Codex reviewer was unavailable/);
+  assert.match(parsed.systemMessage, /degraded Claude Code fallback review/);
+  assert.match(parsed.systemMessage, /primary codex unavailable/);
 });
 
 test("gate invokes Codex fallback with supported read-only argv", () => {
@@ -983,6 +1050,7 @@ process.stdin.on("end", () => {
   const env = {
     ...testEnv(repo),
     REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_HOST: "codex",
     REVIEW_LOOP_CODEX_BIN: fakeCodex,
     REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
   };
@@ -1002,6 +1070,52 @@ process.stdin.on("end", () => {
   assert.ok(argv.includes("--output-last-message"));
   assert.match(JSON.parse(readFileSync(envFile, "utf8")).fallbackToken, /^[0-9a-f-]{36}$/i);
   assert.match(readFileSync(stdinFile, "utf8"), /degraded fallback reviewer/);
+});
+
+test("gate invokes Claude fallback with terminal env and backend-specific prompt", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const envFile = join(repo, "claude-env.json");
+  const stdinFile = join(repo, "claude-stdin.txt");
+  const fakeClaude = join(repo, "bin", "claude-capture");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeClaude, `#!/usr/bin/env node
+const fs = require("fs");
+fs.writeFileSync(${JSON.stringify(envFile)}, JSON.stringify({
+  terminalReviewer: process.env.REVIEW_LOOP_TERMINAL_REVIEWER || "",
+  fallbackToken: process.env.REVIEW_LOOP_FALLBACK_TOKEN || ""
+}));
+let input = "";
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
+  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "claude fallback ok", findings: [], required_next_actions: [] }, result: "ok" }));
+});
+`, { mode: 0o755 });
+  const env = {
+    ...testEnv(repo),
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_HOST: "claude",
+    REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
+    REVIEW_LOOP_FAKE_CODEX_ERROR: "primary codex unavailable",
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"claude-fallback"}' });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.decision, undefined);
+  assert.match(parsed.systemMessage, /degraded Claude Code fallback review/);
+  const envCapture = JSON.parse(readFileSync(envFile, "utf8"));
+  assert.equal(envCapture.terminalReviewer, "1");
+  assert.match(envCapture.fallbackToken, /^[0-9a-f-]{36}$/i);
+  const prompt = readFileSync(stdinFile, "utf8");
+  assert.match(prompt, /Claude Code acting as a degraded fallback reviewer/);
+  assert.match(prompt, /primary Codex reviewer is unavailable/);
 });
 
 test("gate prunes expired fallback sentinels before creating a new one", () => {
@@ -1024,6 +1138,7 @@ process.stdin.on("end", () => {
   const env = {
     ...testEnv(repo),
     REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_HOST: "codex",
     REVIEW_LOOP_CODEX_BIN: fakeCodex,
     REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
   };
@@ -1056,6 +1171,7 @@ test("gate blocks on degraded fallback review findings", () => {
   const env = {
     ...testEnv(repo),
     REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_HOST: "codex",
     REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
     REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
       finding({ id: "fallback-blocker", locations: ["file.txt:1"], message: "Fallback found a blocker.", required_action: "Fix it." }),
@@ -1068,7 +1184,7 @@ test("gate blocks on degraded fallback review findings", () => {
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.decision, "block");
-  assert.match(parsed.reason, /Claude-backed review-loop was unavailable/);
+  assert.match(parsed.reason, /Claude Code reviewer was unavailable/);
   assert.match(parsed.reason, /Fallback review changes_requested/);
   assert.match(parsed.reason, /Fallback found a blocker/);
 });
@@ -1082,6 +1198,7 @@ test("gate allows report-only when Claude and fallback review are unavailable", 
   const env = {
     ...testEnv(repo),
     REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_HOST: "codex",
     REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
     REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback failed with api_key=secret-value",
   };
@@ -1095,6 +1212,33 @@ test("gate allows report-only when Claude and fallback review are unavailable", 
   assert.match(parsed.systemMessage, /Allowing finalization without review coverage/);
   assert.match(parsed.systemMessage, /api_key= REDACTED/);
   assert.doesNotMatch(parsed.systemMessage, /secret-value/);
+});
+
+test("gate allows report-only when Codex and Claude fallback are unavailable", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const env = {
+    ...testEnv(repo),
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_HOST: "claude",
+    REVIEW_LOOP_FAKE_CODEX_ERROR: "primary codex failed with api_key=primary-secret",
+    REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback claude failed with api_key=fallback-secret",
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"claude-fallback-fail"}' });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.decision, undefined);
+  assert.match(parsed.systemMessage, /Codex reviewer was unavailable/);
+  assert.match(parsed.systemMessage, /degraded Claude Code fallback review also failed/);
+  assert.match(parsed.systemMessage, /Allowing finalization without review coverage/);
+  assert.match(parsed.systemMessage, /api_key= REDACTED/);
+  assert.doesNotMatch(parsed.systemMessage, /primary-secret|fallback-secret/);
 });
 
 test("gate does not invoke fallback for real Claude findings", () => {
@@ -1389,7 +1533,7 @@ test("gate infrastructure errors allow report-only when fallback also fails", ()
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  const env = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
+  const env = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1", REVIEW_LOOP_HOST: "codex" };
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
   assert.equal(setup.status, 0, setup.stderr);
   const result = run(["gate", "--json"], {
