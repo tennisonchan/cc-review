@@ -454,9 +454,20 @@ async function runGenericReview({ args, cwd, cache = false }) {
         required_next_actions: [],
       };
       reviewerResult = { resultText: "", meta: { failed: true, reviewer_mechanism: "failed", on_reviewer_failure: "allow" } };
-    } else if (reviewer === "claude") {
+    } else {
+      const fallbackReviewer = resolveFallbackReviewer(reviewer);
+      if (!fallbackReviewer) {
+        return {
+          ok: false,
+          repo: repo.root,
+          guidelines: summarizeGuidelines(guidelines),
+          result: validateNormalizedResult(syntheticNormalizedFailure("blocked", `Reviewer mechanism failed: ${redact(message)}`, inputs.reviewed_inputs)),
+          raw: "",
+          reviewer_mechanism: { failed: true, on_reviewer_failure: "block" },
+        };
+      }
       try {
-        return await runFallbackReview({ args, cwd, primaryFailure: message });
+        return await runFallbackReview({ args, cwd, primaryReviewer: reviewer, fallbackReviewer, primaryFailure: message });
       } catch (fallbackError) {
         const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
         return {
@@ -465,22 +476,13 @@ async function runGenericReview({ args, cwd, cache = false }) {
           guidelines: summarizeGuidelines(guidelines),
           result: validateNormalizedResult(syntheticNormalizedFailure(
             "blocked",
-            `Reviewer mechanism failed: ${redact(message)}. Codex fallback review also failed: ${redact(fallbackMessage)}`,
+            `Reviewer mechanism failed: ${redact(message)}. ${reviewerDisplayName(fallbackReviewer)} fallback review also failed: ${redact(fallbackMessage)}`,
             inputs.reviewed_inputs,
           )),
           raw: "",
           reviewer_mechanism: { failed: true, on_reviewer_failure: "block", fallback_failed: true },
         };
       }
-    } else {
-      return {
-        ok: false,
-        repo: repo.root,
-        guidelines: summarizeGuidelines(guidelines),
-        result: validateNormalizedResult(syntheticNormalizedFailure("blocked", `Reviewer mechanism failed: ${redact(message)}`, inputs.reviewed_inputs)),
-        raw: "",
-        reviewer_mechanism: { failed: true, on_reviewer_failure: "block" },
-      };
     }
   }
 
@@ -510,39 +512,62 @@ async function runGenericReview({ args, cwd, cache = false }) {
   };
 }
 
-async function runFallbackReview({ args, cwd, primaryFailure }) {
+async function runFallbackReview({ args, cwd, primaryReviewer, fallbackReviewer, primaryFailure }) {
   const repo = resolveWorkspace(cwd);
   const guidelines = resolveGuidelines(args.guidelines, cwd, repo.root);
   const policy = guidelinePolicy(guidelines);
   const inputs = collectGenericReviewInputs(repo.root, args, cwd);
 
-  const prompt = buildFallbackPrompt({ guidelines, inputs, primaryFailure });
-  const codex = runCodexReviewerPrimitive(prompt, {
-    repoRoot: repo.root,
-    fakeOutputEnv: "REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT",
-    fakeErrorEnv: "REVIEW_LOOP_FAKE_FALLBACK_ERROR",
-    timeoutEnv: "REVIEW_LOOP_FALLBACK_TIMEOUT_MS",
-    failureLabel: "codex fallback review",
-    mechanism: "codex-fallback",
-    fakeMechanism: "codex-fallback-fake",
-    useFallbackSentinel: true,
-  });
-  const reviewerOutput = validateReviewerOutput(codex.structuredOutput);
+  const prompt = buildFallbackPrompt({ guidelines, inputs, primaryReviewer, fallbackReviewer, primaryFailure });
+  const fallback = await runFallbackReviewer(prompt, { fallbackReviewer, repoRoot: repo.root });
+  const reviewerOutput = validateReviewerOutput(fallback.structuredOutput);
   const normalized = validateNormalizedResult(normalizeReviewOutput(reviewerOutput, {
     policy,
     blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
     reviewedInputs: inputs.reviewed_inputs,
-    reviewerMechanism: mechanismName(codex.meta),
+    reviewerMechanism: mechanismName(fallback.meta),
   }));
   return {
     ok: normalized.decision === "approved",
     repo: repo.root,
     guidelines: summarizeGuidelines(guidelines),
     result: normalized,
-    raw: codex.resultText,
-    reviewer_mechanism: codex.meta,
-    fallback: codex.meta.fake ? { fake: true } : { status: codex.meta.status },
+    raw: fallback.resultText,
+    reviewer_mechanism: fallback.meta,
+    fallback: fallback.meta.fake ? { fake: true, reviewer: fallbackReviewer } : { status: fallback.meta.status, reviewer: fallbackReviewer },
   };
+}
+
+async function runFallbackReviewer(prompt, { fallbackReviewer, repoRoot }) {
+  const mechanism = `${fallbackReviewer}-fallback`;
+  const fakeMechanism = `${fallbackReviewer}-fallback-fake`;
+  const failureLabel = `${reviewerDisplayName(fallbackReviewer)} fallback review`;
+  if (fallbackReviewer === "codex") {
+    return runCodexReviewerPrimitive(prompt, {
+      repoRoot,
+      fakeOutputEnv: "REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT",
+      fakeErrorEnv: "REVIEW_LOOP_FAKE_FALLBACK_ERROR",
+      timeoutEnv: "REVIEW_LOOP_FALLBACK_TIMEOUT_MS",
+      failureLabel,
+      mechanism,
+      fakeMechanism,
+      useFallbackSentinel: true,
+    });
+  }
+  if (fallbackReviewer === "claude") {
+    return runClaudeReviewer(prompt, {
+      cwd: repoRoot,
+      fakeOutputEnv: "REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT",
+      fakeErrorEnv: "REVIEW_LOOP_FAKE_FALLBACK_ERROR",
+      timeoutEnv: "REVIEW_LOOP_FALLBACK_TIMEOUT_MS",
+      failureLabel,
+      mechanism,
+      fakeMechanism,
+      useFallbackSentinel: true,
+      repoRoot,
+    });
+  }
+  throw new Error(`unsupported fallback reviewer: ${fallbackReviewer}`);
 }
 
 async function runReviewer(prompt, options = {}) {
@@ -689,13 +714,15 @@ function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewe
   ].filter(Boolean).join("\n");
 }
 
-function buildFallbackPrompt({ guidelines, inputs, primaryFailure }) {
+function buildFallbackPrompt({ guidelines, inputs, primaryReviewer, fallbackReviewer, primaryFailure }) {
+  const primaryLabel = reviewerDisplayName(primaryReviewer);
+  const fallbackLabel = reviewerDisplayName(fallbackReviewer);
   return [
-    "You are Codex acting as a degraded fallback reviewer because Claude-backed review-loop is unavailable.",
+    `You are ${fallbackLabel} acting as a degraded fallback reviewer because the primary ${primaryLabel} reviewer is unavailable.`,
     "This is a read-only review. Do not edit files, write files, apply patches, commit, or continue into implementation.",
-    "Review the same generic inputs Claude-backed review-loop would have reviewed and return only structured findings matching the requested reviewer-output schema.",
+    `Review the same generic inputs the primary ${primaryLabel} reviewer would have reviewed and return only structured findings matching the requested reviewer-output schema.`,
     "",
-    "Claude-backed review-loop failure context, sanitized:",
+    `${primaryLabel} reviewer failure context, sanitized:`,
     redact(primaryFailure),
     "",
     "Review guidelines:",
@@ -716,19 +743,29 @@ function loadSchema(schemaPath) {
 }
 
 async function runClaudeReviewer(prompt, options = {}) {
-  if (process.env.REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT) {
-    const structuredOutput = JSON.parse(process.env.REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT);
-    return { structuredOutput, resultText: "", meta: { fake: true } };
+  if (options.fakeErrorEnv && process.env[options.fakeErrorEnv]) {
+    throw new Error(process.env[options.fakeErrorEnv]);
+  }
+  const fakeOutputEnv = options.fakeOutputEnv || "REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT";
+  if (process.env[fakeOutputEnv]) {
+    const structuredOutput = JSON.parse(process.env[fakeOutputEnv]);
+    const meta = { fake: true };
+    if (options.fakeMechanism) meta.reviewer_mechanism = options.fakeMechanism;
+    return { structuredOutput, resultText: "", meta };
   }
 
   // Read-only context tools so the reviewer can see beyond the diff (the
   // enclosing function, callers, tests); plan mode prevents writes.
   const args = ["-p", "--permission-mode", "plan", "--tools", "Read,Grep,Glob", "--output-format", "json", "--json-schema", loadSchema(options.schemaPath || REVIEWER_OUTPUT_SCHEMA_PATH)];
+  const runCwd = options.useFallbackSentinel ? (options.cwd || process.cwd()) : process.cwd();
+  const repoRoot = options.repoRoot || runCwd;
+  const fallbackToken = options.useFallbackSentinel ? createFallbackSentinel(repoRoot) : null;
   const childEnv = { ...process.env, REVIEW_LOOP_TERMINAL_REVIEWER: "1" };
+  if (fallbackToken) childEnv.REVIEW_LOOP_FALLBACK_TOKEN = fallbackToken;
   delete childEnv.REVIEW_LOOP_BACKGROUND_ARGS;
 
   const child = spawn(claudeBin(), args, {
-    cwd: process.cwd(),
+    cwd: runCwd,
     stdio: ["pipe", "pipe", "pipe"],
     env: childEnv,
   });
@@ -748,7 +785,7 @@ async function runClaudeReviewer(prompt, options = {}) {
     child.stdin.end(prompt);
   } catch {}
 
-  const timeoutMs = Number(process.env.REVIEW_LOOP_CLAUDE_TIMEOUT_MS || DEFAULT_CLAUDE_TIMEOUT_MS);
+  const timeoutMs = Number(process.env[options.timeoutEnv || "REVIEW_LOOP_CLAUDE_TIMEOUT_MS"] || DEFAULT_CLAUDE_TIMEOUT_MS);
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
@@ -783,15 +820,16 @@ async function runClaudeReviewer(prompt, options = {}) {
     });
   });
   clearTimeout(timer);
+  if (fallbackToken) clearFallbackSentinel(repoRoot, fallbackToken);
 
   if (spawnError) {
-    throw new Error(`claude review failed to start: ${spawnError.message}`);
+    throw new Error(`${options.failureLabel || "claude review"} failed to start: ${spawnError.message}`);
   }
   if (timedOut) {
-    throw new Error(`claude review timed out after ${Math.round(timeoutMs / 1000)}s`);
+    throw new Error(`${options.failureLabel || "claude review"} timed out after ${Math.round(timeoutMs / 1000)}s`);
   }
   if (status !== 0) {
-    throw new Error(`claude review failed with exit ${status}: ${redact(stderr || stdout)}`);
+    throw new Error(`${options.failureLabel || "claude review"} failed with exit ${status}: ${redact(stderr || stdout)}`);
   }
 
   let envelope;
@@ -812,7 +850,7 @@ async function runClaudeReviewer(prompt, options = {}) {
     structuredOutput: envelope.structured_output,
     resultText: envelope.result || "",
     meta: {
-      reviewer_mechanism: "claude-code",
+      reviewer_mechanism: options.mechanism || "claude-code",
       status,
       session_id: envelope.session_id,
       stop_reason: envelope.stop_reason,
@@ -1292,18 +1330,19 @@ async function gateCommand(args) {
       return;
     }
     const selectedReviewer = resolveReviewer(gateArgs);
-    if (selectedReviewer !== "claude") {
+    const fallbackReviewer = resolveFallbackReviewer(selectedReviewer);
+    if (!fallbackReviewer) {
       state.tasks[taskKey] = taskState;
       writeGateState(repo.root, state);
       outputHookBlock(`review-loop reviewer mechanism failed: ${message}`);
       return;
     }
     try {
-      const fallback = await runFallbackReview({ args: gateArgs, cwd: process.cwd(), primaryFailure: message });
+      const fallback = await runFallbackReview({ args: gateArgs, cwd: process.cwd(), primaryReviewer: selectedReviewer, fallbackReviewer, primaryFailure: message });
       reviewResult = fallback;
       fallbackDisclosure = [
-        "Claude-backed review-loop was unavailable; used degraded Codex fallback review.",
-        "This is not equivalent to Claude-backed review-loop coverage.",
+        `${reviewerDisplayName(selectedReviewer)} reviewer was unavailable; used degraded ${reviewerDisplayName(fallbackReviewer)} fallback review.`,
+        `This is not equivalent to ${reviewerDisplayName(selectedReviewer)} reviewer coverage.`,
         `Primary failure: ${message}`,
       ].join("\n");
     } catch (fallbackError) {
@@ -1311,7 +1350,7 @@ async function gateCommand(args) {
       delete state.tasks[taskKey];
       writeGateState(repo.root, state);
       outputHookAllow([
-        "Claude-backed review-loop was unavailable and the degraded Codex fallback review also failed.",
+        `${reviewerDisplayName(selectedReviewer)} reviewer was unavailable and the degraded ${reviewerDisplayName(fallbackReviewer)} fallback review also failed.`,
         "Allowing finalization without review coverage.",
         `Primary failure: ${message}`,
         `Fallback failure: ${fallbackMessage}`,
@@ -1618,6 +1657,15 @@ function resolveReviewer(args = {}) {
     return host === "claude" ? "codex" : "claude";
   }
   return "claude";
+}
+
+function resolveFallbackReviewer(primaryReviewer) {
+  const host = resolveHost();
+  return host && host !== primaryReviewer ? host : null;
+}
+
+function reviewerDisplayName(reviewer) {
+  return reviewer === "codex" ? "Codex" : "Claude Code";
 }
 
 function resolveHost() {
