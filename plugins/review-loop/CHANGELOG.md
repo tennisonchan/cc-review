@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+## 0.4.0
+
+- An explicit `review-loop run` whose target resolves to empty (no diff in the selected scope and no `--artifact`/`--context`) now returns `decision: "invalid_input"` (`ok: false`) with actionable next steps instead of `approved` / "Nothing to review.". The automatic Stop-hook gate keeps the prior allow-on-clean-tree behavior so finalization is never blocked when there are genuinely no changes. This prevents an explicit review request from silently passing without reviewing anything.
 - Renamed the product, package, plugin, CLI, skills, state directory, and environment namespace from `cc-review` to `review-loop`; old `cc-review*` command names and `CC_REVIEW_*` environment variables are intentionally not preserved.
 - Removed the separate counter-review command surface; use `review-loop run --counter` for counter-review stance. Gate, fallback, background jobs, and bundled skills use the normalized v2 result shape.
 - Renamed the machine policy fence to `json review-loop`; old `json cc-review` policy blocks are intentionally no longer honored.
