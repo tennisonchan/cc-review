@@ -491,20 +491,48 @@ test("run preserves reviewer invalid_input and blocked decisions without synthet
   }
 });
 
-test("empty working-tree review approves without invoking reviewer", () => {
+test("empty-target run reports invalid_input without invoking reviewer", () => {
   const repo = makeGitRepo();
   const env = testEnv(repo);
   runGit(["add", "bin/claude"], repo);
   runGit(["commit", "-m", "test env"], repo);
+  // Explicit `run` with an empty target (clean tree, no --artifact/--context) is a
+  // silent no-op if it "approves": it looks like a passed gate while nothing was
+  // reviewed. It must report invalid_input with an actionable next step instead,
+  // and still must not invoke the reviewer (REVIEW_LOOP_CLAUDE_BIN is /bin/false).
   const result = run(["run", "--scope", "auto", "--json"], {
     cwd: repo,
     env: { ...env, REVIEW_LOOP_CLAUDE_BIN: "/bin/false" },
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.result.decision, "approved");
-  assert.equal(parsed.result.summary, "Nothing to review.");
+  assert.equal(parsed.result.decision, "invalid_input");
+  assert.equal(parsed.ok, false);
   assert.equal(parsed.reviewer_mechanism.reason, "empty-target");
+  assert.match(parsed.result.summary, /Nothing to review/);
+  assert.match(parsed.result.required_next_actions.join("\n"), /--artifact/);
+});
+
+test("gate allows finalization on an empty/clean target without invoking reviewer", () => {
+  const repo = makeGitRepo();
+  const env = {
+    ...testEnv(repo),
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_HOST: "codex",
+    // Both reviewer mechanisms point at /bin/false: an empty target must short
+    // circuit to allow before any reviewer is invoked.
+    REVIEW_LOOP_CLAUDE_BIN: "/bin/false",
+    REVIEW_LOOP_CODEX_BIN: "/bin/false",
+  };
+  runGit(["add", "bin/claude"], repo);
+  runGit(["commit", "-m", "test env"], repo);
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  // Clean tree -> empty target on the gate (gate=true) path. The historical
+  // allow-on-clean-tree behavior must be preserved so finalization is not blocked.
+  const result = run(["gate", "--json"], { cwd: repo, env, input: "{}" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {});
 });
 
 test("oversized diffs are truncated in the review prompt", () => {

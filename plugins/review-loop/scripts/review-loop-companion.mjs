@@ -391,7 +391,7 @@ async function runCommand(args) {
   output(result, args.json, renderGenericReviewResult);
 }
 
-async function runGenericReview({ args, cwd, cache = false }) {
+async function runGenericReview({ args, cwd, cache = false, gate = false }) {
   const repo = resolveWorkspace(cwd);
   const guidelines = resolveGuidelines(args.guidelines, cwd, repo.root);
   const policy = guidelinePolicy(guidelines);
@@ -403,19 +403,39 @@ async function runGenericReview({ args, cwd, cache = false }) {
     .update(JSON.stringify(["run", stance, reviewer, args.focus || args.positional.join(" ").trim(), guidelines.content, inputs.fingerprint]))
     .digest("hex");
   if (inputs.empty) {
-    const result = validateNormalizedResult(normalizeReviewOutput({
-      decision: "approved",
-      summary: "Nothing to review.",
-      findings: [],
-      required_next_actions: [],
-    }, {
+    // The automatic Stop gate legitimately reaches here on a clean tree (nothing
+    // changed -> nothing to review -> allow the stop). For that path keep the
+    // historical "approved / Nothing to review" pass so finalization is not
+    // blocked. But an explicit `run` invocation that resolves to an empty target
+    // means the operator asked to review something and nothing was reviewable
+    // (no diff in scope and no --artifact/--context). Returning "approved" there
+    // is a silent no-op that masquerades as a passed gate, so surface it as
+    // invalid_input with an actionable next step instead.
+    const scopeLabel = inputs.reviewed_inputs.find((entry) => entry.kind === "scope")?.scope || args.scope || "auto";
+    const empty = gate
+      ? {
+          decision: "approved",
+          summary: "Nothing to review.",
+          findings: [],
+          required_next_actions: [],
+        }
+      : {
+          decision: "invalid_input",
+          summary: `Nothing to review: no changes in scope "${scopeLabel}" and no --artifact/--context supplied, so no review ran.`,
+          findings: [],
+          required_next_actions: [
+            "To review a document (for example a plan), re-run with --artifact <path> --scope none.",
+            "To review code, ensure there is a diff in the selected scope or pass --base <ref>.",
+          ],
+        };
+    const result = validateNormalizedResult(normalizeReviewOutput(empty, {
       policy,
       blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
       reviewedInputs: inputs.reviewed_inputs,
       reviewerMechanism: "review-loop",
     }));
     return {
-      ok: true,
+      ok: result.decision === "approved",
       repo: repo.root,
       guidelines: summarizeGuidelines(guidelines),
       result,
@@ -1320,7 +1340,7 @@ async function gateCommand(args) {
   let fallbackDisclosure = "";
   const gateArgs = { ...args, json: true, positional: [], scope: args.scope || "auto", blockOn: configuredBlockOn || undefined };
   try {
-    reviewResult = await runGenericReview({ args: { ...gateArgs, onReviewerFailure: "throw" }, cwd: process.cwd(), cache: true });
+    reviewResult = await runGenericReview({ args: { ...gateArgs, onReviewerFailure: "throw" }, cwd: process.cwd(), cache: true, gate: true });
   } catch (error) {
     const message = redact(error instanceof Error ? error.message : String(error));
     if (!(error instanceof ReviewToolFailure)) {
