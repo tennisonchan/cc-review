@@ -18,7 +18,7 @@
   "interface": {
     "displayName": "review-loop",
     "shortDescription": "Run read-only multi-agent review loops before Codex finalizes work",
-    "longDescription": "Use review-loop to run read-only independent reviews, normalized approved/changes_requested decisions, customizable review guidelines, counter-review with --counter, and conditional agent-finalization review gates.",
+    "longDescription": "Use review-loop to run read-only independent reviews, normalized approved/changes_requested decisions, customizable review guidelines, counter-review with --counter, and automatic agent-finalization review gates.",
     "developerName": "Tennison Chan",
     "category": "Developer Tools",
     "capabilities": [

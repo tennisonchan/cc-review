@@ -1537,8 +1537,12 @@ test("gate debug mode logs hook payloads to the state dir", () => {
   assert.equal(logged[0].payload.custom_field, 42);
 });
 
-test("gate allows when not enabled", () => {
+test("gate defaults enabled without per-repo config", () => {
   const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
   const result = run(["gate", "--json"], {
     cwd: repo,
     env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
@@ -1547,7 +1551,66 @@ test("gate allows when not enabled", () => {
     input: "{}",
   });
   assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.decision, "block");
+  assert.match(parsed.reason, /review-loop changes_requested/);
+});
+
+test("disable-review-gate persists an explicit off marker", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const env = { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+    finding({ id: "h1", locations: ["x"], message: "x", required_action: "x" }),
+  ])) };
+  const setup = run(["setup", "--disable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  const action = JSON.parse(setup.stdout).actions.find((item) => item.action === "disable-review-gate");
+  assert.equal(action.status, "disabled");
+  assert.equal(JSON.parse(readFileSync(action.path, "utf8")).enabled, false);
+
+  const result = run(["gate", "--json"], { cwd: repo, env, input: "{}" });
+  assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), {});
+
+  const debugSetup = run(["setup", "--enable-gate-debug", "--json"], { cwd: repo, env });
+  assert.equal(debugSetup.status, 0, debugSetup.stderr);
+  const updatedConfig = JSON.parse(readFileSync(action.path, "utf8"));
+  assert.equal(updatedConfig.enabled, false);
+  assert.equal(updatedConfig.debug, true);
+
+  const debugResult = run(["gate", "--json"], { cwd: repo, env, input: "{}" });
+  assert.equal(debugResult.status, 0, debugResult.stderr);
+  assert.deepEqual(JSON.parse(debugResult.stdout), {});
+});
+
+test("gate treats config without enabled as enabled", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const env = { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+    finding({ id: "h1", locations: ["x"], message: "x", required_action: "x" }),
+  ])) };
+  const setup = run(["setup", "--enable-gate-debug", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  const action = JSON.parse(setup.stdout).actions.find((item) => item.action === "enable-gate-debug");
+  assert.ok(action.log.endsWith(".jsonl"));
+  const gatesDir = join(env.XDG_STATE_HOME, "review-loop", "gates");
+  const configFiles = readdirSync(gatesDir).filter((file) => file.endsWith(".json"));
+  assert.equal(configFiles.length, 1);
+  const config = JSON.parse(readFileSync(join(gatesDir, configFiles[0]), "utf8"));
+  assert.equal(config.debug, true);
+  assert.equal(config.enabled, undefined);
+
+  const result = run(["gate", "--json"], { cwd: repo, env, input: "{}" });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.decision, "block");
+  assert.match(parsed.reason, /review-loop changes_requested/);
 });
 
 test("gate allow paths never emit invalid approve decision", () => {

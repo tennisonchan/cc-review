@@ -263,7 +263,12 @@ async function setup(args) {
 
   if (args.disableReviewGate) {
     const config = gateConfigPath(repo.root);
-    if (existsSync(config)) rmSync(config);
+    mkdirSync(dirname(config), { recursive: true });
+    writeJson(config, {
+      enabled: false,
+      disabled_at: new Date().toISOString(),
+      companion: fileURLToPath(import.meta.url),
+    });
     actions.push({ action: "disable-review-gate", status: "disabled", path: config });
   }
 
@@ -1322,7 +1327,7 @@ async function gateCommand(args) {
     return;
   }
 
-  if (!config?.enabled) {
+  if (!gateConfigEnabled(config)) {
     outputHookAllow();
     return;
   }
@@ -1330,7 +1335,7 @@ async function gateCommand(args) {
   // Base-threshold precedence: per-repo setup choice, then the guidelines
   // policy block, then the built-in default; category overrides from the
   // guidelines always apply.
-  const configuredBlockOn = config.block_on || args.blockOn || null;
+  const configuredBlockOn = config?.block_on || args.blockOn || null;
   if (configuredBlockOn) assertSeverity(configuredBlockOn, "gate block_on");
   const taskKey = gateTaskKey(hookPayload);
   const state = readGateState(repo.root);
@@ -1737,6 +1742,10 @@ function isWithinPath(candidate, root) {
 function readGateConfig(repoRoot) {
   const config = gateConfigPath(repoRoot);
   return existsSync(config) ? readJson(config) : null;
+}
+
+function gateConfigEnabled(config) {
+  return config?.enabled !== false;
 }
 
 function readGateState(repoRoot) {

@@ -3,11 +3,11 @@
     "Stop": [
       {
         "name": "review-loop finalization gate",
-        "description": "Runs the optional review-loop stop hook before Codex finalizes.",
+        "description": "Runs the review-loop stop hook before Codex finalizes.",
         "hooks": [
           {
             "name": "review-loop finalization gate",
-            "description": "Runs the optional review-loop stop hook before Codex finalizes.",
+            "description": "Runs the review-loop stop hook before Codex finalizes.",
             "type": "command",
             "command": "REVIEW_LOOP_HOST=codex node \"${PLUGIN_ROOT}/scripts/stop-review-gate-hook.mjs\"",
             "timeout": 900

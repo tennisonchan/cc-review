@@ -1,5 +1,5 @@
 {
-  "description": "Optional stop-time review gate for review-loop in Claude Code.",
+  "description": "Stop-time review gate for review-loop in Claude Code.",
   "hooks": {
     "Stop": [
       {

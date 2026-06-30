@@ -20,7 +20,7 @@ review-loop
 - Structured generic review results via `--output-format json --json-schema`.
 - Context packet, artifact, working-tree, and base-branch review target selection.
 - Optional background review jobs with status/result/cancel.
-- Optional automatic Stop-hook review gate for Codex or Claude Code finalization.
+- Automatic Stop-hook review gate for Codex or Claude Code finalization, enabled by default when the hook is installed.
 - Terminal reviewer mode prevents reviewer subprocesses from starting nested review loops.
 
 ## Generic Review Engine
@@ -127,7 +127,8 @@ This rename intentionally does not preserve old command or configuration names:
 - `cc-review*` binaries were removed; use `review-loop*`.
 - `CC_REVIEW_*` environment variables were removed; use `REVIEW_LOOP_*`.
 - `json cc-review` policy fences are no longer honored; use `json review-loop`.
-- State now lives under `review-loop`, so repositories that previously enabled the gate should rerun `review-loop-setup --enable-review-gate`.
+- State now lives under `review-loop`; repositories that need an explicit `block_on` override or disabled marker should rerun `review-loop-setup` with the appropriate gate flag.
+- Missing gate config now means enabled, so rerun `review-loop-setup --disable-review-gate` after upgrading if a repository should keep the installed Stop hook disabled.
 
 ## Review Guidelines
 
@@ -162,13 +163,15 @@ Guidelines tune review behavior but cannot override read-only safety: the review
 
 ## Automatic Gate
 
-The plugin ships host-specific `Stop` hook metadata. The hook is always registered with the plugin, but it approves immediately until a repository opts in.
+The plugin ships host-specific `Stop` hook metadata. When that hook is installed, the review gate is enabled by default and uses the normal guidelines/default blocking policy unless a repository writes an explicit override.
 
-Enable the blocking gate for the current repository:
+Write or refresh an explicit gate configuration for the current repository:
 
 ```bash
 review-loop-setup --enable-review-gate
 ```
+
+This is only needed to persist options such as `--block-on`; the missing-config default is enabled.
 
 The gate blocks finalization when the normalized result contains `blocking_findings`. Each blocked stop is re-reviewed, so fixes are verified before finalization. Loop prevention is bounded per task: three blocks for the same finding set and five blocks total; past those caps the gate allows finalization and reports the unresolved findings instead. A stop that changed nothing reuses the previous review decision instead of invoking the reviewer again.
 
@@ -179,6 +182,8 @@ Disable the gate with:
 ```bash
 review-loop-setup --disable-review-gate
 ```
+
+That command writes an explicit disabled marker. Users who manually disable or relocate the host hook can continue to do so outside review-loop setup.
 
 ## Development
 

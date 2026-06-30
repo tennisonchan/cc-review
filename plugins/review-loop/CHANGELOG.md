@@ -8,7 +8,7 @@
 - Renamed the product, package, plugin, CLI, skills, state directory, and environment namespace from `cc-review` to `review-loop`; old `cc-review*` command names and `CC_REVIEW_*` environment variables are intentionally not preserved.
 - Removed the separate counter-review command surface; use `review-loop run --counter` for counter-review stance. Gate, fallback, background jobs, and bundled skills use the normalized v2 result shape.
 - Renamed the machine policy fence to `json review-loop`; old `json cc-review` policy blocks are intentionally no longer honored.
-- Existing repositories that previously enabled the gate should rerun `review-loop-setup --enable-review-gate` because gate state now lives under the `review-loop` state directory.
+- The Stop-hook review gate is enabled by default when the host hook is installed. `review-loop-setup --disable-review-gate` now writes an explicit disabled marker; use `--enable-review-gate` to persist options such as `--block-on`. Re-run `--disable-review-gate` after upgrading if a repository should keep the installed Stop hook disabled.
 - Added separate reviewer-output and normalized-result schemas. Reviewer output is validated structurally first; review-loop then applies deterministic machine policy/fallback threshold normalization to return snake_case `blocking_findings`, `advisory_findings`, `required_next_actions`, and `reviewed_inputs`.
 - Removed old gate-config compatibility markers; existing repositories should rerun `review-loop-setup --enable-review-gate` if they want the current null-by-default `block_on` config shape.
 - Background job metadata for generic reviews redacts free-form focus text in persisted status/result records.

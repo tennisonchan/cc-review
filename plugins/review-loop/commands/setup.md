@@ -1,5 +1,5 @@
 ---
-description: Verify review-loop readiness, initialize guidelines, and configure the optional Claude Code review gate
+description: Verify review-loop readiness, initialize guidelines, and configure the default Claude Code review gate
 argument-hint: '[--json] [--init-guidelines] [--force] [--enable-review-gate] [--disable-review-gate] [--block-on info|low|medium|high]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
