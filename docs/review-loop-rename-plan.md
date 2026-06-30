@@ -119,7 +119,7 @@ Behavior:
    - Document `--counter` as the counter-review stance.
    - State that old `cc-review` command names are intentionally not preserved.
    - Update install examples to use the renamed GitHub repository URL `tennisonchan/review-loop`.
-   - Update templates and live `.claude/rules/review-guidelines.md` fence names.
+   - Update templates and live `.review-loop/review-guidelines.md` fence names.
    - Update the parser to recognize only `json review-loop`.
    - Add a changelog/migration note that old `json cc-review` policy blocks are intentionally no longer honored.
    - Add a test that an old `json cc-review` fence is not parsed as policy, so the no-compatibility behavior is explicit rather than accidental.

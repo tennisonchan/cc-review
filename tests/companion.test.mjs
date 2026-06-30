@@ -25,19 +25,18 @@ test("setup initializes project review guidelines without overwriting", () => {
   assert.equal(secondParsed.actions.find((item) => item.action === "init-guidelines").status, "skipped");
 });
 
-test("init-guidelines does not shadow existing legacy Claude guidelines", () => {
+test("init-guidelines creates neutral guidance when Claude guidance exists", () => {
   const repo = makeGitRepo();
   mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
-  const legacy = join(repo, ".claude", "rules", "review-guidelines.md");
-  writeFileSync(legacy, "legacy custom rules\n");
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), "Claude-specific rules\n");
+
   const result = run(["setup", "--init-guidelines", "--json"], { cwd: repo, env: testEnv(repo) });
   assert.equal(result.status, 0, result.stderr);
   const action = JSON.parse(result.stdout).actions.find((item) => item.action === "init-guidelines");
-  assert.equal(action.status, "skipped");
-  assert.ok(action.path.endsWith(".claude/rules/review-guidelines.md"));
-  assert.ok(action.target_path.endsWith(".review-loop/review-guidelines.md"));
-  assert.match(action.reason, /legacy guidance exists/);
-  assert.equal(existsSync(action.target_path), false);
+  assert.equal(action.status, "created");
+  assert.ok(action.path.endsWith(".review-loop/review-guidelines.md"));
+  assert.equal(existsSync(action.path), true);
+  assert.equal(readFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), "utf8"), "Claude-specific rules\n");
 });
 
 test("init-guidelines scaffolds a project profile from the tracked tree", () => {
@@ -270,10 +269,10 @@ test("run normalizes policy-promoted advisory findings into blocking findings", 
   assert.equal(parsed.result.read_only, true);
 });
 
-test("run still resolves legacy Claude project guidelines", () => {
+test("run ignores Claude project guidelines", () => {
   const repo = makeGitRepo();
   mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
-  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Legacy Rules
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Ignored Rules
 
 \`\`\`json review-loop
 { "block_on": "low" }
@@ -284,18 +283,17 @@ test("run still resolves legacy Claude project guidelines", () => {
   const result = run(["run", "--artifact", plan, "--json"], {
     cwd: repo,
     env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(advisoryOutput([
-      finding({ id: "legacy-low", severity: "low", locations: ["plan.md:1"] }),
+      finding({ id: "ignored-low", severity: "low", locations: ["plan.md:1"] }),
     ])) },
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.guidelines.source, "project-legacy");
-  assert.match(parsed.guidelines.display_path, /\.claude\/rules\/review-guidelines\.md$/);
-  assert.equal(parsed.result.decision, "changes_requested");
-  assert.equal(parsed.result.blocking_findings[0].blocking_reason, "severity_policy");
+  assert.equal(parsed.guidelines.source, "bundled");
+  assert.equal(parsed.result.decision, "approved");
+  assert.equal(parsed.result.blocking_findings.length, 0);
 });
 
-test("neutral project guidelines outrank nested legacy Claude guidelines", () => {
+test("neutral project guidelines apply when Claude guidelines are also present", () => {
   const repo = makeGitRepo();
   const nested = join(repo, "packages", "app");
   mkdirSync(join(repo, ".review-loop"), { recursive: true });
@@ -306,7 +304,7 @@ test("neutral project guidelines outrank nested legacy Claude guidelines", () =>
 { "block_on": "low" }
 \`\`\`
 `);
-  writeFileSync(join(nested, ".claude", "rules", "review-guidelines.md"), `# Legacy Nested Rules
+  writeFileSync(join(nested, ".claude", "rules", "review-guidelines.md"), `# Claude Nested Rules
 
 \`\`\`json review-loop
 { "block_on": "high" }

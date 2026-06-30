@@ -138,18 +138,14 @@ Initialize project guidelines:
 review-loop-setup --init-guidelines
 ```
 
-This creates `.review-loop/review-guidelines.md`. If a legacy `.claude/rules/review-guidelines.md` already exists, setup leaves it in place and continues to read it until you move or copy it to the neutral path. Rerunning setup with `--force` creates a fresh neutral template; it does not migrate legacy content.
+This creates `.review-loop/review-guidelines.md`. Review-loop does not read Claude-specific rule files; move any existing review guidance into the neutral path.
 
 Resolution order:
 
 1. `--guidelines <path>`
 2. nearest `.review-loop/review-guidelines.md`
-3. nearest legacy `.claude/rules/review-guidelines.md`
-4. `~/.review-loop/review-guidelines.md`
-5. legacy `~/.claude/rules/review-guidelines.md`
-6. bundled `templates/review-guidelines.md`
-
-Neutral project guidance takes precedence over legacy project guidance anywhere in the ancestor chain, so a root `.review-loop/review-guidelines.md` outranks a nested legacy `.claude/rules/review-guidelines.md`.
+3. `~/.review-loop/review-guidelines.md`
+4. bundled `templates/review-guidelines.md`
 
 Guidelines may include a machine-read blocking policy in a fenced block:
 
