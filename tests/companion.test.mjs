@@ -14,7 +14,7 @@ test("setup initializes project review guidelines without overwriting", () => {
   assert.equal(first.status, 0, first.stderr);
   const parsed = JSON.parse(first.stdout);
   const action = parsed.actions.find((item) => item.action === "init-guidelines");
-  assert.ok(action.path.endsWith(".claude/rules/review-guidelines.md"));
+  assert.ok(action.path.endsWith(".review-loop/review-guidelines.md"));
   assert.ok(existsSync(action.path));
 
   writeFileSync(action.path, "custom\n");
@@ -23,6 +23,21 @@ test("setup initializes project review guidelines without overwriting", () => {
   assert.equal(readFileSync(action.path, "utf8"), "custom\n");
   const secondParsed = JSON.parse(second.stdout);
   assert.equal(secondParsed.actions.find((item) => item.action === "init-guidelines").status, "skipped");
+});
+
+test("init-guidelines does not shadow existing legacy Claude guidelines", () => {
+  const repo = makeGitRepo();
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  const legacy = join(repo, ".claude", "rules", "review-guidelines.md");
+  writeFileSync(legacy, "legacy custom rules\n");
+  const result = run(["setup", "--init-guidelines", "--json"], { cwd: repo, env: testEnv(repo) });
+  assert.equal(result.status, 0, result.stderr);
+  const action = JSON.parse(result.stdout).actions.find((item) => item.action === "init-guidelines");
+  assert.equal(action.status, "skipped");
+  assert.ok(action.path.endsWith(".claude/rules/review-guidelines.md"));
+  assert.ok(action.target_path.endsWith(".review-loop/review-guidelines.md"));
+  assert.match(action.reason, /legacy guidance exists/);
+  assert.equal(existsSync(action.target_path), false);
 });
 
 test("init-guidelines scaffolds a project profile from the tracked tree", () => {
@@ -218,8 +233,8 @@ test("reviewer selection honors host defaults, explicit override, and validation
 
 test("run normalizes policy-promoted advisory findings into blocking findings", () => {
   const repo = makeGitRepo();
-  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
-  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+  mkdirSync(join(repo, ".review-loop"), { recursive: true });
+  writeFileSync(join(repo, ".review-loop", "review-guidelines.md"), `# Rules
 
 \`\`\`json review-loop
 { "block_on": "high", "category_block_on": { "security": "medium" } }
@@ -253,6 +268,62 @@ test("run normalizes policy-promoted advisory findings into blocking findings", 
   assert.equal(parsed.result.blocking_findings[0].blocking_reason, "category_policy");
   assert.equal(parsed.result.advisory_findings.length, 0);
   assert.equal(parsed.result.read_only, true);
+});
+
+test("run still resolves legacy Claude project guidelines", () => {
+  const repo = makeGitRepo();
+  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Legacy Rules
+
+\`\`\`json review-loop
+{ "block_on": "low" }
+\`\`\`
+`);
+  const plan = join(repo, "plan.md");
+  writeFileSync(plan, "Plan\n");
+  const result = run(["run", "--artifact", plan, "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(advisoryOutput([
+      finding({ id: "legacy-low", severity: "low", locations: ["plan.md:1"] }),
+    ])) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.guidelines.source, "project-legacy");
+  assert.match(parsed.guidelines.display_path, /\.claude\/rules\/review-guidelines\.md$/);
+  assert.equal(parsed.result.decision, "changes_requested");
+  assert.equal(parsed.result.blocking_findings[0].blocking_reason, "severity_policy");
+});
+
+test("neutral project guidelines outrank nested legacy Claude guidelines", () => {
+  const repo = makeGitRepo();
+  const nested = join(repo, "packages", "app");
+  mkdirSync(join(repo, ".review-loop"), { recursive: true });
+  mkdirSync(join(nested, ".claude", "rules"), { recursive: true });
+  writeFileSync(join(repo, ".review-loop", "review-guidelines.md"), `# Neutral Rules
+
+\`\`\`json review-loop
+{ "block_on": "low" }
+\`\`\`
+`);
+  writeFileSync(join(nested, ".claude", "rules", "review-guidelines.md"), `# Legacy Nested Rules
+
+\`\`\`json review-loop
+{ "block_on": "high" }
+\`\`\`
+`);
+  writeFileSync(join(nested, "plan.md"), "Plan\n");
+  const result = run(["run", "--artifact", "plan.md", "--json"], {
+    cwd: nested,
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(advisoryOutput([
+      finding({ id: "neutral-low", severity: "low", locations: ["plan.md:1"] }),
+    ])) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.guidelines.source, "project");
+  assert.equal(parsed.guidelines.display_path, ".review-loop/review-guidelines.md");
+  assert.equal(parsed.result.decision, "changes_requested");
 });
 
 test("run defaults context-only reviews to scope none and uses reviewer-output schema", () => {
@@ -322,8 +393,8 @@ test("run uses fallback threshold for high advisory findings", () => {
 
 test("run labels explicit base policy promotions as severity_policy", () => {
   const repo = makeGitRepo();
-  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
-  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+  mkdirSync(join(repo, ".review-loop"), { recursive: true });
+  writeFileSync(join(repo, ".review-loop", "review-guidelines.md"), `# Rules
 
 \`\`\`json review-loop
 { "block_on": "high" }
@@ -1335,8 +1406,8 @@ test("guidelines policy drives category-aware blocking", () => {
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
-  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+  mkdirSync(join(repo, ".review-loop"), { recursive: true });
+  writeFileSync(join(repo, ".review-loop", "review-guidelines.md"), `# Rules
 
 \`\`\`json review-loop
 { "block_on": "high", "category_block_on": { "security": "low", "style": "never" } }
@@ -1386,8 +1457,8 @@ test("old cc-review policy fence is not honored after rename", () => {
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
-  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+  mkdirSync(join(repo, ".review-loop"), { recursive: true });
+  writeFileSync(join(repo, ".review-loop", "review-guidelines.md"), `# Rules
 
 \`\`\`json cc-review
 { "block_on": "high", "category_block_on": { "security": "low" } }
@@ -1412,8 +1483,8 @@ test("explicit setup block_on overrides the guidelines policy", () => {
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
-  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+  mkdirSync(join(repo, ".review-loop"), { recursive: true });
+  writeFileSync(join(repo, ".review-loop", "review-guidelines.md"), `# Rules
 
 \`\`\`json review-loop
 { "block_on": "high" }
@@ -1438,8 +1509,8 @@ test("category overrides apply on top of an explicit block_on base", () => {
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
-  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+  mkdirSync(join(repo, ".review-loop"), { recursive: true });
+  writeFileSync(join(repo, ".review-loop", "review-guidelines.md"), `# Rules
 
 \`\`\`json review-loop
 { "block_on": "low", "category_block_on": { "security": "medium" } }
@@ -1471,8 +1542,8 @@ test("guidelines policy fence parses with CRLF line endings", () => {
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
-  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"),
+  mkdirSync(join(repo, ".review-loop"), { recursive: true });
+  writeFileSync(join(repo, ".review-loop", "review-guidelines.md"),
     '# Rules\r\n\r\n```json review-loop\r\n{ "block_on": "medium" }\r\n```\r\n');
   const env = {
     ...testEnv(repo),
@@ -1493,8 +1564,8 @@ test("malformed guidelines policy fails closed at the gate", () => {
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed again\n");
-  mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
-  writeFileSync(join(repo, ".claude", "rules", "review-guidelines.md"), `# Rules
+  mkdirSync(join(repo, ".review-loop"), { recursive: true });
+  writeFileSync(join(repo, ".review-loop", "review-guidelines.md"), `# Rules
 
 \`\`\`json review-loop
 { "block_on": "catastrophic" }
@@ -1989,7 +2060,7 @@ function runGit(args, cwd) {
 function testEnv(repo) {
   const bin = join(repo, "bin");
   mkdirSync(bin, { recursive: true });
-  // Isolate HOME so a developer's real ~/.claude/rules/review-guidelines.md
+  // Isolate HOME so a developer's real review-loop/Claude guidelines
   // cannot leak into guideline resolution during tests.
   mkdirSync(join(repo, ".home"), { recursive: true });
   const fakeClaude = join(bin, "claude");

@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REVIEWER_OUTPUT_SCHEMA_PATH = join(ROOT, "schemas", "reviewer-output.schema.json");
 const TEMPLATE_GUIDELINES = join(ROOT, "templates", "review-guidelines.md");
+const PROJECT_GUIDELINES = [".review-loop", "review-guidelines.md"];
+const LEGACY_PROJECT_GUIDELINES = [".claude", "rules", "review-guidelines.md"];
 const SEVERITIES = ["info", "low", "medium", "high"];
 const GENERIC_DECISIONS = ["approved", "changes_requested", "invalid_input", "blocked"];
 const REVIEWER_DISPOSITIONS = ["blocking", "advisory"];
@@ -325,10 +327,14 @@ async function setup(args) {
 }
 
 function initGuidelines(repoRoot, force) {
-  const dest = join(repoRoot, ".claude", "rules", "review-guidelines.md");
+  const dest = join(repoRoot, ...PROJECT_GUIDELINES);
+  const legacy = join(repoRoot, ...LEGACY_PROJECT_GUIDELINES);
   const existed = existsSync(dest);
   if (existed && !force) {
     return { action: "init-guidelines", status: "skipped", path: dest, reason: "already exists" };
+  }
+  if (existsSync(legacy) && !force) {
+    return { action: "init-guidelines", status: "skipped", path: legacy, target_path: dest, reason: "legacy guidance exists; move or copy it to .review-loop/review-guidelines.md, or rerun with --force to create a fresh neutral template" };
   }
   mkdirSync(dirname(dest), { recursive: true });
   const profile = detectProjectProfile(repoRoot);
@@ -1119,14 +1125,18 @@ function resolveGuidelines(explicit, cwd, repoRoot) {
     candidates.push({ path: isAbsolute(explicit) ? explicit : resolve(cwd, explicit), source: "explicit" });
   }
 
+  const legacyCandidates = [];
   let cursor = cwd;
   while (isWithinPath(cursor, repoRoot)) {
-    candidates.push({ path: join(cursor, ".claude", "rules", "review-guidelines.md"), source: "project" });
+    candidates.push({ path: join(cursor, ...PROJECT_GUIDELINES), source: "project" });
+    legacyCandidates.push({ path: join(cursor, ...LEGACY_PROJECT_GUIDELINES), source: "project-legacy" });
     if (cursor === repoRoot) break;
     cursor = dirname(cursor);
   }
+  candidates.push(...legacyCandidates);
 
-  candidates.push({ path: join(homedir(), ".claude", "rules", "review-guidelines.md"), source: "user" });
+  candidates.push({ path: join(homedir(), ...PROJECT_GUIDELINES), source: "user" });
+  candidates.push({ path: join(homedir(), ...LEGACY_PROJECT_GUIDELINES), source: "user-legacy" });
   candidates.push({ path: TEMPLATE_GUIDELINES, source: "bundled" });
 
   for (const candidate of candidates) {
