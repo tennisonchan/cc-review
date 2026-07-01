@@ -20,7 +20,7 @@ Run:
 REVIEW_LOOP_HOST=codex node "<skill-root>/../../scripts/review-loop-companion.mjs" run --scope auto $ARGUMENTS
 ```
 
-2. If the review may outlast the current turn, add `--background`, use `review-loop-status` until the job completes, then use `review-loop-result` to retrieve the result. Otherwise, wait for the command output.
+2. If the review may outlast the current turn, add `--background`, use the sibling `review-loop-status` skill until the job completes, then use the sibling `review-loop-result` skill to retrieve the result. Otherwise, wait for the command output.
 
    Completion criterion: you have the final review output, not just a job id.
 
