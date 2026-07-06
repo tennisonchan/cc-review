@@ -1424,7 +1424,7 @@ async function gateCommand(args) {
     // stop under the same coarse key is a new task and stays gated.
     delete state.tasks[taskKey];
     writeGateState(repo.root, state);
-    outputHookAllow(`${cap} Report-only unresolved findings:\n${reason}`);
+    outputHookAllow(`Cap-forced finalization: ${cap} The automatic gate is allowing this stop as report-only after exhausting its bounded retry budget.\nUnresolved blocking findings:\n${reason}`);
     return;
   }
   state.tasks[taskKey] = taskState;

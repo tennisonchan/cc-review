@@ -991,6 +991,7 @@ test("gate total block ceiling bounds churning finding sets", () => {
   const capped = run(["gate", "--json"], { cwd: repo, env: findingEnv("finding-5"), input: '{"turn_id":"churn"}' });
   const cappedParsed = JSON.parse(capped.stdout);
   assert.equal(cappedParsed.decision, undefined);
+  assert.match(cappedParsed.systemMessage, /Cap-forced finalization/);
   assert.match(cappedParsed.systemMessage, /total block ceiling/);
 
   // A cap allow ends the stop chain and consumes the counters, so a later
@@ -1384,6 +1385,7 @@ test("gate uses persisted block_on and resets after clean review", () => {
   }
   const capped = run(["gate", "--json"], { cwd: repo, env: mediumEnv, input: '{"turn_id":"t1"}' });
   const cappedParsed = JSON.parse(capped.stdout);
+  assert.match(cappedParsed.systemMessage, /Cap-forced finalization/);
   assert.match(cappedParsed.systemMessage, /three-block convergence cap/);
   assert.match(cappedParsed.systemMessage, /file\.txt:1: Medium issue/);
   assert.doesNotMatch(cappedParsed.systemMessage, /decision/);
