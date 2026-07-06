@@ -991,13 +991,66 @@ test("gate total block ceiling bounds churning finding sets", () => {
   const capped = run(["gate", "--json"], { cwd: repo, env: findingEnv("finding-5"), input: '{"turn_id":"churn"}' });
   const cappedParsed = JSON.parse(capped.stdout);
   assert.equal(cappedParsed.decision, undefined);
+  assert.match(cappedParsed.systemMessage, /Cap-forced finalization/);
   assert.match(cappedParsed.systemMessage, /total block ceiling/);
+  const events = gateCapEvents(baseEnv);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].event, "gate_cap_hit");
+  assert.equal(events[0].cap_type, "total_block_ceiling");
+  assert.equal(events[0].task_key, "churn");
+  assert.equal(events[0].block_count, 1);
+  assert.equal(events[0].total_blocks, 6);
+  assert.equal(events[0].finding_fingerprint, "finding-5");
+  assert.deepEqual(events[0].findings, [
+    {
+      id: "finding-5",
+      severity: "high",
+      category: "correctness",
+      location: "file.txt:1",
+      message: "Issue finding-5.",
+    },
+  ]);
+  assert.equal(gateTaskState(baseEnv, "churn"), undefined);
 
   // A cap allow ends the stop chain and consumes the counters, so a later
   // unrelated task reusing the same coarse key is still gated.
   writeFileSync(join(repo, "file.txt"), "unrelated task\n");
   const nextTask = run(["gate", "--json"], { cwd: repo, env: findingEnv("unrelated"), input: '{"turn_id":"churn"}' });
   assert.equal(JSON.parse(nextTask.stdout).decision, "block");
+});
+
+test("gate blocks and retains state when cap-hit event recording fails", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const blockingEnv = {
+    ...baseEnv,
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+      finding({ id: "write-fail", locations: ["file.txt:1"], message: "Persist this before allowing.", required_action: "Fix." }),
+    ])),
+  };
+  for (let i = 0; i < 3; i += 1) {
+    const result = run(["gate", "--json"], { cwd: repo, env: blockingEnv, input: '{"turn_id":"write-fail"}' });
+    assert.equal(JSON.parse(result.stdout).decision, "block");
+  }
+
+  mkdirSync(join(baseEnv.XDG_STATE_HOME, "review-loop"), { recursive: true });
+  writeFileSync(join(baseEnv.XDG_STATE_HOME, "review-loop", "gate-events"), "not a directory\n");
+
+  const capped = run(["gate", "--json"], { cwd: repo, env: blockingEnv, input: '{"turn_id":"write-fail"}' });
+  const cappedParsed = JSON.parse(capped.stdout);
+  assert.equal(cappedParsed.decision, "block");
+  assert.match(cappedParsed.reason, /could not record cap-hit event before cap-forced finalization/);
+  const retained = gateTaskState(baseEnv, "write-fail");
+  assert.equal(retained.block_count, 4);
+  assert.equal(retained.total_blocks, 4);
+  assert.equal(retained.fingerprint, "write-fail");
 });
 
 test("gate default-key counters reset after the chain gap window", async () => {
@@ -1384,9 +1437,28 @@ test("gate uses persisted block_on and resets after clean review", () => {
   }
   const capped = run(["gate", "--json"], { cwd: repo, env: mediumEnv, input: '{"turn_id":"t1"}' });
   const cappedParsed = JSON.parse(capped.stdout);
+  assert.match(cappedParsed.systemMessage, /Cap-forced finalization/);
   assert.match(cappedParsed.systemMessage, /three-block convergence cap/);
   assert.match(cappedParsed.systemMessage, /file\.txt:1: Medium issue/);
   assert.doesNotMatch(cappedParsed.systemMessage, /decision/);
+  const events = gateCapEvents(baseEnv);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].event, "gate_cap_hit");
+  assert.equal(events[0].cap_type, "same_finding_set");
+  assert.equal(events[0].task_key, "t1");
+  assert.equal(events[0].block_count, 4);
+  assert.equal(events[0].total_blocks, 4);
+  assert.equal(events[0].finding_fingerprint, "m1");
+  assert.deepEqual(events[0].findings, [
+    {
+      id: "m1",
+      severity: "medium",
+      category: "correctness",
+      location: "file.txt:1",
+      message: "Medium issue.",
+    },
+  ]);
+  assert.equal(gateTaskState(baseEnv, "t1"), undefined);
 
   writeFileSync(join(repo, "file.txt"), "fixed for clean review\n");
   const cleanEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()) };
@@ -2072,6 +2144,24 @@ function testEnv(repo) {
     REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
     XDG_STATE_HOME: mkdtempSync(join(tmpdir(), "review-loop-state-")),
   };
+}
+
+function gateCapEvents(env) {
+  const dir = join(env.XDG_STATE_HOME, "review-loop", "gate-events");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((file) => file.endsWith(".jsonl"))
+    .flatMap((file) => readFileSync(join(dir, file), "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)));
+}
+
+function gateTaskState(env, taskKey) {
+  const dir = join(env.XDG_STATE_HOME, "review-loop", "gate-state");
+  if (!existsSync(dir)) return undefined;
+  for (const file of readdirSync(dir).filter((name) => name.endsWith(".json"))) {
+    const state = JSON.parse(readFileSync(join(dir, file), "utf8"));
+    if (state.tasks && Object.hasOwn(state.tasks, taskKey)) return state.tasks[taskKey];
+  }
+  return undefined;
 }
 
 function approvedOutput(summary = "ok") {

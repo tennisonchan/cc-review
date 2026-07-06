@@ -1414,17 +1414,51 @@ async function gateCommand(args) {
   taskState.last_findings = blocking.map((finding) => finding.id);
 
   const reason = blocking.map((finding) => `[${finding.severity}] ${finding.locations[0] || ""}: ${finding.message}`).join("\n");
-  const cap = taskState.block_count > GATE_FINGERPRINT_BLOCK_LIMIT
-    ? "review-loop reached the three-block convergence cap."
+  const capType = taskState.block_count > GATE_FINGERPRINT_BLOCK_LIMIT
+    ? "same_finding_set"
     : taskState.total_blocks > GATE_TOTAL_BLOCK_LIMIT
+      ? "total_block_ceiling"
+      : null;
+  const cap = capType === "same_finding_set"
+    ? "review-loop reached the three-block convergence cap."
+    : capType === "total_block_ceiling"
       ? "review-loop reached the total block ceiling for this task."
       : null;
   if (cap) {
+    try {
+      writeGateCapHit(repo.root, {
+        schema_version: "review-loop.gate_cap_hit.v1",
+        event: "gate_cap_hit",
+        ts: new Date().toISOString(),
+        cap_type: capType,
+        task_key: String(taskKey),
+        block_count: Number(taskState.block_count || 0),
+        total_blocks: Number(taskState.total_blocks || 0),
+        finding_fingerprint: fingerprint,
+        finding_ids: blocking.map((finding) => finding.id),
+        findings: blocking.map((finding) => ({
+          id: finding.id,
+          severity: finding.severity,
+          category: finding.category,
+          location: finding.locations[0] || "",
+          message: redact(finding.message),
+        })),
+        reviewer_mechanism: reviewResult.result.reviewer_mechanism,
+        fallback_used: Boolean(fallbackDisclosure || reviewResult.fallback),
+        reviewed_inputs: reviewResult.result.reviewed_inputs,
+      });
+    } catch (error) {
+      const message = redact(error instanceof Error ? error.message : String(error));
+      state.tasks[taskKey] = taskState;
+      writeGateState(repo.root, state);
+      outputHookBlock(`review-loop could not record cap-hit event before cap-forced finalization: ${message}`);
+      return;
+    }
     // A cap allow ends the stop chain, so consume the counters; the next
     // stop under the same coarse key is a new task and stays gated.
     delete state.tasks[taskKey];
     writeGateState(repo.root, state);
-    outputHookAllow(`${cap} Report-only unresolved findings:\n${reason}`);
+    outputHookAllow(`Cap-forced finalization: ${cap} The automatic gate is allowing this stop as report-only after exhausting its bounded retry budget.\nUnresolved blocking findings:\n${reason}`);
     return;
   }
   state.tasks[taskKey] = taskState;
@@ -1761,6 +1795,12 @@ function writeGateState(repoRoot, state) {
   writeJson(gateStatePath(repoRoot), state);
 }
 
+function writeGateCapHit(repoRoot, event) {
+  const path = gateEventLogPath(repoRoot);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(event)}\n`, { flag: "a" });
+}
+
 function gateTaskKey(hookPayload) {
   return hookPayload?.turn_id || hookPayload?.session_id || hookPayload?.thread_id || "default";
 }
@@ -1889,6 +1929,10 @@ function gateConfigPath(repoRoot) {
 
 function gateDebugLogPath(repoRoot) {
   return join(stateRoot(), "debug", `${repoHash(repoRoot)}.jsonl`);
+}
+
+function gateEventLogPath(repoRoot) {
+  return join(stateRoot(), "gate-events", `${repoHash(repoRoot)}.jsonl`);
 }
 
 function gateStatePath(repoRoot) {
