@@ -855,6 +855,75 @@ test("gate cache misses on changes invisible to the rendered prompt", () => {
   assert.deepEqual(JSON.parse(fixed.stdout), {});
 });
 
+test("gate block output identifies the reviewed target", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const env = {
+    ...testEnv(repo),
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+      finding({ id: "target", locations: ["file.txt:1"], message: "Targeted issue.", required_action: "Fix." }),
+    ])),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"target"}' });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.decision, "block");
+  assert.match(parsed.reason, /Reviewed target:/);
+  assert.match(parsed.reason, /scope=working-tree/);
+  assert.match(parsed.reason, /hash=[a-f0-9]{64}/);
+  assert.match(parsed.reason, new RegExp(escapeRegExp(repo)));
+});
+
+test("gate state separates same-session counters by stable target class", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "initial\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  runGit(["branch", "base"], repo);
+  writeFileSync(join(repo, "branch.txt"), "branch diff\n");
+  runGit(["add", "branch.txt"], repo);
+  runGit(["commit", "-m", "branch change"], repo);
+  writeFileSync(join(repo, "file.txt"), "working tree diff\n");
+
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
+  assert.equal(setup.status, 0, setup.stderr);
+  const branchEnv = {
+    ...baseEnv,
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+      finding({ id: "branch-target", locations: ["branch.txt:1"], message: "Branch issue.", required_action: "Fix branch." }),
+    ])),
+  };
+  const worktreeEnv = {
+    ...baseEnv,
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+      finding({ id: "worktree-target", locations: ["file.txt:1"], message: "Worktree issue.", required_action: "Fix worktree." }),
+    ])),
+  };
+
+  const branch = run(["gate", "--json", "--scope", "branch", "--base", "base"], { cwd: repo, env: branchEnv, input: '{"session_id":"same-session"}' });
+  assert.equal(branch.status, 0, branch.stderr);
+  assert.equal(JSON.parse(branch.stdout).decision, "block");
+  const worktree = run(["gate", "--json"], { cwd: repo, env: worktreeEnv, input: '{"session_id":"same-session"}' });
+  assert.equal(worktree.status, 0, worktree.stderr);
+  assert.equal(JSON.parse(worktree.stdout).decision, "block");
+
+  const stateDir = join(baseEnv.XDG_STATE_HOME, "review-loop", "gate-state");
+  const [stateFile] = readdirSync(stateDir);
+  const state = JSON.parse(readFileSync(join(stateDir, stateFile), "utf8"));
+  const taskKeys = Object.keys(state.tasks);
+  assert.equal(taskKeys.length, 2);
+  assert.ok(taskKeys.some((key) => key.includes("scope=branch") && key.includes("base=base")));
+  assert.ok(taskKeys.some((key) => key.includes("scope=working-tree") && key.includes("base=")));
+});
+
 test("gate allows immediately on recursion sentinels", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
@@ -938,7 +1007,9 @@ test("gate state does not persist dead infra failure counters", () => {
   const [stateFile] = readdirSync(stateDir);
   assert.ok(stateFile, "expected gate state file");
   const state = JSON.parse(readFileSync(join(stateDir, stateFile), "utf8"));
-  assert.equal("infra_failures" in state.tasks["no-infra"], false);
+  const [taskKey] = Object.keys(state.tasks).filter((key) => key.startsWith("no-infra|"));
+  assert.ok(taskKey, "expected scoped no-infra task key");
+  assert.equal("infra_failures" in state.tasks[taskKey], false);
 });
 
 test("gate blocks review target preparation failures instead of using fallback", () => {
@@ -955,13 +1026,17 @@ test("gate blocks review target preparation failures instead of using fallback",
   const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
   assert.equal(setup.status, 0, setup.stderr);
 
-  const result = run(["gate", "--json", "--scope", "branch", "--base", "missing-ref"], { cwd: repo, env, input: "{}" });
+  const result = run(["gate", "--json", "--scope", "branch", "--base", "missing-ref"], { cwd: repo, env, input: '{"turn_id":"prep-fail"}' });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.decision, "block");
   assert.match(parsed.reason, /could not prepare review/);
   assert.match(parsed.reason, /base ref is not a valid commit/);
   assert.doesNotMatch(parsed.reason, /fallback should not run/);
+  const stateDir = join(env.XDG_STATE_HOME, "review-loop", "gate-state");
+  const [stateFile] = readdirSync(stateDir);
+  const state = JSON.parse(readFileSync(join(stateDir, stateFile), "utf8"));
+  assert.deepEqual(Object.keys(state.tasks), ["prep-fail|scope=branch|base=missing-ref"]);
 });
 
 test("gate total block ceiling bounds churning finding sets", () => {
@@ -2098,6 +2173,10 @@ function finding(overrides = {}) {
     required_action: "Fix it.",
     ...overrides,
   };
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 async function waitFor(predicate) {
