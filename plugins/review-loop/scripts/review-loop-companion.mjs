@@ -1338,19 +1338,17 @@ async function gateCommand(args) {
   // guidelines always apply.
   const configuredBlockOn = config?.block_on || args.blockOn || null;
   if (configuredBlockOn) assertSeverity(configuredBlockOn, "gate block_on");
-  const taskKey = gateTaskKey(hookPayload);
-  const state = readGateState(repo.root);
-  const taskState = freshTaskState(state.tasks[taskKey]);
-
   let reviewResult;
   let fallbackDisclosure = "";
   const gateArgs = { ...args, json: true, positional: [], scope: args.scope || "auto", blockOn: configuredBlockOn || undefined };
+  const fallbackTaskKey = gateTaskKey(hookPayload, gatePlannedScopeInput(gateArgs, repo.root));
+  const state = readGateState(repo.root);
   try {
     reviewResult = await runGenericReview({ args: { ...gateArgs, onReviewerFailure: "throw" }, cwd: process.cwd(), cache: true, gate: true });
   } catch (error) {
     const message = redact(error instanceof Error ? error.message : String(error));
     if (!(error instanceof ReviewToolFailure)) {
-      state.tasks[taskKey] = taskState;
+      state.tasks[fallbackTaskKey] = freshTaskState(state.tasks[fallbackTaskKey]);
       writeGateState(repo.root, state);
       outputHookBlock(`review-loop could not prepare review: ${message}`);
       return;
@@ -1358,7 +1356,7 @@ async function gateCommand(args) {
     const selectedReviewer = resolveReviewer(gateArgs);
     const fallbackReviewer = resolveFallbackReviewer(selectedReviewer);
     if (!fallbackReviewer) {
-      state.tasks[taskKey] = taskState;
+      state.tasks[fallbackTaskKey] = freshTaskState(state.tasks[fallbackTaskKey]);
       writeGateState(repo.root, state);
       outputHookBlock(`review-loop reviewer mechanism failed: ${message}`);
       return;
@@ -1373,7 +1371,7 @@ async function gateCommand(args) {
       ].join("\n");
     } catch (fallbackError) {
       const fallbackMessage = redact(fallbackError instanceof Error ? fallbackError.message : String(fallbackError));
-      delete state.tasks[taskKey];
+      delete state.tasks[fallbackTaskKey];
       writeGateState(repo.root, state);
       outputHookAllow([
         `${reviewerDisplayName(selectedReviewer)} reviewer was unavailable and the degraded ${reviewerDisplayName(fallbackReviewer)} fallback review also failed.`,
@@ -1390,11 +1388,16 @@ async function gateCommand(args) {
     blocking = reviewResult.result.blocking_findings;
   } catch (error) {
     const message = redact(error instanceof Error ? error.message : String(error));
-    state.tasks[taskKey] = taskState;
+    state.tasks[fallbackTaskKey] = freshTaskState(state.tasks[fallbackTaskKey]);
     writeGateState(repo.root, state);
     outputHookBlock(`review-loop configuration failure: ${message}`);
     return;
   }
+
+  const taskKey = gateTaskKey(hookPayload, reviewResult.result);
+  const taskState = freshTaskState(state.tasks[taskKey]);
+  const targetSummary = gateTargetSummary(reviewResult.result);
+  if (fallbackTaskKey !== taskKey) delete state.tasks[fallbackTaskKey];
 
   if (!blocking.length) {
     delete state.tasks[taskKey];
@@ -1413,7 +1416,8 @@ async function gateCommand(args) {
   taskState.updated_at = taskState.last_blocked_at;
   taskState.last_findings = blocking.map((finding) => finding.id);
 
-  const reason = blocking.map((finding) => `[${finding.severity}] ${finding.locations[0] || ""}: ${finding.message}`).join("\n");
+  const findingLines = blocking.map((finding) => `[${finding.severity}] ${finding.locations[0] || ""}: ${finding.message}`);
+  const reason = [targetSummary ? `Reviewed target: ${targetSummary}` : "", ...findingLines].filter(Boolean).join("\n");
   const cap = taskState.block_count > GATE_FINGERPRINT_BLOCK_LIMIT
     ? "review-loop reached the three-block convergence cap."
     : taskState.total_blocks > GATE_TOTAL_BLOCK_LIMIT
@@ -1761,8 +1765,42 @@ function writeGateState(repoRoot, state) {
   writeJson(gateStatePath(repoRoot), state);
 }
 
-function gateTaskKey(hookPayload) {
-  return hookPayload?.turn_id || hookPayload?.session_id || hookPayload?.thread_id || "default";
+function gateTaskKey(hookPayload, result = null) {
+  const hookKey = hookPayload?.turn_id || hookPayload?.session_id || hookPayload?.thread_id || "default";
+  const targetKey = gateTargetStateKey(result);
+  return targetKey ? `${hookKey}|${targetKey}` : hookKey;
+}
+
+function gateTargetStateKey(result) {
+  const scopeInput = result?.scope !== undefined ? result : gateScopeInput(result);
+  if (!scopeInput) return "";
+  return `scope=${scopeInput.scope || ""}|base=${scopeInput.base || ""}`;
+}
+
+function gateTargetSummary(result) {
+  const scopeInput = gateScopeInput(result);
+  if (!scopeInput) return "";
+  return [
+    scopeInput.display_path || "",
+    `scope=${scopeInput.scope || ""}`,
+    `base=${scopeInput.base || ""}`,
+    `hash=${scopeInput.hash || ""}`,
+  ].filter(Boolean).join(" ");
+}
+
+function gateScopeInput(result) {
+  const inputs = result?.reviewed_inputs;
+  if (!Array.isArray(inputs)) return null;
+  return inputs.find((input) => input?.kind === "scope") || null;
+}
+
+function gatePlannedScopeInput(args, repoRoot) {
+  const requestedScope = args.scopeExplicit ? args.scope : (args.context || args.artifact ? "none" : args.scope || "auto");
+  const scope = requestedScope === "auto" ? (args.base ? "branch" : "working-tree") : requestedScope;
+  return {
+    scope,
+    base: scope === "branch" ? args.base || defaultBranch(repoRoot) : null,
+  };
 }
 
 function signalProcessTree(pid, signal) {
