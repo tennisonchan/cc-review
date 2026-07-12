@@ -20,6 +20,7 @@ const DEFAULT_BLOCK_ON = "high";
 const GATE_FINGERPRINT_BLOCK_LIMIT = 3;
 const GATE_TOTAL_BLOCK_LIMIT = 5;
 const GATE_CHAIN_GAP_MS = 10 * 60 * 1000;
+const REVIEW_CACHE_INTEGRITY_VERSION = 1;
 const DEFAULT_MAX_DIFF_CHARS = 200 * 1000;
 const DEFAULT_CLAUDE_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_FALLBACK_TIMEOUT_MS = 10 * 60 * 1000;
@@ -131,7 +132,7 @@ Run "<subcommand> --help" for subcommand options.`);
 }
 
 const SUBCOMMAND_HELP = {
-  setup: "setup [--init-guidelines] [--force] [--enable-review-gate] [--disable-review-gate] [--block-on info|low|medium|high] [--enable-gate-debug] [--disable-gate-debug] [--json]",
+  setup: "setup [--init-guidelines] [--force] [--enable-review-gate] [--disable-review-gate] [--block-on info|low|medium|high] [--on-reviewer-failure block|allow] [--enable-gate-debug] [--disable-gate-debug] [--json]",
   run: "run [--background] [--counter] [--context <path>] [--artifact <path>] [--focus <text>] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--reviewer claude|codex] [--on-reviewer-failure block|allow] [--json]",
   status: "status [job-id] [--all] [--json]",
   result: "result [job-id] [--json]",
@@ -289,6 +290,7 @@ async function setup(args) {
         enabled: true,
         event: support.event,
         block_on: args.blockOn || null,
+        on_reviewer_failure: args.onReviewerFailure,
         installed_at: new Date().toISOString(),
         companion: fileURLToPath(import.meta.url),
       };
@@ -298,6 +300,7 @@ async function setup(args) {
         status: "enabled",
         event: support.event,
         block_on: args.blockOn || "guidelines-or-default",
+        on_reviewer_failure: args.onReviewerFailure,
         path: config,
         artifact_root: jobsDir(repo.root),
       });
@@ -472,16 +475,37 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     if (args.onReviewerFailure === "throw") {
       throw new ReviewToolFailure(message);
     }
+    const fallbackReviewer = resolveFallbackReviewer(reviewer);
+    let fallbackMessage = null;
+    if (fallbackReviewer) {
+      try {
+        return await runFallbackReview({ args, cwd, primaryReviewer: reviewer, fallbackReviewer, primaryFailure: message });
+      } catch (fallbackError) {
+        fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+      }
+    }
     if (args.onReviewerFailure === "allow") {
       reviewerOutput = {
         decision: "approved",
-        summary: `Reviewer mechanism failed and --on-reviewer-failure=allow was set: ${redact(message)}`,
+        summary: [
+          `Reviewer mechanism failed and --on-reviewer-failure=allow was set: ${redact(message)}`,
+          fallbackMessage && fallbackReviewer
+            ? `${reviewerDisplayName(fallbackReviewer)} fallback review also failed: ${redact(fallbackMessage)}`
+            : null,
+        ].filter(Boolean).join(". "),
         findings: [],
         required_next_actions: [],
       };
-      reviewerResult = { resultText: "", meta: { failed: true, reviewer_mechanism: "failed", on_reviewer_failure: "allow" } };
+      reviewerResult = {
+        resultText: "",
+        meta: {
+          failed: true,
+          reviewer_mechanism: "failed",
+          on_reviewer_failure: "allow",
+          ...(fallbackMessage ? { fallback_failed: true } : {}),
+        },
+      };
     } else {
-      const fallbackReviewer = resolveFallbackReviewer(reviewer);
       if (!fallbackReviewer) {
         return {
           ok: false,
@@ -492,23 +516,18 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
           reviewer_mechanism: { failed: true, on_reviewer_failure: "block" },
         };
       }
-      try {
-        return await runFallbackReview({ args, cwd, primaryReviewer: reviewer, fallbackReviewer, primaryFailure: message });
-      } catch (fallbackError) {
-        const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
-        return {
-          ok: false,
-          repo: repo.root,
-          guidelines: summarizeGuidelines(guidelines),
-          result: validateNormalizedResult(syntheticNormalizedFailure(
-            "blocked",
-            `Reviewer mechanism failed: ${redact(message)}. ${reviewerDisplayName(fallbackReviewer)} fallback review also failed: ${redact(fallbackMessage)}`,
-            inputs.reviewed_inputs,
-          )),
-          raw: "",
-          reviewer_mechanism: { failed: true, on_reviewer_failure: "block", fallback_failed: true },
-        };
-      }
+      return {
+        ok: false,
+        repo: repo.root,
+        guidelines: summarizeGuidelines(guidelines),
+        result: validateNormalizedResult(syntheticNormalizedFailure(
+          "blocked",
+          `Reviewer mechanism failed: ${redact(message)}. ${reviewerDisplayName(fallbackReviewer)} fallback review also failed: ${redact(fallbackMessage)}`,
+          inputs.reviewed_inputs,
+        )),
+        raw: "",
+        reviewer_mechanism: { failed: true, on_reviewer_failure: "block", fallback_failed: true },
+      };
     }
   }
 
@@ -521,6 +540,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
   const normalized = validateNormalizedResult(result);
   if (cache) {
     writeJson(reviewCachePath(repo.root), {
+      integrity_version: REVIEW_CACHE_INTEGRITY_VERSION,
       target_hash: targetHash,
       result: normalized,
       raw: reviewerResult.resultText,
@@ -684,6 +704,7 @@ function readReviewCache(repoRoot, targetHash) {
   } catch {
     return null;
   }
+  if (cached.integrity_version !== REVIEW_CACHE_INTEGRITY_VERSION) return null;
   if (cached.target_hash !== targetHash) return null;
   const ttl = Number(process.env.REVIEW_LOOP_GATE_CHAIN_GAP_MS || GATE_CHAIN_GAP_MS);
   const createdAt = Date.parse(cached.created_at || "");
@@ -693,6 +714,7 @@ function readReviewCache(repoRoot, targetHash) {
   } catch {
     return null;
   }
+  if (isPlaceholderSummary(cached.result.summary)) return null;
   return cached;
 }
 
@@ -1338,6 +1360,11 @@ async function gateCommand(args) {
   // guidelines always apply.
   const configuredBlockOn = config?.block_on || args.blockOn || null;
   if (configuredBlockOn) assertSeverity(configuredBlockOn, "gate block_on");
+  const automaticReviewerFailurePolicy = config?.on_reviewer_failure ?? "block";
+  if (!["block", "allow"].includes(automaticReviewerFailurePolicy)) {
+    outputHookBlock("review-loop configuration failure: gate on_reviewer_failure must be block or allow");
+    return;
+  }
   let reviewResult;
   let fallbackDisclosure = "";
   const gateArgs = { ...args, json: true, positional: [], scope: args.scope || "auto", blockOn: configuredBlockOn || undefined };
@@ -1373,12 +1400,22 @@ async function gateCommand(args) {
       const fallbackMessage = redact(fallbackError instanceof Error ? fallbackError.message : String(fallbackError));
       delete state.tasks[fallbackTaskKey];
       writeGateState(repo.root, state);
-      outputHookAllow([
+      const missingCoverage = [
         `${reviewerDisplayName(selectedReviewer)} reviewer was unavailable and the degraded ${reviewerDisplayName(fallbackReviewer)} fallback review also failed.`,
-        "Allowing finalization without review coverage.",
         `Primary failure: ${message}`,
         `Fallback failure: ${fallbackMessage}`,
-      ].join("\n"));
+      ];
+      if (automaticReviewerFailurePolicy === "allow") {
+        outputHookAllow([
+          ...missingCoverage,
+          "Allowing finalization without review coverage because gate on_reviewer_failure is explicitly allow.",
+        ].join("\n"));
+      } else {
+        outputHookBlock([
+          "Missing review coverage; blocking finalization.",
+          ...missingCoverage,
+        ].join("\n"));
+      }
       return;
     }
   }
@@ -1491,11 +1528,17 @@ function validateReviewerOutput(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("reviewer output must be an object");
   }
-  if (value.decision !== undefined && !GENERIC_DECISIONS.includes(value.decision)) {
+  if (value.decision === undefined) {
+    throw new Error("reviewer output decision is required");
+  }
+  if (!GENERIC_DECISIONS.includes(value.decision)) {
     throw new Error(`reviewer output decision must be one of: ${GENERIC_DECISIONS.join(", ")}`);
   }
   if (typeof value.summary !== "string" || !value.summary) {
     throw new Error("reviewer output summary is required");
+  }
+  if (isPlaceholderSummary(value.summary)) {
+    throw new Error("reviewer_output_integrity: placeholder_summary");
   }
   if (!Array.isArray(value.findings)) {
     throw new Error("reviewer output findings must be an array");
@@ -1505,7 +1548,7 @@ function validateReviewerOutput(value) {
     throw new Error("reviewer output required_next_actions must be an array");
   }
   return {
-    decision: value.decision || "approved",
+    decision: value.decision,
     summary: value.summary,
     findings: value.findings,
     required_next_actions: value.required_next_actions || [],
@@ -1525,6 +1568,10 @@ function validateReviewerFinding(finding) {
   if (finding.reviewer_disposition !== undefined && !REVIEWER_DISPOSITIONS.includes(finding.reviewer_disposition)) {
     throw new Error(`finding.reviewer_disposition must be one of: ${REVIEWER_DISPOSITIONS.join(", ")}`);
   }
+}
+
+function isPlaceholderSummary(value) {
+  return typeof value === "string" && value.trim().toLowerCase() === "test";
 }
 
 function normalizeReviewOutput(reviewerOutput, { policy, blockOn, reviewedInputs, reviewerMechanism }) {

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reviewer output now requires an explicit decision and rejects the observed normalized `test` placeholder as a reviewer-mechanism failure. Review caches are integrity-versioned so legacy or placeholder-bearing entries are misses. Automatic gates now block by default when both the primary and distinct-host fallback reviewers fail; repositories that intentionally prefer availability can persist report-only behavior with `review-loop-setup --enable-review-gate --on-reviewer-failure allow`.
+
 ## 0.4.0
 
 - An explicit `review-loop run` whose target resolves to empty (no diff in the selected scope and no `--artifact`/`--context`) now returns `decision: "invalid_input"` (`ok: false`) with actionable next steps instead of `approved` / "Nothing to review.". The automatic Stop-hook gate keeps the prior allow-on-clean-tree behavior so finalization is never blocked when there are genuinely no changes. This prevents an explicit review request from silently passing without reviewing anything.
