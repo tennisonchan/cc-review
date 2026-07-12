@@ -438,6 +438,104 @@ test("run fails closed on reviewer mechanism failure by default", () => {
   assert.match(parsed.result.summary, /Codex fallback review also failed/);
 });
 
+test("run treats a missing reviewer decision as mechanism failure instead of approval", () => {
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+        summary: "Substantive but missing its decision.",
+        findings: [],
+        required_next_actions: [],
+      }),
+      REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback unavailable",
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "blocked");
+  assert.match(parsed.result.summary, /reviewer output decision is required/);
+  assert.doesNotMatch(parsed.result.summary, /Substantive but missing/);
+});
+
+test("run rejects the observed placeholder summary and uses one host fallback", () => {
+  for (const decision of ["approved", "changes_requested"]) {
+    const repo = makeGitRepo();
+    const result = run(["run", "--scope", "none", "--json"], {
+      cwd: repo,
+      env: {
+        ...testEnv(repo),
+        REVIEW_LOOP_HOST: "codex",
+        REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+          decision,
+          summary: "  TeSt  ",
+          findings: [{
+            id: "a",
+            severity: "low",
+            category: "correctness",
+            message: "test message",
+            locations: ["file.md"],
+            required_action: "do the thing",
+            reviewer_disposition: "advisory",
+          }],
+          required_next_actions: ["do the thing"],
+        }),
+        REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback reviewed the target")),
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.result.decision, "approved");
+    assert.equal(parsed.result.summary, "fallback reviewed the target");
+    assert.equal(parsed.result.reviewer_mechanism, "codex-fallback-fake");
+    assert.doesNotMatch(JSON.stringify(parsed), /test message|do the thing|file\.md/i);
+  }
+});
+
+test("run fails closed when both primary and fallback return placeholder summaries", () => {
+  const repo = makeGitRepo();
+  const placeholder = approvedOutput("test");
+  const result = run(["run", "--scope", "none", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(placeholder),
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(placeholder),
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "blocked");
+  assert.match(parsed.result.summary, /reviewer_output_integrity: placeholder_summary/);
+  assert.equal(parsed.reviewer_mechanism.fallback_failed, true);
+});
+
+test("run preserves concise clean reviews and findings-authoritative normalization", () => {
+  for (const summary of ["ok", "Reviewed the selected target; no blockers found."]) {
+    const repo = makeGitRepo();
+    const result = run(["run", "--scope", "none", "--json"], {
+      cwd: repo,
+      env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput(summary)) },
+    });
+    assert.equal(JSON.parse(result.stdout).result.decision, "approved");
+  }
+
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      decision: "approved",
+      summary: "Reviewed the target and found a blocker.",
+      findings: [{ ...finding({ required_action: "Fix it." }), reviewer_disposition: "blocking" }],
+      required_next_actions: [],
+    }) },
+  });
+  assert.equal(JSON.parse(result.stdout).result.decision, "changes_requested");
+});
+
 test("run uses Codex fallback when Claude is rate limited", () => {
   const repo = makeGitRepo();
   const fakeClaude = join(repo, "bin", "claude-rate-limited");
@@ -528,6 +626,23 @@ test("run can fail open explicitly on reviewer mechanism failure", () => {
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.result.decision, "approved");
   assert.match(parsed.result.summary, /on-reviewer-failure=allow/);
+});
+
+test("run explicit allow still prefers a healthy distinct-host fallback", () => {
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--on-reviewer-failure", "allow", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("test")),
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback supplied coverage")),
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.summary, "fallback supplied coverage");
+  assert.equal(parsed.result.reviewer_mechanism, "codex-fallback-fake");
 });
 
 test("run rejects direct --block-on policy override", () => {
@@ -758,6 +873,46 @@ test("enable-review-gate uses bundled Stop hook wiring", () => {
   assert.equal(action.event, "Stop");
 });
 
+test("enable-review-gate persists the automatic reviewer failure policy", () => {
+  for (const [args, expected] of [
+    [["setup", "--enable-review-gate", "--json"], "block"],
+    [["setup", "--enable-review-gate", "--on-reviewer-failure", "allow", "--json"], "allow"],
+  ]) {
+    const repo = makeGitRepo();
+    const result = run(args, { cwd: repo, env: testEnv(repo) });
+    assert.equal(result.status, 0, result.stderr);
+    const action = JSON.parse(result.stdout).actions.find((item) => item.action === "enable-review-gate");
+    assert.equal(action.on_reviewer_failure, expected);
+    assert.equal(JSON.parse(readFileSync(action.path, "utf8")).on_reviewer_failure, expected);
+  }
+});
+
+test("gate fails closed on a corrupt persisted reviewer failure policy", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const env = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1" };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  const configPath = JSON.parse(setup.stdout).actions.find((item) => item.action === "enable-review-gate").path;
+  const config = JSON.parse(readFileSync(configPath, "utf8"));
+  config.on_reviewer_failure = "maybe";
+  writeFileSync(configPath, JSON.stringify(config));
+
+  const result = run(["gate", "--json"], {
+    cwd: repo,
+    env: { ...env, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("review should not run")) },
+    input: '{}',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.decision, "block");
+  assert.match(parsed.reason, /configuration failure.*on_reviewer_failure must be block or allow/);
+  assert.doesNotMatch(parsed.reason, /review should not run/);
+});
+
 test("gate re-reviews after a block instead of allowing on stop_hook_active", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
@@ -818,6 +973,66 @@ test("gate reuses the cached decision for an unchanged tree", () => {
   writeFileSync(join(repo, "file.txt"), "actually fixed\n");
   const fresh = run(["gate", "--json"], { cwd: repo, env: approvingEnv, input: '{"turn_id":"cache"}' });
   assert.deepEqual(JSON.parse(fresh.stdout), {});
+});
+
+test("gate ignores a pre-integrity-version review cache entry", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1", REVIEW_LOOP_HOST: "codex" };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const blockingEnv = {
+    ...baseEnv,
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+      finding({ id: "legacy-cache", locations: ["file.txt:1"], message: "Legacy cached issue.", required_action: "Fix." }),
+    ])),
+  };
+  const first = run(["gate", "--json"], { cwd: repo, env: blockingEnv, input: '{"turn_id":"legacy-cache"}' });
+  assert.equal(JSON.parse(first.stdout).decision, "block");
+
+  const cacheDir = join(baseEnv.XDG_STATE_HOME, "review-loop", "review-cache");
+  const cachePath = join(cacheDir, readdirSync(cacheDir)[0]);
+  const legacy = JSON.parse(readFileSync(cachePath, "utf8"));
+  delete legacy.integrity_version;
+  writeFileSync(cachePath, JSON.stringify(legacy));
+
+  const approvingEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fresh review")) };
+  const rerun = run(["gate", "--json"], { cwd: repo, env: approvingEnv, input: '{"turn_id":"legacy-cache"}' });
+  assert.deepEqual(JSON.parse(rerun.stdout), {});
+});
+
+test("gate ignores a versioned cache entry with the placeholder summary", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const baseEnv = { ...testEnv(repo), REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1", REVIEW_LOOP_HOST: "codex" };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env: baseEnv });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const blockingEnv = {
+    ...baseEnv,
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+      finding({ id: "sentinel-cache", locations: ["file.txt:1"], message: "Cached issue.", required_action: "Fix." }),
+    ])),
+  };
+  const first = run(["gate", "--json"], { cwd: repo, env: blockingEnv, input: '{"turn_id":"sentinel-cache"}' });
+  assert.equal(JSON.parse(first.stdout).decision, "block");
+
+  const cacheDir = join(baseEnv.XDG_STATE_HOME, "review-loop", "review-cache");
+  const cachePath = join(cacheDir, readdirSync(cacheDir)[0]);
+  const cached = JSON.parse(readFileSync(cachePath, "utf8"));
+  cached.result.summary = " TEST ";
+  writeFileSync(cachePath, JSON.stringify(cached));
+
+  const approvingEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fresh review")) };
+  const rerun = run(["gate", "--json"], { cwd: repo, env: approvingEnv, input: '{"turn_id":"sentinel-cache"}' });
+  assert.deepEqual(JSON.parse(rerun.stdout), {});
 });
 
 test("gate cache misses on changes invisible to the rendered prompt", () => {
@@ -1362,7 +1577,7 @@ test("gate blocks on degraded fallback review findings", () => {
   assert.match(parsed.reason, /Fallback found a blocker/);
 });
 
-test("gate allows report-only when Claude and fallback review are unavailable", () => {
+test("gate blocks by default when Claude and fallback review are unavailable", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
   runGit(["add", "file.txt"], repo);
@@ -1381,13 +1596,41 @@ test("gate allows report-only when Claude and fallback review are unavailable", 
   const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"fallback-fail"}' });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.decision, undefined);
-  assert.match(parsed.systemMessage, /Allowing finalization without review coverage/);
-  assert.match(parsed.systemMessage, /api_key= REDACTED/);
-  assert.doesNotMatch(parsed.systemMessage, /secret-value/);
+  assert.equal(parsed.decision, "block");
+  assert.match(parsed.reason, /Missing review coverage/);
+  assert.match(parsed.reason, /api_key= REDACTED/);
+  assert.doesNotMatch(parsed.reason, /secret-value/);
 });
 
-test("gate allows report-only when Codex and Claude fallback are unavailable", () => {
+test("gate treats a persisted null reviewer failure policy as fail-closed default", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const env = {
+    ...testEnv(repo),
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_HOST: "codex",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "", findings: [] }),
+    REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback unavailable",
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  const configPath = JSON.parse(setup.stdout).actions.find((item) => item.action === "enable-review-gate").path;
+  const config = JSON.parse(readFileSync(configPath, "utf8"));
+  config.on_reviewer_failure = null;
+  writeFileSync(configPath, JSON.stringify(config));
+
+  const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"null-policy"}' });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.decision, "block");
+  assert.match(parsed.reason, /Missing review coverage/);
+  assert.doesNotMatch(parsed.reason, /Allowing finalization/);
+});
+
+test("gate allows report-only with persisted allow when Codex and Claude fallback are unavailable", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
   runGit(["add", "file.txt"], repo);
@@ -1400,7 +1643,7 @@ test("gate allows report-only when Codex and Claude fallback are unavailable", (
     REVIEW_LOOP_FAKE_CODEX_ERROR: "primary codex failed with api_key=primary-secret",
     REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback claude failed with api_key=fallback-secret",
   };
-  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  const setup = run(["setup", "--enable-review-gate", "--on-reviewer-failure", "allow", "--json"], { cwd: repo, env });
   assert.equal(setup.status, 0, setup.stderr);
 
   const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"claude-fallback-fail"}' });
@@ -1764,7 +2007,7 @@ test("gate allow paths never emit invalid approve decision", () => {
   assert.doesNotMatch(source, /decision:\s*["']approve["']/);
 });
 
-test("gate infrastructure errors allow report-only when fallback also fails", () => {
+test("gate infrastructure errors block by default when fallback also fails", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
   runGit(["add", "file.txt"], repo);
@@ -1788,10 +2031,10 @@ test("gate infrastructure errors allow report-only when fallback also fails", ()
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.decision, undefined);
-  assert.match(parsed.systemMessage, /Allowing finalization without review coverage/);
-  assert.match(parsed.systemMessage, /reviewer output summary is required/);
-  assert.match(parsed.systemMessage, /fallback unavailable/);
+  assert.equal(parsed.decision, "block");
+  assert.match(parsed.reason, /Missing review coverage/);
+  assert.match(parsed.reason, /reviewer output summary is required/);
+  assert.match(parsed.reason, /fallback unavailable/);
 });
 
 test("background review job can be started, listed, and read", async () => {
@@ -1870,6 +2113,32 @@ process.stdin.on("end", () => {
   assert.match(prompt, /Focus: api_key=secret-value/);
   assert.doesNotMatch(prompt, /Focus: \[redacted\]/);
   assert.equal(JSON.parse(readFileSync(envFile, "utf8")).backgroundArgs, "");
+});
+
+test("background review rejects a placeholder assessment as mechanism failure", async () => {
+  const repo = makeGitRepo();
+  const context = join(repo, "context.md");
+  writeFileSync(context, "Problem: background placeholder review\n");
+  const env = {
+    ...testEnv(repo),
+    REVIEW_LOOP_HOST: "codex",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("test")),
+    REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback unavailable",
+  };
+
+  const started = run(["run", "--context", context, "--background", "--json"], { cwd: repo, env });
+  assert.equal(started.status, 0, started.stderr);
+  const job = JSON.parse(started.stdout);
+  await waitFor(() => {
+    const status = run(["status", job.id, "--json"], { cwd: repo, env });
+    return JSON.parse(status.stdout).jobs[0]?.state === "completed";
+  });
+
+  const result = run(["result", job.id, "--json"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  const completed = JSON.parse(result.stdout);
+  assert.equal(completed.result.result.decision, "blocked");
+  assert.match(completed.result.result.summary, /reviewer_output_integrity: placeholder_summary/);
 });
 
 test("cancel of a completed job preserves the result", async () => {
