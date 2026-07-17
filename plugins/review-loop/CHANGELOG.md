@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.2
+
+- A concrete correctness, compatibility, safety, or data-loss regression that must be fixed before finalization now remains blocking at its evidence-supported severity. Reviewers no longer downgrade such findings merely because the machine policy threshold would not independently promote them.
+
 ## 0.5.1
 
 - Strengthened the shared reviewer contract to trace externally reachable compatibility, stale retained identity across scope changes, and shared-component behavior. The same mechanism checks now apply to every reviewer provider and semantic tier.
