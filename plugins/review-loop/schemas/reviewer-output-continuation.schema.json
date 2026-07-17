@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["decision", "summary", "findings", "required_next_actions"],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": ["approved", "changes_requested", "invalid_input", "blocked"]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "category", "message", "locations", "required_action", "reviewer_disposition"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "severity": { "$ref": "#/$defs/severity" },
+          "category": { "type": "string", "minLength": 1 },
+          "message": { "type": "string", "minLength": 1 },
+          "locations": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "required_action": { "type": "string", "minLength": 1 },
+          "reviewer_disposition": {
+            "type": "string",
+            "enum": ["blocking", "advisory"]
+          }
+        }
+      }
+    },
+    "required_next_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "continuation_envelope": {
+      "$ref": "#/$defs/continuation_envelope"
+    }
+  },
+  "$defs": {
+    "severity": {
+      "type": "string",
+      "enum": ["info", "low", "medium", "high"]
+    },
+    "continuation_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allowed_paths",
+        "allowed_subject_elements",
+        "expected_closure_claim",
+        "required_checks",
+        "forbidden_effects"
+      ],
+      "properties": {
+        "allowed_paths": { "$ref": "#/$defs/non_empty_strings" },
+        "allowed_subject_elements": { "$ref": "#/$defs/non_empty_strings" },
+        "expected_closure_claim": { "type": "string", "minLength": 1 },
+        "required_checks": { "$ref": "#/$defs/non_empty_strings" },
+        "forbidden_effects": { "$ref": "#/$defs/non_empty_strings" }
+      }
+    },
+    "non_empty_strings": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    }
+  }
+}

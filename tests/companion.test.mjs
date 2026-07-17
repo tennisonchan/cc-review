@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, statSync, utimesSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, readdirSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -127,6 +127,7 @@ process.stdin.on("end", () => {
   const schemaArg = argv[argv.indexOf("--json-schema") + 1];
   const schema = JSON.parse(schemaArg);
   assert.equal(schema.$schema, undefined);
+  assert.equal(schema.properties.continuation_envelope, undefined);
   assert.deepEqual(schema.properties.decision.enum, ["approved", "changes_requested", "invalid_input", "blocked"]);
 });
 
@@ -228,6 +229,259 @@ test("reviewer selection honors host defaults, explicit override, and validation
   });
   assert.notEqual(invalidHost.status, 0);
   assert.match(invalidHost.stderr, /REVIEW_LOOP_HOST must be one of: codex, claude/);
+});
+
+test("capabilities reports legacy compatibility when operator tiers are not configured", () => {
+  const repo = makeGitRepo();
+  const result = run(["capabilities", "--json"], { cwd: repo, env: testEnv(repo) });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.schema_version, "review-loop.capabilities.v1");
+  assert.deepEqual(parsed.semantic_tiers, ["fast", "standard", "strong", "legacy_unqualified"]);
+  assert.equal(parsed.tier_configuration.status, "missing");
+  assert.equal(parsed.tiers.fast.configured, false);
+  assert.equal(parsed.legacy_unqualified.approval_authority, false);
+  assert.match(parsed.capability_digest, /^[a-f0-9]{64}$/);
+});
+
+test("capabilities reads its adapter version from a packaged plugin manifest", () => {
+  const repo = makeGitRepo();
+  const installedPlugin = join(repo, "installed", "review-loop");
+  cpSync(new URL("../plugins/review-loop", import.meta.url).pathname, installedPlugin, { recursive: true });
+  const installedCompanion = join(installedPlugin, "scripts", "review-loop-companion.mjs");
+  const result = spawnSync(process.execPath, [installedCompanion, "capabilities", "--json"], {
+    cwd: repo,
+    env: testEnv(repo),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).adapter_version, "0.5.0");
+});
+
+test("capabilities resolves configured tiers to deterministic exact release identities", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    fast: { reviewer: "codex", model: "gpt-5.6-luna-20260701", reasoning_effort: "medium" },
+    strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+  });
+  const first = run(["capabilities", "--json"], { cwd: repo, env });
+  const second = run(["capabilities", "--json"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(second.status, 0, second.stderr);
+  const parsed = JSON.parse(first.stdout);
+  assert.deepEqual(parsed, JSON.parse(second.stdout));
+  assert.equal(parsed.tier_configuration.status, "configured");
+  assert.equal(parsed.tiers.fast.release_identity.semantic_tier, "fast");
+  assert.equal(parsed.tiers.fast.release_identity.provider, "openai");
+  assert.equal(parsed.tiers.fast.release_identity.model_identity_evidence, "explicit_argv");
+  assert.match(parsed.tiers.fast.release_identity.reviewer_cli_version, /Codex/i);
+  assert.equal(parsed.tiers.strong.release_identity.provider, "anthropic");
+  assert.equal(parsed.tiers.strong.release_identity.model_identity_evidence, "provider_reported");
+  assert.match(parsed.tiers.strong.release_identity.reviewer_cli_version, /Claude Code/i);
+  assert.equal(parsed.tiers.standard.configured, false);
+  for (const field of [
+    "release_digest", "adapter_digest", "read_only_contract_digest", "prompt_contract_digest",
+    "reviewer_output_schema_digest", "finding_policy_digest", "operator_tier_configuration_digest",
+  ]) {
+    assert.match(parsed.tiers.fast.release_identity[field], /^[a-f0-9]{64}$/);
+  }
+});
+
+test("tiered Claude review passes exact model settings and returns immutable mechanism evidence", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "base\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  const argvFile = join(repo, "tier-claude-argv.json");
+  const fakeClaude = join(repo, "bin", "tier-claude");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeClaude, `#!/usr/bin/env node
+const fs = require("fs");
+if (process.argv[2] === "--version") { console.log("2.1.212 (Claude Code)"); process.exit(0); }
+fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }, result: "ok", modelUsage: { "claude-opus-4-1-20250805": { outputTokens: 12 } } }));
+`, { mode: 0o755 });
+  const env = {
+    ...testEnv(repo),
+    REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
+  };
+  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+  });
+  const result = run(["run", "--scope", "auto", "--tier", "strong", "--continuation-envelope", "--json"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.reviewer_mechanism.schema_version, "review-loop.reviewer-mechanism.v1");
+  assert.equal(parsed.result.reviewer_mechanism.status, "completed");
+  assert.equal(parsed.result.reviewer_mechanism.release_identity.model, "claude-opus-4-1-20250805");
+  assert.match(parsed.result.reviewer_mechanism.release_identity.release_digest, /^[a-f0-9]{64}$/);
+  const argv = JSON.parse(readFileSync(argvFile, "utf8"));
+  const contract = parsed.result.reviewer_mechanism.release_identity.read_only_contract;
+  assert.deepEqual(argv.slice(1, 1 + contract.static_argv.length), contract.static_argv);
+  assert.deepEqual(argv.slice(0, 8), [
+    "-p", "--safe-mode", "--model", "claude-opus-4-1-20250805",
+    "--effort", "high", "--no-session-persistence", "--permission-mode",
+  ]);
+  assert.deepEqual(argv.slice(argv.indexOf("--tools"), argv.indexOf("--tools") + 2), ["--tools", "Read,Grep,Glob"]);
+  const schema = JSON.parse(argv[argv.indexOf("--json-schema") + 1]);
+  assert.equal(schema.properties.continuation_envelope.$ref, "#/$defs/continuation_envelope");
+
+  writeFileSync(fakeClaude, `#!/usr/bin/env node
+if (process.argv[2] === "--version") { console.log("2.1.212 (Claude Code)"); process.exit(0); }
+console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }, result: "ok", modelUsage: { "claude-opus-4-8": { outputTokens: 12 } } }));
+`, { mode: 0o755 });
+  const drift = run(["run", "--scope", "auto", "--tier", "strong", "--json"], { cwd: repo, env });
+  assert.equal(drift.status, 0, drift.stderr);
+  const driftResult = JSON.parse(drift.stdout);
+  assert.equal(driftResult.result.decision, "blocked");
+  assert.match(driftResult.result.summary, /tier identity drift.*configured claude-opus-4-1-20250805, resolved claude-opus-4-8/);
+});
+
+test("tiered Codex review passes exact model settings without user configuration", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "base\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  const argvFile = join(repo, "tier-codex-argv.json");
+  const cwdFile = join(repo, "tier-codex-cwd.txt");
+  const fakeCodex = join(repo, "bin", "tier-codex");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeCodex, `#!/usr/bin/env node
+const fs = require("fs");
+if (process.argv[2] === "--version") { console.log(process.env.FAKE_CODEX_VERSION || "OpenAI Codex vtest-1"); process.exit(0); }
+const argv = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(argv));
+fs.writeFileSync(${JSON.stringify(cwdFile)}, process.cwd());
+const out = argv[argv.indexOf("--output-last-message") + 1];
+fs.writeFileSync(out, JSON.stringify({ decision: "approved", summary: "ok", findings: [], required_next_actions: [] }));
+`, { mode: 0o755 });
+  const env = { ...testEnv(repo), REVIEW_LOOP_CODEX_BIN: fakeCodex };
+  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    fast: { reviewer: "codex", model: "gpt-5.6-luna-20260701", reasoning_effort: "medium" },
+  });
+  const result = run(["run", "--scope", "auto", "--tier", "fast", "--json"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.reviewer_mechanism.release_identity.semantic_tier, "fast");
+  assert.equal(parsed.result.reviewer_mechanism.release_identity.reviewer_cli_version, "OpenAI Codex vtest-1");
+  const argv = JSON.parse(readFileSync(argvFile, "utf8"));
+  const contract = parsed.result.reviewer_mechanism.release_identity.read_only_contract;
+  assert.deepEqual(argv.slice(1, 1 + contract.static_argv.length), contract.static_argv);
+  assert.deepEqual(argv.slice(0, 14), [
+    "exec", "--ignore-user-config", "--ignore-rules", "--strict-config", "--model", "gpt-5.6-luna-20260701",
+    "--config", 'model_reasoning_effort="medium"',
+    "--config", "project_doc_max_bytes=0",
+    "--config", "project_doc_fallback_filenames=[]",
+    "--sandbox", "read-only",
+  ]);
+  const neutralRoot = argv[argv.indexOf("--cd") + 1];
+  assert.notEqual(neutralRoot, repo);
+  assert.equal(realpathSync(readFileSync(cwdFile, "utf8")), realpathSync(neutralRoot));
+  assert.deepEqual(argv.slice(argv.indexOf("--add-dir"), argv.indexOf("--add-dir") + 2), ["--add-dir", realpathSync(repo)]);
+  assert.ok(argv.includes("--skip-git-repo-check"));
+  assert.deepEqual(contract.workspace_argv_template, [
+    "--cd", "<instruction-neutral-state-directory>",
+    "--add-dir", "<repository-root>",
+    "--skip-git-repo-check",
+  ]);
+  const changedCli = run(["capabilities", "--json"], {
+    cwd: repo,
+    env: { ...env, FAKE_CODEX_VERSION: "OpenAI Codex vtest-2" },
+  });
+  assert.equal(changedCli.status, 0, changedCli.stderr);
+  const changedIdentity = JSON.parse(changedCli.stdout).tiers.fast.release_identity;
+  assert.equal(changedIdentity.reviewer_cli_version, "OpenAI Codex vtest-2");
+  assert.notEqual(changedIdentity.release_digest, parsed.result.reviewer_mechanism.release_identity.release_digest);
+});
+
+test("tiered Claude capabilities reject alternate provider backends", () => {
+  const repo = makeGitRepo();
+  const baseEnv = testEnv(repo);
+  baseEnv.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+  });
+  for (const flag of ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"]) {
+    const result = run(["capabilities", "--json"], { cwd: repo, env: { ...baseEnv, [flag]: "1" } });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, new RegExp(`alternate backend configuration: ${flag}`));
+  }
+});
+
+test("tiered review fails closed on missing, mutable, or unavailable configured identity", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "base\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  const baseEnv = testEnv(repo);
+
+  const missing = run(["run", "--scope", "auto", "--tier", "fast", "--json"], { cwd: repo, env: baseEnv });
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stderr, /reviewer tier configuration is missing/);
+
+  const mutableEnv = { ...baseEnv };
+  mutableEnv.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    strong: { reviewer: "claude", model: "opus", reasoning_effort: "high" },
+  }, "mutable-tiers.json");
+  const mutable = run(["capabilities", "--json"], { cwd: repo, env: mutableEnv });
+  assert.notEqual(mutable.status, 0);
+  assert.match(mutable.stderr, /must be an exact model identifier/);
+
+  const failedEnv = {
+    ...baseEnv,
+    REVIEW_LOOP_HOST: "claude",
+    REVIEW_LOOP_CLAUDE_BIN: join(repo, "missing-claude"),
+    REVIEW_LOOP_FAKE_CODEX_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("must not fallback")),
+  };
+  failedEnv.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+  }, "failed-tiers.json");
+  const failed = run(["run", "--scope", "auto", "--tier", "strong", "--json"], { cwd: repo, env: failedEnv });
+  assert.notEqual(failed.status, 0);
+  assert.match(failed.stderr, /claude reviewer CLI version probe failed/);
+  assert.doesNotMatch(failed.stderr, /fallback review/);
+
+  const allow = run(["run", "--scope", "auto", "--tier", "strong", "--on-reviewer-failure", "allow"], { cwd: repo, env: failedEnv });
+  assert.notEqual(allow.status, 0);
+  assert.match(allow.stderr, /tiered review cannot use --on-reviewer-failure allow/);
+});
+
+test("strong initial review can emit a strict continuation envelope and other invocations cannot", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "base\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  const env = testEnv(repo);
+  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+    fast: { reviewer: "codex", model: "gpt-5.6-luna-20260701", reasoning_effort: "medium" },
+  });
+  const output = {
+    ...approvedOutput("bounded closure"),
+    continuation_envelope: {
+      allowed_paths: ["file.txt"],
+      allowed_subject_elements: ["changed line"],
+      expected_closure_claim: "Replace the incorrect fixture value.",
+      required_checks: ["npm test"],
+      forbidden_effects: ["runtime behavior outside file.txt"],
+    },
+  };
+  env.REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT = JSON.stringify(output);
+  const strong = run(["run", "--scope", "auto", "--tier", "strong", "--continuation-envelope", "--json"], { cwd: repo, env });
+  assert.equal(strong.status, 0, strong.stderr);
+  assert.deepEqual(JSON.parse(strong.stdout).result.continuation_envelope, output.continuation_envelope);
+
+  const unrequested = run(["run", "--scope", "auto", "--tier", "strong", "--json"], { cwd: repo, env });
+  assert.equal(unrequested.status, 0, unrequested.stderr);
+  assert.equal(JSON.parse(unrequested.stdout).result.decision, "blocked");
+
+  const fast = run(["run", "--scope", "auto", "--tier", "fast", "--continuation-envelope"], { cwd: repo, env });
+  assert.notEqual(fast.status, 0);
+  assert.match(fast.stderr, /--continuation-envelope requires --tier strong/);
 });
 
 test("run normalizes policy-promoted advisory findings into blocking findings", () => {
@@ -2409,6 +2663,8 @@ function testEnv(repo) {
   mkdirSync(join(repo, ".home"), { recursive: true });
   const fakeClaude = join(bin, "claude");
   writeFileSync(fakeClaude, "#!/usr/bin/env sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.167 (Claude Code)'; exit 0; fi\nif [ \"$1\" = \"auth\" ]; then echo 'ok'; exit 0; fi\necho '{\"structured_output\":{\"decision\":\"approved\",\"summary\":\"ok\",\"findings\":[],\"required_next_actions\":[]},\"result\":\"ok\"}'\n", { mode: 0o755 });
+  const fakeCodex = join(mkdtempSync(join(tmpdir(), "review-loop-codex-")), "codex");
+  writeFileSync(fakeCodex, "#!/usr/bin/env sh\nif [ \"$1\" = \"--version\" ]; then echo 'OpenAI Codex vtest'; exit 0; fi\nexit 1\n", { mode: 0o755 });
   // State must live outside the worktree (as it does in production): the
   // gate's own state files are otherwise untracked files in the next review
   // target, perturbing it between runs.
@@ -2416,8 +2672,19 @@ function testEnv(repo) {
     ...process.env,
     HOME: join(repo, ".home"),
     REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
+    REVIEW_LOOP_CODEX_BIN: fakeCodex,
     XDG_STATE_HOME: mkdtempSync(join(tmpdir(), "review-loop-state-")),
   };
+}
+
+function writeTierConfig(repo, tiers, name = "reviewer-tiers.json") {
+  const path = join(repo, ".home", name);
+  mkdirSync(join(repo, ".home"), { recursive: true });
+  writeFileSync(path, JSON.stringify({
+    schema_version: "review-loop.reviewer-tier-config.v1",
+    tiers,
+  }));
+  return path;
 }
 
 function approvedOutput(summary = "ok") {

@@ -57,6 +57,8 @@ Useful options:
 - `--scope none|auto|working-tree|branch` selects repository diff input. For `run`, context/artifact-only reviews default to `none`; otherwise the default is `auto`.
 - `--focus <text>` supplies the reviewer ask.
 - `--counter` runs the loop in counter-review stance, focused on challenging an assumption, risk, or approach.
+- `--tier fast|standard|strong` selects an exact operator-configured reviewer release. Tiered runs fail closed and do not use cross-provider fallback or `--on-reviewer-failure allow`.
+- `--continuation-envelope` asks a `strong` tier initial review for a structured closure envelope. It is invalid without `--tier strong`.
 - `--on-reviewer-failure block|allow` controls direct-run mechanism failure behavior. The generic engine defaults to `block`; when the selected opposite-agent reviewer fails and the host agent is known, review-loop first tries one degraded read-only host-agent fallback. An explicit `allow` is consulted only when distinct-host fallback is unavailable or also fails.
 - `--background`, `status`, `result`, and `cancel` work with generic reviews. Persisted job metadata is sanitized; free-form focus text, logs, and errors are not returned raw through status/result JSON.
 
@@ -78,6 +80,45 @@ Host plugins select the opposite reviewer by default:
 Reviewer agents are terminal. A reviewer may inspect code and return structured findings, but must not invoke `review-loop`, run another reviewer, delegate work, or modify files. Internally, reviewer subprocesses receive `REVIEW_LOOP_TERMINAL_REVIEWER=1`; `review-loop run` refuses nested review execution and the Stop hook allows/no-ops in that mode.
 
 `REVIEW_LOOP_REVIEWER=claude|codex` and `--reviewer claude|codex` exist for internal/plugin routing and tests. Normal users should rely on the host defaults.
+
+## Semantic Reviewer Tiers
+
+Review-loop exposes `fast`, `standard`, `strong`, and `legacy_unqualified` as provider-independent capability names. It executes the selected reviewer read-only; it does not decide whether a release is qualified or has gate authority. Callers such as Agent Kernel own qualification, routing, and approval policy.
+
+Trusted tier configuration lives outside repositories at `$XDG_STATE_HOME/review-loop/reviewer-tiers.json` (or `~/.local/state/review-loop/reviewer-tiers.json` when `XDG_STATE_HOME` is unset). An operator may point `REVIEW_LOOP_TIER_CONFIG` at another trusted file. Repository files cannot configure reviewer tiers.
+
+```json
+{
+  "schema_version": "review-loop.reviewer-tier-config.v1",
+  "tiers": {
+    "fast": {
+      "reviewer": "codex",
+      "model": "gpt-release-specific-model-id",
+      "reasoning_effort": "medium"
+    },
+    "strong": {
+      "reviewer": "claude",
+      "model": "claude-release-specific-model-id",
+      "reasoning_effort": "high"
+    }
+  }
+}
+```
+
+Known mutable aliases such as `latest`, `opus`, and `sonnet` are rejected. Operators remain responsible for using a provider-pinned model identifier rather than another mutable family name. Inspect the resolved identities before routing:
+
+```bash
+review-loop-companion capabilities --json
+review-loop run --tier strong --context review-context.md --scope none --json
+```
+
+Each configured capability includes a release digest over the provider, model, reasoning effort, installed reviewer CLI version, companion/run-wrapper source and version, exact static read-only argv contract, prompt contract, reviewer schemas, deterministic finding policy, and complete operator tier configuration. A tiered normalized result returns that exact identity under `result.reviewer_mechanism.release_identity`. Existing untiered runs remain `legacy_unqualified` and preserve their current host selection and fallback behavior.
+
+Claude tiered runs also compare the configured model with the primary model reported by Claude's result envelope. Silent provider remapping is treated as identity drift and blocks the review. Bedrock, Vertex, and Foundry Claude backends are not currently qualified and fail closed instead of being mislabeled as Anthropic.
+
+Codex currently does not report a resolved model in its structured execution output. Its release identity therefore records `model_identity_evidence: "explicit_argv"`: review-loop removes user configuration, disables project-document loading, runs from an instruction-neutral state directory with the reviewed repository mounted read-only, and passes the configured model explicitly. These controls are included in the attested argv contract, but Codex still cannot perform Claude's post-execution model comparison. Claude identities record `provider_reported`. Callers can enforce different qualification requirements using this field.
+
+A caller requesting a strong initial review may add `--continuation-envelope`. Only that invocation receives the continuation-capable reviewer schema; ordinary and legacy reviewers cannot emit the field. When the reviewer can bound the remediation, the normalized result may include `continuation_envelope` with allowed paths and subject elements, the expected closure claim, required checks, and forbidden effects. This remains untrusted reviewer evidence until the caller validates it against its own policy and immutable subject.
 
 ## Install
 
