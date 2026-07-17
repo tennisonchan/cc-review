@@ -1,6 +1,6 @@
 ---
 description: Run a read-only review-loop review with the opposite-agent reviewer
-argument-hint: '[--background] [--base <ref>] [--scope none|auto|working-tree|branch] [--context <path>] [--artifact <path>] [--focus <text>] [--counter] [--json]'
+argument-hint: '[--background] [--base <ref>] [--scope none|auto|working-tree|branch] [--context <path>] [--artifact <path>] [--focus <text>] [--counter] [--tier fast|standard|strong] [--continuation-envelope] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.5.0
+
+- Added provider-independent `fast`, `standard`, and `strong` reviewer tiers backed by strict operator-owned configuration, a machine-readable capability response, exact model/reasoning argv, and digest-bound release identity evidence. Tiered runs fail closed without cross-provider fallback; Claude runs additionally reject provider-reported model drift. Legacy untiered behavior remains available but unqualified.
+- Release identities distinguish Claude's provider-reported model evidence from Codex's explicit-argv evidence so callers can apply qualification policy without assuming equivalent runtime observability.
+- Tiered Codex reviews run from an instruction-neutral state directory, disable project-document loading, and expose that workspace strategy in their attested read-only contract. Adapter versions are read from the packaged plugin manifest so capability discovery works from installed plugin caches as well as source checkouts.
+- Release identities bind the installed reviewer CLI version. Tiered Claude capabilities fail closed for unqualified Bedrock, Vertex, or Foundry backends rather than attesting them as Anthropic.
+- Added an opt-in structured continuation envelope for strong initial reviews. Only explicitly requested strong reviews receive the continuation-capable output schema; review-loop validates and carries the envelope as reviewer evidence without granting it policy authority.
 - Reviewer output now requires an explicit decision and rejects the observed normalized `test` placeholder as a reviewer-mechanism failure. Review caches are integrity-versioned so legacy or placeholder-bearing entries are misses. Automatic gates now block by default when both the primary and distinct-host fallback reviewers fail; repositories that intentionally prefer availability can persist report-only behavior with `review-loop-setup --enable-review-gate --on-reviewer-failure allow`.
 
 ## 0.4.0

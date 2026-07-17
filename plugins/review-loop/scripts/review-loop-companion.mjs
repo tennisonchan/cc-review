@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REVIEWER_OUTPUT_SCHEMA_PATH = join(ROOT, "schemas", "reviewer-output.schema.json");
+const REVIEWER_CONTINUATION_SCHEMA_PATH = join(ROOT, "schemas", "reviewer-output-continuation.schema.json");
 const TEMPLATE_GUIDELINES = join(ROOT, "templates", "review-guidelines.md");
 const PROJECT_GUIDELINES = [".review-loop", "review-guidelines.md"];
 const SEVERITIES = ["info", "low", "medium", "high"];
@@ -16,6 +17,24 @@ const REVIEWER_DISPOSITIONS = ["blocking", "advisory"];
 const BLOCKING_REASONS = ["reviewer", "category_policy", "severity_policy", "fallback_threshold"];
 const REVIEWERS = ["claude", "codex"];
 const HOSTS = ["codex", "claude"];
+const SEMANTIC_TIERS = ["fast", "standard", "strong"];
+const REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+const CLAUDE_ALTERNATE_BACKEND_FLAGS = [
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+];
+const TIER_CONFIG_SCHEMA_VERSION = "review-loop.reviewer-tier-config.v1";
+const CAPABILITY_SCHEMA_VERSION = "review-loop.capabilities.v1";
+const RELEASE_IDENTITY_SCHEMA_VERSION = "review-loop.reviewer-release-identity.v1";
+const REVIEWER_MECHANISM_SCHEMA_VERSION = "review-loop.reviewer-mechanism.v1";
+const CODEX_REPOSITORY_ROOT_TOKEN = "<repository-root>";
+const CODEX_NEUTRAL_ROOT_TOKEN = "<instruction-neutral-state-directory>";
+const TIER_CODEX_WORKSPACE_ARG_TEMPLATE = [
+  "--cd", CODEX_NEUTRAL_ROOT_TOKEN,
+  "--add-dir", CODEX_REPOSITORY_ROOT_TOKEN,
+  "--skip-git-repo-check",
+];
 const DEFAULT_BLOCK_ON = "high";
 const GATE_FINGERPRINT_BLOCK_LIMIT = 3;
 const GATE_TOTAL_BLOCK_LIMIT = 5;
@@ -94,6 +113,9 @@ async function main(argv) {
 
   const args = parseArgs(rest);
   switch (command) {
+    case "capabilities":
+      capabilitiesCommand(args);
+      break;
     case "setup":
       await setup(args);
       break;
@@ -121,6 +143,7 @@ function printHelp() {
   console.log(`Usage: review-loop-companion <subcommand> [options]
 
 Subcommands:
+  capabilities
   setup
   run
   status
@@ -132,8 +155,9 @@ Run "<subcommand> --help" for subcommand options.`);
 }
 
 const SUBCOMMAND_HELP = {
+  capabilities: "capabilities [--json]",
   setup: "setup [--init-guidelines] [--force] [--enable-review-gate] [--disable-review-gate] [--block-on info|low|medium|high] [--on-reviewer-failure block|allow] [--enable-gate-debug] [--disable-gate-debug] [--json]",
-  run: "run [--background] [--counter] [--context <path>] [--artifact <path>] [--focus <text>] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--reviewer claude|codex] [--on-reviewer-failure block|allow] [--json]",
+  run: "run [--background] [--counter] [--context <path>] [--artifact <path>] [--focus <text>] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--reviewer claude|codex] [--tier fast|standard|strong] [--continuation-envelope] [--on-reviewer-failure block|allow] [--json]",
   status: "status [job-id] [--all] [--json]",
   result: "result [job-id] [--json]",
   cancel: "cancel [job-id] [--json]",
@@ -157,6 +181,7 @@ function parseArgs(argv) {
     blockOn: null,
     context: null,
     counter: false,
+    continuationEnvelope: false,
     force: false,
     artifact: null,
     focus: null,
@@ -164,6 +189,7 @@ function parseArgs(argv) {
     initGuidelines: false,
     json: false,
     reviewer: null,
+    tier: null,
     scope: "auto",
     scopeExplicit: false,
     onReviewerFailure: "block",
@@ -189,6 +215,9 @@ function parseArgs(argv) {
       case "--counter":
         args.counter = true;
         break;
+      case "--continuation-envelope":
+        args.continuationEnvelope = true;
+        break;
       case "--json":
         args.json = true;
         break;
@@ -213,6 +242,7 @@ function parseArgs(argv) {
       case "--focus":
       case "--guidelines":
       case "--reviewer":
+      case "--tier":
       case "--scope":
       case "--on-reviewer-failure":
       case "--block-on": {
@@ -224,6 +254,7 @@ function parseArgs(argv) {
         if (arg === "--focus") args.focus = value;
         if (arg === "--guidelines") args.guidelines = value;
         if (arg === "--reviewer") args.reviewer = value;
+        if (arg === "--tier") args.tier = value;
         if (arg === "--scope") {
           args.scope = value;
           args.scopeExplicit = true;
@@ -245,8 +276,26 @@ function parseArgs(argv) {
     throw new Error(`invalid --on-reviewer-failure: ${args.onReviewerFailure}`);
   }
   if (args.reviewer) assertReviewer(args.reviewer, "--reviewer");
+  if (args.tier) assertSemanticTier(args.tier, "--tier");
+  if (args.tier && args.reviewer) throw new Error("--tier and --reviewer cannot be used together");
+  if (args.tier && args.onReviewerFailure === "allow") {
+    throw new Error("tiered review cannot use --on-reviewer-failure allow");
+  }
+  if (args.continuationEnvelope && args.tier !== "strong") {
+    throw new Error("--continuation-envelope requires --tier strong");
+  }
   if (args.blockOn) assertSeverity(args.blockOn, "--block-on");
   return args;
+}
+
+function capabilitiesCommand(args) {
+  const capabilities = reviewerCapabilities();
+  output(capabilities, args.json, (value) => [
+    `review-loop ${value.adapter_version}`,
+    ...SEMANTIC_TIERS.map((tier) => `${tier}: ${value.tiers[tier]?.configured ? value.tiers[tier].release_identity.release_digest : "unconfigured"}`),
+    "legacy_unqualified: available",
+    "",
+  ].join("\n"));
 }
 
 async function setup(args) {
@@ -406,10 +455,29 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
   const policy = guidelinePolicy(guidelines);
   const inputs = collectGenericReviewInputs(repo.root, args, cwd);
   const stance = args.counter ? "counter" : "standard";
-  const reviewer = resolveReviewer(args);
-  const prompt = buildGenericPrompt({ guidelines, inputs, focus: args.focus || args.positional.join(" ").trim(), stance, policy, reviewer });
+  const selection = resolveReviewerSelection(args);
+  const reviewer = selection.reviewer;
+  const prompt = buildGenericPrompt({
+    guidelines,
+    inputs,
+    focus: args.focus || args.positional.join(" ").trim(),
+    stance,
+    policy,
+    reviewer,
+    repositoryRoot: repo.root,
+    continuationEnvelope: args.continuationEnvelope,
+  });
   const targetHash = createHash("sha256")
-    .update(JSON.stringify(["run", stance, reviewer, args.focus || args.positional.join(" ").trim(), guidelines.content, inputs.fingerprint]))
+    .update(JSON.stringify([
+      "run",
+      stance,
+      reviewer,
+      selection.releaseIdentity?.release_digest || "legacy_unqualified",
+      args.continuationEnvelope,
+      args.focus || args.positional.join(" ").trim(),
+      guidelines.content,
+      inputs.fingerprint,
+    ]))
     .digest("hex");
   if (inputs.empty) {
     // The automatic Stop gate legitimately reaches here on a clean tree (nothing
@@ -461,21 +529,30 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
         guidelines: summarizeGuidelines(guidelines),
         result: cached.result,
         raw: cached.raw || "",
-        reviewer_mechanism: { ...(cached.meta || {}), cached: true },
+        reviewer_mechanism: selection.qualified
+          ? { ...cached.result.reviewer_mechanism, cached: true }
+          : { ...(cached.meta || {}), cached: true },
       };
     }
   }
   let reviewerResult;
   let reviewerOutput;
   try {
-    reviewerResult = await runReviewer(prompt, { reviewer, schemaPath: REVIEWER_OUTPUT_SCHEMA_PATH, cwd: repo.root });
-    reviewerOutput = validateReviewerOutput(reviewerResult.structuredOutput);
+    reviewerResult = await runReviewer(prompt, {
+      reviewer,
+      schemaPath: args.continuationEnvelope ? REVIEWER_CONTINUATION_SCHEMA_PATH : REVIEWER_OUTPUT_SCHEMA_PATH,
+      cwd: repo.root,
+      tierSelection: selection,
+    });
+    reviewerOutput = validateReviewerOutput(reviewerResult.structuredOutput, {
+      allowContinuationEnvelope: args.continuationEnvelope,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (args.onReviewerFailure === "throw") {
       throw new ReviewToolFailure(message);
     }
-    const fallbackReviewer = resolveFallbackReviewer(reviewer);
+    const fallbackReviewer = selection.qualified ? null : resolveFallbackReviewer(reviewer);
     let fallbackMessage = null;
     if (fallbackReviewer) {
       try {
@@ -507,13 +584,24 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
       };
     } else {
       if (!fallbackReviewer) {
+        const mechanism = selection.qualified
+          ? reviewerMechanismEvidence(selection, { failed: true })
+          : "review-loop";
         return {
           ok: false,
           repo: repo.root,
           guidelines: summarizeGuidelines(guidelines),
-          result: validateNormalizedResult(syntheticNormalizedFailure("blocked", `Reviewer mechanism failed: ${redact(message)}`, inputs.reviewed_inputs)),
+          result: validateNormalizedResult(syntheticNormalizedFailure(
+            "blocked",
+            `Reviewer mechanism failed: ${redact(message)}`,
+            inputs.reviewed_inputs,
+            [],
+            mechanism,
+          )),
           raw: "",
-          reviewer_mechanism: { failed: true, on_reviewer_failure: "block" },
+          reviewer_mechanism: selection.qualified
+            ? reviewerMechanismEvidence(selection, { failed: true })
+            : { failed: true, on_reviewer_failure: "block" },
         };
       }
       return {
@@ -535,7 +623,9 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     policy,
     blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
     reviewedInputs: inputs.reviewed_inputs,
-    reviewerMechanism: mechanismName(reviewerResult.meta),
+    reviewerMechanism: selection.qualified
+      ? reviewerMechanismEvidence(selection, reviewerResult.meta)
+      : mechanismName(reviewerResult.meta),
   });
   const normalized = validateNormalizedResult(result);
   if (cache) {
@@ -554,7 +644,9 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     guidelines: summarizeGuidelines(guidelines),
     result: normalized,
     raw: reviewerResult.resultText,
-    reviewer_mechanism: reviewerResult.meta,
+    reviewer_mechanism: selection.qualified
+      ? reviewerMechanismEvidence(selection, reviewerResult.meta)
+      : reviewerResult.meta,
   };
 }
 
@@ -633,6 +725,8 @@ function runCodexReviewer(prompt, options = {}) {
     mechanism: "codex",
     fakeMechanism: "codex-fake",
     useFallbackSentinel: false,
+    tierSelection: options.tierSelection,
+    schemaPath: options.schemaPath || REVIEWER_OUTPUT_SCHEMA_PATH,
   });
 }
 
@@ -642,7 +736,11 @@ function runCodexReviewerPrimitive(prompt, options) {
   }
   if (process.env[options.fakeOutputEnv]) {
     const structuredOutput = JSON.parse(process.env[options.fakeOutputEnv]);
-    return { structuredOutput, resultText: "", meta: { fake: true, reviewer_mechanism: options.fakeMechanism } };
+    return {
+      structuredOutput,
+      resultText: "",
+      meta: { fake: true, reviewer_mechanism: options.fakeMechanism },
+    };
   }
 
   const outDir = join(stateRoot(), "fallback");
@@ -653,15 +751,18 @@ function runCodexReviewerPrimitive(prompt, options) {
   const timeoutMs = Number(process.env[options.timeoutEnv] || DEFAULT_FALLBACK_TIMEOUT_MS);
   const childEnv = { ...process.env, REVIEW_LOOP_TERMINAL_REVIEWER: "1" };
   if (fallbackToken) childEnv.REVIEW_LOOP_FALLBACK_TOKEN = fallbackToken;
+  const reviewerArgs = options.tierSelection?.qualified
+    ? tierReviewerStaticArgs(options.tierSelection)
+    : ["--sandbox", "read-only"];
   const result = spawnSync(codexBin(), [
     "exec",
-    "--sandbox", "read-only",
-    "--cd", options.repoRoot,
-    "--output-schema", REVIEWER_OUTPUT_SCHEMA_PATH,
+    ...reviewerArgs,
+    ...(options.tierSelection?.qualified ? tierCodexWorkspaceArgs(options.repoRoot) : ["--cd", options.repoRoot]),
+    "--output-schema", options.schemaPath || REVIEWER_OUTPUT_SCHEMA_PATH,
     "--output-last-message", outPath,
     "-",
   ], {
-    cwd: options.repoRoot,
+    cwd: options.tierSelection?.qualified ? tierCodexNeutralRoot() : options.repoRoot,
     encoding: "utf8",
     input: prompt,
     timeout: timeoutMs,
@@ -722,7 +823,7 @@ function reviewCachePath(repoRoot) {
   return join(stateRoot(), "review-cache", `${repoHash(repoRoot)}.json`);
 }
 
-function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewer }) {
+function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewer, repositoryRoot, continuationEnvelope = false }) {
   const delimiter = `REVIEW_LOOP_INPUT_${randomUUID()}`;
   const reviewerLabel = reviewer === "codex" ? "Codex" : "Claude Code";
   const policySummary = [
@@ -741,9 +842,13 @@ function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewe
     "You may use Read, Grep, and Glob to inspect surrounding code for context.",
     "Return only structured output matching the requested reviewer-output schema.",
     "Do not decide project gates. Classify findings with severity, category, message, required_action, and reviewer_disposition.",
+    continuationEnvelope
+      ? "For this strong initial review, include continuation_envelope only when you can bound closure to explicit allowed_paths, allowed_subject_elements, expected_closure_claim, required_checks, and forbidden_effects."
+      : "Do not emit continuation_envelope for this review invocation.",
     "",
     `Review stance: ${stance}`,
     focus ? `Focus: ${focus}` : "",
+    repositoryRoot ? `Repository root for read-only inspection: ${repositoryRoot}` : "",
     "",
     "Machine-readable policy summary:",
     policySummary,
@@ -804,7 +909,15 @@ async function runClaudeReviewer(prompt, options = {}) {
 
   // Read-only context tools so the reviewer can see beyond the diff (the
   // enclosing function, callers, tests); plan mode prevents writes.
-  const args = ["-p", "--permission-mode", "plan", "--tools", "Read,Grep,Glob", "--output-format", "json", "--json-schema", loadSchema(options.schemaPath || REVIEWER_OUTPUT_SCHEMA_PATH)];
+  const reviewerArgs = options.tierSelection?.qualified
+    ? tierReviewerStaticArgs(options.tierSelection)
+    : ["--permission-mode", "plan", "--tools", "Read,Grep,Glob"];
+  const args = [
+    "-p",
+    ...reviewerArgs,
+    "--output-format", "json",
+    "--json-schema", loadSchema(options.schemaPath || REVIEWER_OUTPUT_SCHEMA_PATH),
+  ];
   const runCwd = options.useFallbackSentinel ? (options.cwd || process.cwd()) : process.cwd();
   const repoRoot = options.repoRoot || runCwd;
   const fallbackToken = options.useFallbackSentinel ? createFallbackSentinel(repoRoot) : null;
@@ -893,6 +1006,9 @@ async function runClaudeReviewer(prompt, options = {}) {
   if (!envelope.structured_output) {
     throw new Error("claude JSON envelope did not include structured_output");
   }
+  if (options.tierSelection?.qualified) {
+    assertClaudeResolvedModel(envelope, options.tierSelection.model);
+  }
 
   return {
     structuredOutput: envelope.structured_output,
@@ -905,6 +1021,25 @@ async function runClaudeReviewer(prompt, options = {}) {
       terminal_reason: envelope.terminal_reason,
     },
   };
+}
+
+function assertClaudeResolvedModel(envelope, configuredModel) {
+  const usage = envelope.modelUsage;
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) {
+    throw new Error("claude tier identity could not be verified: JSON envelope did not include modelUsage");
+  }
+  const ranked = Object.entries(usage)
+    .map(([model, metrics]) => ({ model, outputTokens: Number(metrics?.outputTokens || 0) }))
+    .sort((a, b) => b.outputTokens - a.outputTokens || a.model.localeCompare(b.model));
+  if (!ranked.length || ranked[0].outputTokens <= 0) {
+    throw new Error("claude tier identity could not be verified: modelUsage did not identify a primary response model");
+  }
+  if (ranked.length > 1 && ranked[0].outputTokens === ranked[1].outputTokens) {
+    throw new Error("claude tier identity could not be verified: modelUsage primary response model was ambiguous");
+  }
+  if (ranked[0].model !== configuredModel) {
+    throw new Error(`claude tier identity drift: configured ${configuredModel}, resolved ${ranked[0].model}`);
+  }
 }
 
 function resolveWorkspace(cwd = process.cwd()) {
@@ -1524,7 +1659,7 @@ function guidelinePolicy(guidelines) {
   return policy;
 }
 
-function validateReviewerOutput(value) {
+function validateReviewerOutput(value, { allowContinuationEnvelope = false } = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("reviewer output must be an object");
   }
@@ -1547,12 +1682,45 @@ function validateReviewerOutput(value) {
   if (value.required_next_actions !== undefined && !Array.isArray(value.required_next_actions)) {
     throw new Error("reviewer output required_next_actions must be an array");
   }
+  if (value.continuation_envelope !== undefined) {
+    if (!allowContinuationEnvelope) {
+      throw new Error("reviewer output continuation_envelope is not allowed for this invocation");
+    }
+    validateContinuationEnvelope(value.continuation_envelope);
+  }
   return {
     decision: value.decision,
     summary: value.summary,
     findings: value.findings,
     required_next_actions: value.required_next_actions || [],
+    ...(value.continuation_envelope ? { continuation_envelope: value.continuation_envelope } : {}),
   };
+}
+
+function continuationEnvelopeSchema() {
+  return {
+    allowed_paths: "non-empty string[]",
+    allowed_subject_elements: "non-empty string[]",
+    expected_closure_claim: "non-empty string",
+    required_checks: "non-empty string[]",
+    forbidden_effects: "non-empty string[]",
+  };
+}
+
+function validateContinuationEnvelope(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("continuation_envelope must be an object");
+  }
+  const fields = Object.keys(continuationEnvelopeSchema());
+  assertExactKeys(value, fields, "continuation_envelope");
+  for (const field of ["allowed_paths", "allowed_subject_elements", "required_checks", "forbidden_effects"]) {
+    if (!Array.isArray(value[field]) || value[field].length === 0 || value[field].some((item) => typeof item !== "string" || !item.trim())) {
+      throw new Error(`continuation_envelope.${field} must be a non-empty array of non-empty strings`);
+    }
+  }
+  if (typeof value.expected_closure_claim !== "string" || !value.expected_closure_claim.trim()) {
+    throw new Error("continuation_envelope.expected_closure_claim must be a non-empty string");
+  }
 }
 
 function validateReviewerFinding(finding) {
@@ -1607,6 +1775,7 @@ function normalizeReviewOutput(reviewerOutput, { policy, blockOn, reviewedInputs
     reviewed_inputs: reviewedInputs,
     reviewer_mechanism: reviewerMechanism || "claude-code",
     read_only: true,
+    ...(reviewerOutput.continuation_envelope ? { continuation_envelope: reviewerOutput.continuation_envelope } : {}),
   };
 }
 
@@ -1678,8 +1847,70 @@ function validateNormalizedResult(value) {
       }
     }
   }
+  validateReviewerMechanismEvidence(value.reviewer_mechanism);
+  if (value.continuation_envelope !== undefined) validateContinuationEnvelope(value.continuation_envelope);
   if (value.read_only !== true) throw new Error("normalized result read_only must be true");
   return value;
+}
+
+function validateReviewerMechanismEvidence(value) {
+  if (typeof value === "string") {
+    if (!value) throw new Error("normalized result reviewer_mechanism must not be empty");
+    return;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("normalized result reviewer_mechanism must be a string or reviewer mechanism evidence object");
+  }
+  assertExactKeys(value, ["schema_version", "mechanism", "status", "release_identity"], "reviewer_mechanism");
+  if (value.schema_version !== REVIEWER_MECHANISM_SCHEMA_VERSION) {
+    throw new Error(`reviewer_mechanism.schema_version must be ${REVIEWER_MECHANISM_SCHEMA_VERSION}`);
+  }
+  if (typeof value.mechanism !== "string" || !value.mechanism) throw new Error("reviewer_mechanism.mechanism is required");
+  if (!["completed", "failed"].includes(value.status)) throw new Error("reviewer_mechanism.status must be completed or failed");
+  validateReleaseIdentity(value.release_identity);
+}
+
+function validateReleaseIdentity(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("release_identity must be an object");
+  const fields = [
+    "schema_version", "semantic_tier", "reviewer", "provider", "model", "reasoning_effort", "adapter_version", "reviewer_cli_version",
+    "model_identity_evidence", "adapter_digest", "read_only_contract", "read_only_contract_digest", "prompt_contract_digest", "reviewer_output_schema_digest",
+    "finding_policy_digest", "operator_tier_configuration_digest", "release_digest",
+  ];
+  assertExactKeys(value, fields, "release_identity");
+  if (value.schema_version !== RELEASE_IDENTITY_SCHEMA_VERSION) throw new Error(`release_identity.schema_version must be ${RELEASE_IDENTITY_SCHEMA_VERSION}`);
+  assertSemanticTier(value.semantic_tier, "release_identity.semantic_tier");
+  assertReviewer(value.reviewer, "release_identity.reviewer");
+  const expectedModelEvidence = value.reviewer === "claude" ? "provider_reported" : "explicit_argv";
+  if (value.model_identity_evidence !== expectedModelEvidence) {
+    throw new Error(`release_identity.model_identity_evidence must be ${expectedModelEvidence} for ${value.reviewer}`);
+  }
+  if (!REASONING_EFFORTS.includes(value.reasoning_effort)) throw new Error("release_identity.reasoning_effort is invalid");
+  validateReadOnlyContract(value.read_only_contract, value.reviewer);
+  if (domainDigest("review-loop.read-only-contract.v1", value.read_only_contract) !== value.read_only_contract_digest) {
+    throw new Error("release_identity.read_only_contract_digest does not match its content");
+  }
+  for (const field of fields.filter((field) => !["schema_version", "semantic_tier", "reviewer", "reasoning_effort", "read_only_contract"].includes(field))) {
+    if (typeof value[field] !== "string" || !value[field]) throw new Error(`release_identity.${field} is required`);
+  }
+  const { release_digest: releaseDigest, ...identity } = value;
+  if (domainDigest(RELEASE_IDENTITY_SCHEMA_VERSION, identity) !== releaseDigest) {
+    throw new Error("release_identity.release_digest does not match its content");
+  }
+}
+
+function validateReadOnlyContract(value, reviewer) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("read_only_contract must be an object");
+  assertExactKeys(value, ["reviewer", "static_argv", "workspace_argv_template", "terminal_reviewer"], "read_only_contract");
+  if (value.reviewer !== reviewer) throw new Error("read_only_contract.reviewer must match release_identity.reviewer");
+  if (!Array.isArray(value.static_argv) || value.static_argv.some((arg) => typeof arg !== "string" || !arg)) {
+    throw new Error("read_only_contract.static_argv must be an array of non-empty strings");
+  }
+  const expectedWorkspaceArgs = reviewer === "codex" ? TIER_CODEX_WORKSPACE_ARG_TEMPLATE : null;
+  if (canonicalJson(value.workspace_argv_template) !== canonicalJson(expectedWorkspaceArgs)) {
+    throw new Error(`read_only_contract.workspace_argv_template is invalid for ${reviewer}`);
+  }
+  if (value.terminal_reviewer !== true) throw new Error("read_only_contract.terminal_reviewer must be true");
 }
 
 function maxFindingSeverity(findings) {
@@ -1717,6 +1948,12 @@ function assertReviewer(value, label) {
   }
 }
 
+function assertSemanticTier(value, label) {
+  if (!SEMANTIC_TIERS.includes(value)) {
+    throw new Error(`${label} must be one of: ${SEMANTIC_TIERS.join(", ")}`);
+  }
+}
+
 function assertHost(value, label) {
   if (!HOSTS.includes(value)) {
     throw new Error(`${label} must be one of: ${HOSTS.join(", ")}`);
@@ -1734,6 +1971,278 @@ function resolveReviewer(args = {}) {
     return host === "claude" ? "codex" : "claude";
   }
   return "claude";
+}
+
+function resolveReviewerSelection(args = {}) {
+  if (!args.tier) {
+    return {
+      qualified: false,
+      semanticTier: "legacy_unqualified",
+      reviewer: resolveReviewer(args),
+      releaseIdentity: null,
+    };
+  }
+  const config = loadTierConfig({ required: true });
+  const tier = config.value.tiers[args.tier];
+  if (!tier) {
+    throw new Error(`semantic tier ${args.tier} is not configured in ${config.path}`);
+  }
+  const releaseIdentity = buildReleaseIdentity(args.tier, tier, config);
+  return {
+    qualified: true,
+    semanticTier: args.tier,
+    reviewer: tier.reviewer,
+    model: tier.model,
+    reasoningEffort: tier.reasoning_effort,
+    releaseIdentity,
+  };
+}
+
+function reviewerCapabilities() {
+  const config = loadTierConfig({ required: false });
+  const tiers = {};
+  for (const semanticTier of SEMANTIC_TIERS) {
+    const configured = config?.value.tiers[semanticTier];
+    tiers[semanticTier] = configured
+      ? { configured: true, release_identity: buildReleaseIdentity(semanticTier, configured, config) }
+      : { configured: false };
+  }
+  const response = {
+    schema_version: CAPABILITY_SCHEMA_VERSION,
+    adapter_version: adapterVersion(),
+    semantic_tiers: [...SEMANTIC_TIERS, "legacy_unqualified"],
+    tier_configuration: config
+      ? { status: "configured", digest: config.digest }
+      : { status: "missing" },
+    tiers,
+    legacy_unqualified: {
+      available: true,
+      approval_authority: false,
+    },
+  };
+  return {
+    ...response,
+    capability_digest: domainDigest(CAPABILITY_SCHEMA_VERSION, response),
+  };
+}
+
+function loadTierConfig({ required }) {
+  const path = process.env.REVIEW_LOOP_TIER_CONFIG || join(stateRoot(), "reviewer-tiers.json");
+  if (!existsSync(path)) {
+    if (required) {
+      throw new Error(`reviewer tier configuration is missing: ${path}`);
+    }
+    return null;
+  }
+  let value;
+  try {
+    value = readJson(path);
+  } catch (error) {
+    throw new Error(`invalid reviewer tier configuration at ${path}: ${error.message}`);
+  }
+  validateTierConfig(value, path);
+  return {
+    path,
+    value,
+    digest: domainDigest(TIER_CONFIG_SCHEMA_VERSION, value),
+  };
+}
+
+function validateTierConfig(value, path) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`reviewer tier configuration at ${path} must be an object`);
+  }
+  assertExactKeys(value, ["schema_version", "tiers"], `reviewer tier configuration at ${path}`);
+  if (value.schema_version !== TIER_CONFIG_SCHEMA_VERSION) {
+    throw new Error(`reviewer tier configuration schema_version must be ${TIER_CONFIG_SCHEMA_VERSION}`);
+  }
+  if (!value.tiers || typeof value.tiers !== "object" || Array.isArray(value.tiers)) {
+    throw new Error("reviewer tier configuration tiers must be an object");
+  }
+  for (const [semanticTier, entry] of Object.entries(value.tiers)) {
+    assertSemanticTier(semanticTier, "configured semantic tier");
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`reviewer tier configuration ${semanticTier} must be an object`);
+    }
+    assertExactKeys(entry, ["reviewer", "model", "reasoning_effort"], `reviewer tier configuration ${semanticTier}`);
+    assertReviewer(entry.reviewer, `reviewer tier configuration ${semanticTier}.reviewer`);
+    if (typeof entry.model !== "string" || !entry.model.trim()) {
+      throw new Error(`reviewer tier configuration ${semanticTier}.model is required`);
+    }
+    if (isMutableModelAlias(entry.model)) {
+      throw new Error(`reviewer tier configuration ${semanticTier}.model must be an exact model identifier, not mutable alias ${entry.model}`);
+    }
+    if (!REASONING_EFFORTS.includes(entry.reasoning_effort)) {
+      throw new Error(`reviewer tier configuration ${semanticTier}.reasoning_effort must be one of: ${REASONING_EFFORTS.join(", ")}`);
+    }
+  }
+}
+
+function assertExactKeys(value, allowed, label) {
+  const allowedSet = new Set(allowed);
+  for (const key of Object.keys(value)) {
+    if (!allowedSet.has(key)) throw new Error(`${label} contains unknown key: ${key}`);
+  }
+  for (const key of allowed) {
+    if (!(key in value)) throw new Error(`${label} is missing required key: ${key}`);
+  }
+}
+
+function isMutableModelAlias(model) {
+  const normalized = model.trim().toLowerCase();
+  return ["opus", "sonnet", "haiku", "fable", "latest", "default"].includes(normalized)
+    || normalized.endsWith("-latest");
+}
+
+function buildReleaseIdentity(semanticTier, tier, config) {
+  assertSupportedReviewerProvider(tier.reviewer);
+  const provider = tier.reviewer === "codex" ? "openai" : "anthropic";
+  const selection = {
+    qualified: true,
+    reviewer: tier.reviewer,
+    model: tier.model,
+    reasoningEffort: tier.reasoning_effort,
+  };
+  const identity = {
+    schema_version: RELEASE_IDENTITY_SCHEMA_VERSION,
+    semantic_tier: semanticTier,
+    reviewer: tier.reviewer,
+    provider,
+    model: tier.model,
+    reasoning_effort: tier.reasoning_effort,
+    model_identity_evidence: tier.reviewer === "claude" ? "provider_reported" : "explicit_argv",
+    adapter_version: adapterVersion(),
+    reviewer_cli_version: reviewerCliVersion(tier.reviewer),
+    adapter_digest: adapterSourceDigest(),
+    read_only_contract: readOnlyContract(selection),
+    read_only_contract_digest: domainDigest("review-loop.read-only-contract.v1", readOnlyContract(selection)),
+    prompt_contract_digest: domainDigest("review-loop.prompt-contract.v1", {
+      generic_prompt: buildGenericPrompt.toString(),
+      continuation_envelope_schema: continuationEnvelopeSchema(),
+    }),
+    reviewer_output_schema_digest: domainDigest("review-loop.reviewer-output-schemas.v1", {
+      base: sha256(readFileSync(REVIEWER_OUTPUT_SCHEMA_PATH)),
+      continuation: sha256(readFileSync(REVIEWER_CONTINUATION_SCHEMA_PATH)),
+    }),
+    finding_policy_digest: domainDigest("review-loop.finding-policy.v1", {
+      normalize: normalizeReviewOutput.toString(),
+      blocking_reason: blockingReason.toString(),
+      severities: SEVERITIES,
+      default_block_on: DEFAULT_BLOCK_ON,
+    }),
+    operator_tier_configuration_digest: config.digest,
+  };
+  return {
+    ...identity,
+    release_digest: domainDigest(RELEASE_IDENTITY_SCHEMA_VERSION, identity),
+  };
+}
+
+function reviewerMechanismEvidence(selection, meta = {}) {
+  return {
+    schema_version: REVIEWER_MECHANISM_SCHEMA_VERSION,
+    mechanism: mechanismName(meta),
+    status: meta.failed ? "failed" : "completed",
+    release_identity: selection.releaseIdentity,
+  };
+}
+
+function tierReviewerStaticArgs(selection) {
+  if (selection.reviewer === "codex") {
+    return [
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--strict-config",
+      "--model", selection.model,
+      "--config", `model_reasoning_effort=${JSON.stringify(selection.reasoningEffort)}`,
+      "--config", "project_doc_max_bytes=0",
+      "--config", "project_doc_fallback_filenames=[]",
+      "--sandbox", "read-only",
+    ];
+  }
+  return [
+    "--safe-mode",
+    "--model", selection.model,
+    "--effort", selection.reasoningEffort,
+    "--no-session-persistence",
+    "--permission-mode", "plan",
+    "--tools", "Read,Grep,Glob",
+  ];
+}
+
+function readOnlyContract(selection) {
+  return {
+    reviewer: selection.reviewer,
+    static_argv: tierReviewerStaticArgs(selection),
+    workspace_argv_template: selection.reviewer === "codex" ? TIER_CODEX_WORKSPACE_ARG_TEMPLATE : null,
+    terminal_reviewer: true,
+  };
+}
+
+function tierCodexNeutralRoot() {
+  const root = join(stateRoot(), "codex-tier-reviewer-root");
+  mkdirSync(root, { recursive: true });
+  return root;
+}
+
+function tierCodexWorkspaceArgs(repoRoot) {
+  const neutralRoot = tierCodexNeutralRoot();
+  return TIER_CODEX_WORKSPACE_ARG_TEMPLATE.map((arg) => {
+    if (arg === CODEX_NEUTRAL_ROOT_TOKEN) return neutralRoot;
+    if (arg === CODEX_REPOSITORY_ROOT_TOKEN) return repoRoot;
+    return arg;
+  });
+}
+
+function adapterSourceDigest() {
+  const sources = {
+    companion: sha256(readFileSync(fileURLToPath(import.meta.url))),
+    run_wrapper: sha256(readFileSync(join(ROOT, "scripts", "bin", "review-loop.mjs"))),
+  };
+  return domainDigest("review-loop.adapter-source.v1", sources);
+}
+
+function adapterVersion() {
+  return readJson(join(ROOT, ".codex-plugin", "plugin.json")).version;
+}
+
+function reviewerCliVersion(reviewer) {
+  const bin = reviewer === "codex" ? codexBin() : claudeBin();
+  const result = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 10_000 });
+  if (result.error) throw new Error(`${reviewer} reviewer CLI version probe failed: ${result.error.message}`);
+  if (result.status !== 0) {
+    throw new Error(`${reviewer} reviewer CLI version probe failed with exit ${result.status}: ${redact(result.stderr || result.stdout)}`);
+  }
+  const version = String(result.stdout || result.stderr || "").trim();
+  if (!version) throw new Error(`${reviewer} reviewer CLI version probe returned no version`);
+  return version;
+}
+
+function assertSupportedReviewerProvider(reviewer) {
+  if (reviewer !== "claude") return;
+  const active = CLAUDE_ALTERNATE_BACKEND_FLAGS.filter((name) => environmentFlagEnabled(process.env[name]));
+  if (active.length) {
+    throw new Error(`claude reviewer tier does not support alternate backend configuration: ${active.join(", ")}`);
+  }
+}
+
+function environmentFlagEnabled(value) {
+  if (typeof value !== "string" || !value.trim()) return false;
+  return !["0", "false", "no", "off"].includes(value.trim().toLowerCase());
+}
+
+function domainDigest(domain, value) {
+  return sha256(`${domain}\0${canonicalJson(value)}`);
+}
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
 }
 
 function resolveFallbackReviewer(primaryReviewer) {
