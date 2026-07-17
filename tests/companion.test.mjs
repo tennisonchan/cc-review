@@ -267,7 +267,7 @@ test("capabilities reads its adapter version from a packaged plugin manifest", (
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).adapter_version, "0.5.2");
+  assert.equal(JSON.parse(result.stdout).adapter_version, "0.5.3");
 });
 
 test("capabilities resolves configured tiers to deterministic exact release identities", () => {
@@ -2029,11 +2029,11 @@ test("guidelines policy drives category-aware blocking", () => {
   assert.equal(JSON.parse(secBlock.stdout).decision, "block");
   assert.match(JSON.parse(secBlock.stdout).reason, /Leaky/);
 
-  // A high-severity style finding never blocks.
+  // An explicit category exemption overrides severity and reviewer disposition.
   writeFileSync(join(repo, "file.txt"), "style change\n");
-  const styleEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: decisionWith([
-    { id: "style1", severity: "high", category: "style", location: "file.txt:1", summary: "Ugly.", required_action: "Prettify." },
-  ]) };
+  const styleEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+    finding({ id: "style1", severity: "high", category: "style", locations: ["file.txt:1"], message: "Ugly.", required_action: "Prettify." }),
+  ])) };
   const styleAllow = run(["gate", "--json"], { cwd: repo, env: styleEnv, input: '{"turn_id":"style"}' });
   assert.deepEqual(JSON.parse(styleAllow.stdout), {});
 

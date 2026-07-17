@@ -1802,10 +1802,10 @@ function normalizeFinding(finding) {
 }
 
 function blockingReason(finding, policy, blockOn) {
-  if (finding.reviewer_disposition === "blocking") return "reviewer";
   const categoryThreshold = finding.category ? policy.categories[finding.category] : undefined;
+  if (categoryThreshold === "never") return null;
+  if (finding.reviewer_disposition === "blocking") return "reviewer";
   const threshold = categoryThreshold !== undefined ? categoryThreshold : blockOn;
-  if (threshold === "never") return null;
   if (SEVERITIES.indexOf(finding.severity) >= SEVERITIES.indexOf(threshold)) {
     if (categoryThreshold !== undefined) return "category_policy";
     return policy.hasPolicy ? "severity_policy" : "fallback_threshold";
