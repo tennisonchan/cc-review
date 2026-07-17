@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.3
+
+- An explicit `category_block_on: "never"` policy is now a hard exemption even when the reviewer marks the finding blocking, preserving deterministic caller policy precedence.
+
 ## 0.5.2
 
 - A concrete correctness, compatibility, safety, or data-loss regression that must be fixed before finalization now remains blocking at its evidence-supported severity. Reviewers no longer downgrade such findings merely because the machine policy threshold would not independently promote them.
