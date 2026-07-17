@@ -1,6 +1,6 @@
 {
   "name": "review-loop",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Run structured, policy-aware review loops from Claude Code.",
   "author": {
     "name": "Tennison Chan"

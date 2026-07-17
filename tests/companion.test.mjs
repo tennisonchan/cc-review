@@ -120,7 +120,11 @@ process.stdin.on("end", () => {
   assert.equal(result.status, 0, result.stderr);
   const argv = JSON.parse(readFileSync(argvFile, "utf8"));
   assert.deepEqual(argv.slice(0, 5), ["-p", "--permission-mode", "plan", "--tools", "Read,Grep,Glob"]);
-  assert.match(readFileSync(stdinFile, "utf8"), /You are Claude Code acting as a read-only independent reviewer/);
+  const prompt = readFileSync(stdinFile, "utf8");
+  assert.match(prompt, /You are Claude Code acting as a read-only independent reviewer/);
+  assert.match(prompt, /deleted, renamed, or moved externally reachable contracts/);
+  assert.match(prompt, /retained identity or state is re-scoped or reset/);
+  assert.match(prompt, /shared components preserve established behavioral defaults/);
   assert.doesNotMatch(JSON.stringify(argv), /You are Claude Code/);
   // claude --json-schema silently drops structured output when the schema
   // carries a $schema meta key; the companion must strip it.
@@ -179,7 +183,11 @@ process.stdin.on("end", () => {
   const envCapture = JSON.parse(readFileSync(envFile, "utf8"));
   assert.equal(envCapture.terminalReviewer, "1");
   assert.equal(envCapture.fallbackToken, "");
-  assert.match(readFileSync(stdinFile, "utf8"), /You are Codex acting as a read-only independent reviewer/);
+  const prompt = readFileSync(stdinFile, "utf8");
+  assert.match(prompt, /You are Codex acting as a read-only independent reviewer/);
+  assert.match(prompt, /deleted, renamed, or moved externally reachable contracts/);
+  assert.match(prompt, /retained identity or state is re-scoped or reset/);
+  assert.match(prompt, /shared components preserve established behavioral defaults/);
 });
 
 test("reviewer selection honors host defaults, explicit override, and validation", () => {
@@ -255,7 +263,7 @@ test("capabilities reads its adapter version from a packaged plugin manifest", (
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).adapter_version, "0.5.0");
+  assert.equal(JSON.parse(result.stdout).adapter_version, "0.5.1");
 });
 
 test("capabilities resolves configured tiers to deterministic exact release identities", () => {
@@ -1711,7 +1719,11 @@ process.stdin.on("end", () => {
   assert.ok(argv.includes("--output-schema"));
   assert.ok(argv.includes("--output-last-message"));
   assert.match(JSON.parse(readFileSync(envFile, "utf8")).fallbackToken, /^[0-9a-f-]{36}$/i);
-  assert.match(readFileSync(stdinFile, "utf8"), /degraded fallback reviewer/);
+  const prompt = readFileSync(stdinFile, "utf8");
+  assert.match(prompt, /degraded fallback reviewer/);
+  assert.match(prompt, /deleted, renamed, or moved externally reachable contracts/);
+  assert.match(prompt, /retained identity or state is re-scoped or reset/);
+  assert.match(prompt, /shared components preserve established behavioral defaults/);
 });
 
 test("gate invokes Claude fallback with terminal env and backend-specific prompt", () => {
@@ -1758,6 +1770,9 @@ process.stdin.on("end", () => {
   const prompt = readFileSync(stdinFile, "utf8");
   assert.match(prompt, /Claude Code acting as a degraded fallback reviewer/);
   assert.match(prompt, /primary Codex reviewer is unavailable/);
+  assert.match(prompt, /deleted, renamed, or moved externally reachable contracts/);
+  assert.match(prompt, /retained identity or state is re-scoped or reset/);
+  assert.match(prompt, /shared components preserve established behavioral defaults/);
 });
 
 test("gate prunes expired fallback sentinels before creating a new one", () => {

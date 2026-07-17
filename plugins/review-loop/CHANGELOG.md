@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.1
+
+- Strengthened the shared reviewer contract to trace externally reachable compatibility, stale retained identity across scope changes, and shared-component behavior. The same mechanism checks now apply to every reviewer provider and semantic tier.
+
 ## 0.5.0
 
 - Added provider-independent `fast`, `standard`, and `strong` reviewer tiers backed by strict operator-owned configuration, a machine-readable capability response, exact model/reasoning argv, and digest-bound release identity evidence. Tiered runs fail closed without cross-provider fallback; Claude runs additionally reject provider-reported model drift. Legacy untiered behavior remains available but unqualified.
