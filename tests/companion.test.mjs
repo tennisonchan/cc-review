@@ -125,6 +125,8 @@ process.stdin.on("end", () => {
   assert.match(prompt, /deleted, renamed, or moved externally reachable contracts/);
   assert.match(prompt, /retained identity or state is re-scoped or reset/);
   assert.match(prompt, /shared components preserve established behavioral defaults/);
+  assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
+  assert.match(prompt, /blocking at the evidence-supported severity/);
   assert.doesNotMatch(JSON.stringify(argv), /You are Claude Code/);
   // claude --json-schema silently drops structured output when the schema
   // carries a $schema meta key; the companion must strip it.
@@ -188,6 +190,8 @@ process.stdin.on("end", () => {
   assert.match(prompt, /deleted, renamed, or moved externally reachable contracts/);
   assert.match(prompt, /retained identity or state is re-scoped or reset/);
   assert.match(prompt, /shared components preserve established behavioral defaults/);
+  assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
+  assert.match(prompt, /blocking at the evidence-supported severity/);
 });
 
 test("reviewer selection honors host defaults, explicit override, and validation", () => {
@@ -263,7 +267,7 @@ test("capabilities reads its adapter version from a packaged plugin manifest", (
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).adapter_version, "0.5.1");
+  assert.equal(JSON.parse(result.stdout).adapter_version, "0.5.2");
 });
 
 test("capabilities resolves configured tiers to deterministic exact release identities", () => {
@@ -1724,6 +1728,8 @@ process.stdin.on("end", () => {
   assert.match(prompt, /deleted, renamed, or moved externally reachable contracts/);
   assert.match(prompt, /retained identity or state is re-scoped or reset/);
   assert.match(prompt, /shared components preserve established behavioral defaults/);
+  assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
+  assert.match(prompt, /blocking at the evidence-supported severity/);
 });
 
 test("gate invokes Claude fallback with terminal env and backend-specific prompt", () => {
@@ -1773,6 +1779,8 @@ process.stdin.on("end", () => {
   assert.match(prompt, /deleted, renamed, or moved externally reachable contracts/);
   assert.match(prompt, /retained identity or state is re-scoped or reset/);
   assert.match(prompt, /shared components preserve established behavioral defaults/);
+  assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
+  assert.match(prompt, /blocking at the evidence-supported severity/);
 });
 
 test("gate prunes expired fallback sentinels before creating a new one", () => {

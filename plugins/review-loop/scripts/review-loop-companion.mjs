@@ -47,6 +47,7 @@ const REVIEW_MECHANISM_CHECKS = [
   "- For deleted, renamed, or moved externally reachable contracts, trace compatibility across legacy routes, aliases, identifiers, persisted data, and inbound consumers; internally consistent generated artifacts do not prove continuity.",
   "- When the active entity or selection changes, verify retained identity or state is re-scoped or reset before any read or write that depends on the new scope.",
   "- Verify shared components preserve established behavioral defaults and consumer-sensitive layout, positioning, validation, and interaction semantics unless the change intentionally migrates every affected consumer.",
+  "- A concrete correctness, compatibility, safety, or data-loss regression that requires remediation before finalization is blocking at the evidence-supported severity; do not inflate severity or downgrade reviewer_disposition to fit a machine threshold.",
 ];
 const TEXT_EXTENSIONS = new Set([
   ".c", ".cc", ".cpp", ".cs", ".css", ".go", ".h", ".hpp", ".html", ".java",
@@ -861,7 +862,7 @@ function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewe
     "Fallback rubric when caller guidance is incomplete:",
     "- Review for correctness, safety/security, maintainability, scope fit, evidence gaps, test gaps, documentation gaps, and unclear context.",
     ...REVIEW_MECHANISM_CHECKS,
-    "- High severity findings block by default; lower severity findings are advisory unless machine-readable policy promotes them.",
+    "- Findings that do not require remediation before finalization are advisory unless machine-readable policy promotes them.",
     "",
     "Caller guidelines:",
     guidelines.content,
