@@ -129,7 +129,10 @@ a qualified `--tier`, exactly one immutable `--artifact` packet, and explicit
 `--scope none`. The subject digest must equal the packet's actual SHA-256;
 content substitution therefore fails before reviewer launch. Review Loop also
 validates the envelope schema, digest, expiry, attempt ordinal, and selected
-isolation-profile digest. It then performs exactly one invocation and returns a
+isolation-profile digest. Authoritative mode rejects `--focus`, `--counter`,
+`--guidelines`, and positional reviewer instructions, and ignores discovered
+project/user guidance in favor of fixed adapter-owned instructions covered by
+the adapter release digest. It then performs exactly one invocation and returns a
 `review-loop.transaction-result.v1` object:
 
 - `outcome: decision` means the complete reviewer result was schema-valid and

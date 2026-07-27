@@ -39,7 +39,8 @@ Common arguments; append `--help` to the `run` command before using advanced rev
 Agent Kernel may provide `--authorization <path> --subject-digest <sha256>`
 with a qualified `--tier`, one immutable `--artifact` packet, and explicit
 `--scope none`; the subject digest must equal the packet SHA-256. In that mode,
-do not add `--background`,
+do not add caller/project reviewer instructions such as `--focus`, `--counter`,
+`--guidelines`, or positional text, and do not add `--background`,
 `--continuation-envelope`, or `--on-reviewer-failure allow`. Review Loop
 validates the envelope, executes exactly once without cache or fallback, and
 emits `decision`, `unavailable`, or `unparseable` transaction evidence. Kernel,

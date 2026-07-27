@@ -11,6 +11,8 @@
 - Bind the authorization subject to the immutable packet bytes, classify
   returned invalid envelopes separately from transport failures, and enforce
   ephemeral qualified Codex sessions.
+- Exclude unbound caller, project, and user reviewer instructions from
+  authoritative packet-only transactions.
 - Keep direct advisory review behavior compatible while authoritative mode
   bypasses cache, fallback, background, continuation, and fail-open paths.
 

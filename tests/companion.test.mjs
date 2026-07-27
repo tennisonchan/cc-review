@@ -416,6 +416,8 @@ test("authoritative transaction invokes exactly once and emits derived isolation
   runGit(["add", "file.txt"], repo);
   runGit(["commit", "-m", "init"], repo);
   const packet = writeAuthoritativePacket(repo, "review the exact implementation subject");
+  mkdirSync(join(repo, ".review-loop"), { recursive: true });
+  writeFileSync(join(repo, ".review-loop", "review-guidelines.md"), "PROJECT INSTRUCTION MUST NOT LOAD\n");
   const env = testEnv(repo);
   env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
     strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
@@ -442,6 +444,7 @@ test("authoritative transaction invokes exactly once and emits derived isolation
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.ok, false);
+  assert.equal(parsed.guidelines.source, "authoritative-runtime");
   assert.equal(parsed.result.decision, "changes_requested");
   assert.equal(parsed.transaction.outcome, "decision");
   assert.equal(parsed.transaction.invocation_count, 1);
@@ -503,6 +506,30 @@ test("authoritative transaction rejects invalid bindings before reviewer launch"
     ], { cwd: repo, env });
     assert.notEqual(result.status, 0, `${item.name}: ${result.stdout}`);
     assert.match(result.stderr, item.pattern);
+    assert.doesNotMatch(result.stderr, /reviewer must not launch/);
+  }
+  for (const [name, extraArgs] of [
+    ["focus", ["--focus", "unbound focus"]],
+    ["counter", ["--counter"]],
+    ["guidelines", ["--guidelines", packet.path]],
+    ["positional", ["unbound positional instruction"]],
+  ]) {
+    const authorization = writeAuthorization(repo, env, {
+      task_id: "task-1",
+      gate: "execution",
+      subject_digest: packet.digest,
+      attempt_ordinal: 1,
+      tier: "strong",
+    }, `authorization-instruction-${name}.json`);
+    const result = run([
+      "run", "--scope", "none", "--artifact", packet.path, "--tier", "strong",
+      "--authorization", authorization.path,
+      "--subject-digest", packet.digest,
+      ...extraArgs,
+      "--json",
+    ], { cwd: repo, env });
+    assert.notEqual(result.status, 0, `${name}: ${result.stdout}`);
+    assert.match(result.stderr, /authoritative review does not accept caller or project instructions/);
     assert.doesNotMatch(result.stderr, /reviewer must not launch/);
   }
 });
