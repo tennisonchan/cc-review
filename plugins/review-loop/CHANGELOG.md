@@ -8,6 +8,9 @@
   decision, unavailable, and unparseable outcomes.
 - Derive versioned isolation evidence from qualified release identity and emit
   hashed provider-native reviewer session identity.
+- Bind the authorization subject to the immutable packet bytes, classify
+  returned invalid envelopes separately from transport failures, and enforce
+  ephemeral qualified Codex sessions.
 - Keep direct advisory review behavior compatible while authoritative mode
   bypasses cache, fallback, background, continuation, and fail-open paths.
 

@@ -87,6 +87,14 @@ class ReviewToolFailure extends Error {
   }
 }
 
+class ReviewerEnvelopeFailure extends Error {
+  constructor(message, content) {
+    super(message);
+    this.name = "ReviewerEnvelopeFailure";
+    this.contentDigest = domainDigest("review-loop.reviewer-envelope.v1", content);
+  }
+}
+
 // Auto-run only when executed directly (node review-loop-companion.mjs ...);
 // the bin alias wrappers import runMain and prepend their subcommand.
 const invokedDirectly = (() => {
@@ -697,6 +705,10 @@ async function runAuthoritativeReview({ args, repo, guidelines, policy, inputs, 
     subjectDigest: args.subjectDigest,
     isolationProfileDigest: selection.isolationProfile.profile_digest,
   });
+  const reviewedInputDigest = authoritativeReviewedInputDigest(args, inputs);
+  if (reviewedInputDigest !== authorization.subject_digest) {
+    throw new Error("reviewed input digest mismatch");
+  }
   const reviewContextId = randomUUID();
   const transactionBase = {
     schema_version: TRANSACTION_RESULT_SCHEMA_VERSION,
@@ -712,6 +724,7 @@ async function runAuthoritativeReview({ args, repo, guidelines, policy, inputs, 
       authorization_digest: authorization.authorization_digest,
     },
     review_context_id: reviewContextId,
+    reviewed_input_digest: reviewedInputDigest,
     isolation_profile: selection.isolationProfile,
     invocation_count: 1,
   };
@@ -725,7 +738,28 @@ async function runAuthoritativeReview({ args, repo, guidelines, policy, inputs, 
       tierSelection: selection,
       fakeErrorEnv: "REVIEW_LOOP_FAKE_ERROR",
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof ReviewerEnvelopeFailure) {
+      return {
+        ok: false,
+        repo: repo.root,
+        guidelines: summarizeGuidelines(guidelines),
+        result: null,
+        raw: "",
+        transaction: validateTransactionResult({
+          ...transactionBase,
+          outcome: "unparseable",
+          reviewer_identity: null,
+          transport: {
+            status: "completed",
+          },
+          envelope: {
+            status: "invalid",
+            content_digest: error.contentDigest,
+          },
+        }),
+      };
+    }
     return {
       ok: false,
       repo: repo.root,
@@ -736,6 +770,16 @@ async function runAuthoritativeReview({ args, repo, guidelines, policy, inputs, 
         ...transactionBase,
         outcome: "unavailable",
         reviewer_identity: null,
+        transport: {
+          status: "failed",
+          diagnostic_digest: domainDigest("review-loop.transport-diagnostic.v1", {
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        },
+        envelope: {
+          status: "absent",
+          content_digest: null,
+        },
       }),
     };
   }
@@ -763,6 +807,13 @@ async function runAuthoritativeReview({ args, repo, guidelines, policy, inputs, 
         ...transactionBase,
         outcome: "unparseable",
         reviewer_identity: null,
+        transport: {
+          status: "completed",
+        },
+        envelope: {
+          status: "invalid",
+          content_digest: domainDigest("review-loop.reviewer-envelope.v1", reviewerResult.structuredOutput),
+        },
       }),
     };
   }
@@ -778,8 +829,27 @@ async function runAuthoritativeReview({ args, repo, guidelines, policy, inputs, 
       ...transactionBase,
       outcome: "decision",
       reviewer_identity: reviewerIdentity,
+      transport: {
+        status: "completed",
+      },
+      envelope: {
+        status: "valid",
+        content_digest: domainDigest("review-loop.reviewer-envelope.v1", reviewerResult.structuredOutput),
+      },
     }),
   };
+}
+
+function authoritativeReviewedInputDigest(args, inputs) {
+  const artifacts = inputs.reviewed_inputs.filter((entry) => entry.kind === "artifact");
+  const scopes = inputs.reviewed_inputs.filter((entry) => entry.kind === "scope");
+  if (!args.artifact || args.context || artifacts.length !== 1
+      || !args.scopeExplicit || args.scope !== "none"
+      || scopes.length !== 1 || scopes[0].scope !== "none") {
+    throw new Error("authoritative review requires exactly one --artifact packet with explicit --scope none");
+  }
+  assertSha256(artifacts[0].hash, "authoritative reviewed input digest");
+  return artifacts[0].hash;
 }
 
 function readAndValidateAuthorization(path, { subjectDigest, isolationProfileDigest }) {
@@ -849,6 +919,16 @@ function validateTransactionResult(value) {
     throw new Error("transaction outcome must be decision, unavailable, or unparseable");
   }
   if (value.invocation_count !== 1) throw new Error("transaction invocation_count must be 1");
+  assertSha256(value.reviewed_input_digest, "transaction reviewed_input_digest");
+  if (value.reviewed_input_digest !== value.authorization?.subject_digest) {
+    throw new Error("transaction reviewed_input_digest must match authorization subject_digest");
+  }
+  if (!value.transport || !["completed", "failed"].includes(value.transport.status)) {
+    throw new Error("transaction transport status must be completed or failed");
+  }
+  if (!value.envelope || !["valid", "invalid", "absent"].includes(value.envelope.status)) {
+    throw new Error("transaction envelope status must be valid, invalid, or absent");
+  }
   if (!value.authorization || typeof value.authorization !== "object" || Array.isArray(value.authorization)) {
     throw new Error("transaction authorization is required");
   }
@@ -948,7 +1028,15 @@ function runCodexReviewerPrimitive(prompt, options) {
     throw new Error(process.env[options.fakeErrorEnv]);
   }
   if (process.env[options.fakeOutputEnv]) {
-    const structuredOutput = JSON.parse(process.env[options.fakeOutputEnv]);
+    let structuredOutput;
+    try {
+      structuredOutput = JSON.parse(process.env[options.fakeOutputEnv]);
+    } catch (error) {
+      throw new ReviewerEnvelopeFailure(
+        `${options.failureLabel} structured output was not JSON: ${error.message}`,
+        process.env[options.fakeOutputEnv],
+      );
+    }
     return {
       structuredOutput,
       resultText: "",
@@ -1002,7 +1090,10 @@ function runCodexReviewerPrimitive(prompt, options) {
   try {
     parsed = JSON.parse(readFileSync(outPath, "utf8"));
   } catch (error) {
-    throw new Error(`${options.failureLabel} structured output was not JSON: ${error.message}`);
+    throw new ReviewerEnvelopeFailure(
+      `${options.failureLabel} structured output was not JSON: ${error.message}`,
+      readFileSync(outPath, "utf8"),
+    );
   }
   return {
     structuredOutput: parsed,
@@ -1137,7 +1228,15 @@ async function runClaudeReviewer(prompt, options = {}) {
   }
   const fakeOutputEnv = options.fakeOutputEnv || "REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT";
   if (process.env[fakeOutputEnv]) {
-    const structuredOutput = JSON.parse(process.env[fakeOutputEnv]);
+    let structuredOutput;
+    try {
+      structuredOutput = JSON.parse(process.env[fakeOutputEnv]);
+    } catch (error) {
+      throw new ReviewerEnvelopeFailure(
+        `claude structured output was not JSON: ${error.message}`,
+        process.env[fakeOutputEnv],
+      );
+    }
     const meta = {
       fake: true,
       session_id: process.env.REVIEW_LOOP_FAKE_CLAUDE_SESSION_ID || null,
@@ -1236,17 +1335,24 @@ async function runClaudeReviewer(prompt, options = {}) {
   try {
     envelope = JSON.parse(stdout);
   } catch {
-    throw new Error(`claude structured output was not JSON: ${redact(stdout.slice(0, 500))}`);
+    throw new ReviewerEnvelopeFailure(
+      `claude structured output was not JSON: ${redact(stdout.slice(0, 500))}`,
+      stdout,
+    );
   }
 
   if (envelope.is_error) {
     throw new Error(`claude reported an error: ${redact(envelope.result || envelope.subtype || "unknown")}`);
   }
   if (!envelope.structured_output) {
-    throw new Error("claude JSON envelope did not include structured_output");
+    throw new ReviewerEnvelopeFailure("claude JSON envelope did not include structured_output", envelope);
   }
   if (options.tierSelection?.qualified) {
-    assertClaudeResolvedModel(envelope, options.tierSelection.model);
+    try {
+      assertClaudeResolvedModel(envelope, options.tierSelection.model);
+    } catch (error) {
+      throw new ReviewerEnvelopeFailure(error.message, envelope);
+    }
   }
 
   return {
@@ -2422,6 +2528,7 @@ function reviewerMechanismEvidence(selection, meta = {}) {
 function tierReviewerStaticArgs(selection) {
   if (selection.reviewer === "codex") {
     return [
+      "--ephemeral",
       "--ignore-user-config",
       "--ignore-rules",
       "--strict-config",

@@ -46,6 +46,9 @@ test("authoritative transaction schemas bind one invocation to derived isolation
   assert.ok(authorizationSchema.required.includes("isolation_profile_digest"));
   assert.deepEqual(transactionSchema.properties.outcome.enum, ["decision", "unavailable", "unparseable"]);
   assert.equal(transactionSchema.properties.invocation_count.const, 1);
+  assert.ok(transactionSchema.required.includes("reviewed_input_digest"));
+  assert.equal(transactionSchema.properties.transport.oneOf[0].properties.status.const, "completed");
+  assert.deepEqual(transactionSchema.properties.envelope.oneOf[0].properties.status.enum, ["valid", "invalid"]);
   assert.equal(transactionSchema.properties.isolation_profile.properties.fresh_context.const, true);
   assert.equal(transactionSchema.properties.isolation_profile.properties.resume_allowed.const, false);
   assert.equal(transactionSchema.properties.isolation_profile.properties.history_persistence.const, false);

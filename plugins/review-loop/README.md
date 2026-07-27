@@ -125,9 +125,11 @@ Kernel authorization; it is not a parallel profile registry.
 ### Agent Kernel-authorized transactions
 
 Agent Kernel may supply `--authorization <path> --subject-digest <sha256>` with
-a qualified `--tier`. Review Loop validates the envelope schema, digest,
-subject, expiry, attempt ordinal, and selected isolation-profile digest before
-launch. It then performs exactly one invocation and returns a
+a qualified `--tier`, exactly one immutable `--artifact` packet, and explicit
+`--scope none`. The subject digest must equal the packet's actual SHA-256;
+content substitution therefore fails before reviewer launch. Review Loop also
+validates the envelope schema, digest, expiry, attempt ordinal, and selected
+isolation-profile digest. It then performs exactly one invocation and returns a
 `review-loop.transaction-result.v1` object:
 
 - `outcome: decision` means the complete reviewer result was schema-valid and
@@ -139,8 +141,12 @@ launch. It then performs exactly one invocation and returns a
 
 The transaction includes the authorization identity, a fresh
 `review_context_id`, the derived isolation profile, exactly
-`invocation_count: 1`, and a digest of the provider-reported native reviewer
-session ID. Raw provider session IDs are not emitted. Review Loop deliberately
+`invocation_count: 1`, the producer-computed `reviewed_input_digest`, separate
+transport and envelope validity evidence, and a digest of the provider-reported
+native reviewer session ID. Qualified Codex runs include `--ephemeral`, so the
+no-history-persistence claim is enforced by the exact digest-bound launch argv.
+Raw diagnostics,
+invalid reviewer prose, and provider session IDs are not emitted. Review Loop deliberately
 does not persist a replay ledger: Agent Kernel rejects consumed authorizations,
 owns the retry budget and recovery generation, and decides whether the emitted
 evidence is admissible.

@@ -8,8 +8,11 @@
     "authorization",
     "outcome",
     "review_context_id",
+    "reviewed_input_digest",
     "isolation_profile",
     "reviewer_identity",
+    "transport",
+    "envelope",
     "invocation_count"
   ],
   "properties": {
@@ -49,6 +52,7 @@
       "type": "string",
       "format": "uuid"
     },
+    "reviewed_input_digest": { "$ref": "#/$defs/sha256" },
     "isolation_profile": {
       "type": "object",
       "additionalProperties": false,
@@ -94,6 +98,49 @@
             "provider": { "enum": ["anthropic", "openai"] },
             "signal": { "const": "provider_reported_session_id" },
             "session_id_digest": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      ]
+    },
+    "transport": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {
+            "status": { "const": "completed" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "diagnostic_digest"],
+          "properties": {
+            "status": { "const": "failed" },
+            "diagnostic_digest": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      ]
+    },
+    "envelope": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "content_digest"],
+          "properties": {
+            "status": { "enum": ["valid", "invalid"] },
+            "content_digest": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "content_digest"],
+          "properties": {
+            "status": { "const": "absent" },
+            "content_digest": { "type": "null" }
           }
         }
       ]
