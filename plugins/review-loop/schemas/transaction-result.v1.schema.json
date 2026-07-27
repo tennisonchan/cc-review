@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Review Loop Authoritative Transaction Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "authorization",
+    "outcome",
+    "review_context_id",
+    "reviewed_input_digest",
+    "isolation_profile",
+    "reviewer_identity",
+    "transport",
+    "envelope",
+    "invocation_count"
+  ],
+  "properties": {
+    "schema_version": { "const": "review-loop.transaction-result.v1" },
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "authorization_id",
+        "task_id",
+        "gate",
+        "subject_digest",
+        "policy_version",
+        "isolation_profile_digest",
+        "attempt_ordinal",
+        "authorization_digest"
+      ],
+      "properties": {
+        "schema_version": { "const": "review-loop.authorization.v1" },
+        "authorization_id": { "type": "string", "minLength": 1 },
+        "task_id": { "type": "string", "minLength": 1 },
+        "gate": {
+          "enum": ["design", "execution", "merge", "delivery_validation", "audit"]
+        },
+        "subject_digest": { "$ref": "#/$defs/sha256" },
+        "policy_version": { "type": "string", "minLength": 1 },
+        "isolation_profile_digest": { "$ref": "#/$defs/sha256" },
+        "attempt_ordinal": { "type": "integer", "minimum": 1 },
+        "authorization_digest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "outcome": {
+      "enum": ["decision", "unavailable", "unparseable"]
+    },
+    "review_context_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "reviewed_input_digest": { "$ref": "#/$defs/sha256" },
+    "isolation_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "profile_id",
+        "reviewer",
+        "provider",
+        "release_digest",
+        "read_only_contract_digest",
+        "transaction_contract_digest",
+        "fresh_context",
+        "resume_allowed",
+        "history_persistence",
+        "packet_only",
+        "terminal_reviewer",
+        "profile_digest"
+      ],
+      "properties": {
+        "schema_version": { "const": "review-loop.isolation-profile.v1" },
+        "profile_id": { "type": "string", "minLength": 1 },
+        "reviewer": { "enum": ["claude", "codex"] },
+        "provider": { "enum": ["anthropic", "openai"] },
+        "release_digest": { "$ref": "#/$defs/sha256" },
+        "read_only_contract_digest": { "$ref": "#/$defs/sha256" },
+        "transaction_contract_digest": { "$ref": "#/$defs/sha256" },
+        "fresh_context": { "const": true },
+        "resume_allowed": { "const": false },
+        "history_persistence": { "const": false },
+        "packet_only": { "const": true },
+        "terminal_reviewer": { "const": true },
+        "profile_digest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "reviewer_identity": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provider", "signal", "session_id_digest"],
+          "properties": {
+            "provider": { "enum": ["anthropic", "openai"] },
+            "signal": { "const": "provider_reported_session_id" },
+            "session_id_digest": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      ]
+    },
+    "transport": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {
+            "status": { "const": "completed" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "diagnostic_digest"],
+          "properties": {
+            "status": { "const": "failed" },
+            "diagnostic_digest": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      ]
+    },
+    "envelope": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "content_digest"],
+          "properties": {
+            "status": { "enum": ["valid", "invalid"] },
+            "content_digest": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "content_digest"],
+          "properties": {
+            "status": { "const": "absent" },
+            "content_digest": { "type": "null" }
+          }
+        }
+      ]
+    },
+    "invocation_count": { "const": 1 }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { cpSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, readdirSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -267,7 +268,7 @@ test("capabilities reads its adapter version from a packaged plugin manifest", (
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).adapter_version, "0.5.3");
+  assert.equal(JSON.parse(result.stdout).adapter_version, "0.6.0");
 });
 
 test("capabilities resolves configured tiers to deterministic exact release identities", () => {
@@ -382,8 +383,8 @@ fs.writeFileSync(out, JSON.stringify({ decision: "approved", summary: "ok", find
   const argv = JSON.parse(readFileSync(argvFile, "utf8"));
   const contract = parsed.result.reviewer_mechanism.release_identity.read_only_contract;
   assert.deepEqual(argv.slice(1, 1 + contract.static_argv.length), contract.static_argv);
-  assert.deepEqual(argv.slice(0, 14), [
-    "exec", "--ignore-user-config", "--ignore-rules", "--strict-config", "--model", "gpt-5.6-luna-20260701",
+  assert.deepEqual(argv.slice(0, 15), [
+    "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--strict-config", "--model", "gpt-5.6-luna-20260701",
     "--config", 'model_reasoning_effort="medium"',
     "--config", "project_doc_max_bytes=0",
     "--config", "project_doc_fallback_filenames=[]",
@@ -407,6 +408,328 @@ fs.writeFileSync(out, JSON.stringify({ decision: "approved", summary: "ok", find
   const changedIdentity = JSON.parse(changedCli.stdout).tiers.fast.release_identity;
   assert.equal(changedIdentity.reviewer_cli_version, "OpenAI Codex vtest-2");
   assert.notEqual(changedIdentity.release_digest, parsed.result.reviewer_mechanism.release_identity.release_digest);
+});
+
+test("authoritative transaction invokes exactly once and emits derived isolation and identity evidence", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "base\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  const packet = writeAuthoritativePacket(repo, "review the exact implementation subject");
+  mkdirSync(join(repo, ".review-loop"), { recursive: true });
+  writeFileSync(join(repo, ".review-loop", "review-guidelines.md"), "PROJECT INSTRUCTION MUST NOT LOAD\n");
+  const env = testEnv(repo);
+  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+  });
+  env.REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT = JSON.stringify(blockingOutput([
+    finding({ id: "real-finding", message: "A schema-valid finding is terminal.", required_action: "Fix it." }),
+  ]));
+  env.REVIEW_LOOP_FAKE_CLAUDE_SESSION_ID = "reviewer-session-1";
+  env.REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT = JSON.stringify(approvedOutput("fallback must not run"));
+  const authorization = writeAuthorization(repo, env, {
+    task_id: "task-1",
+    gate: "execution",
+    subject_digest: packet.digest,
+    attempt_ordinal: 1,
+    tier: "strong",
+  });
+
+  const result = run([
+    "run", "--scope", "none", "--artifact", packet.path, "--tier", "strong",
+    "--authorization", authorization.path,
+    "--subject-digest", authorization.record.subject_digest,
+    "--json",
+  ], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.guidelines.source, "authoritative-runtime");
+  assert.equal(parsed.result.decision, "changes_requested");
+  assert.equal(parsed.transaction.outcome, "decision");
+  assert.equal(parsed.transaction.invocation_count, 1);
+  assert.equal(parsed.transaction.transport.status, "completed");
+  assert.equal(parsed.transaction.envelope.status, "valid");
+  assert.match(parsed.transaction.envelope.content_digest, /^[a-f0-9]{64}$/);
+  assert.equal(parsed.transaction.authorization.authorization_digest, authorization.record.authorization_digest);
+  assert.equal(parsed.transaction.reviewed_input_digest, packet.digest);
+  assert.equal(parsed.transaction.isolation_profile.release_digest,
+    parsed.result.reviewer_mechanism.release_identity.release_digest);
+  assert.equal(parsed.transaction.isolation_profile.read_only_contract_digest,
+    parsed.result.reviewer_mechanism.release_identity.read_only_contract_digest);
+  assert.match(parsed.transaction.isolation_profile.transaction_contract_digest, /^[a-f0-9]{64}$/);
+  assert.equal(parsed.transaction.isolation_profile.fresh_context, true);
+  assert.equal(parsed.transaction.isolation_profile.resume_allowed, false);
+  assert.equal(parsed.transaction.isolation_profile.history_persistence, false);
+  assert.equal(parsed.transaction.isolation_profile.packet_only, true);
+  assert.match(parsed.transaction.review_context_id, /^[0-9a-f-]{36}$/i);
+  assert.equal(parsed.transaction.reviewer_identity.provider, "anthropic");
+  assert.equal(parsed.transaction.reviewer_identity.signal, "provider_reported_session_id");
+  assert.match(parsed.transaction.reviewer_identity.session_id_digest, /^[a-f0-9]{64}$/);
+  assert.doesNotMatch(JSON.stringify(parsed), /reviewer-session-1|fallback must not run/);
+});
+
+test("authoritative transaction rejects invalid bindings before reviewer launch", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "base\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  const packet = writeAuthoritativePacket(repo, "immutable execution packet");
+  const env = testEnv(repo);
+  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+  });
+  env.REVIEW_LOOP_FAKE_ERROR = "reviewer must not launch";
+  const cases = [
+    { name: "version", override: { schema_version: "review-loop.authorization.v0" }, subject: packet.digest, pattern: /authorization schema_version/ },
+    { name: "subject", override: {}, subject: "2".repeat(64), pattern: /authorization subject digest mismatch/ },
+    { name: "content", override: { subject_digest: "1".repeat(64) }, subject: "1".repeat(64), pattern: /reviewed input digest mismatch/ },
+    { name: "expiry", override: { expires_at: "2026-07-27T08:30:00.000Z" }, subject: packet.digest, pattern: /authorization expired/ },
+    { name: "attempt", override: { attempt_ordinal: 0 }, subject: packet.digest, pattern: /attempt_ordinal/ },
+    { name: "profile", override: { isolation_profile_digest: "3".repeat(64) }, subject: packet.digest, pattern: /isolation profile digest mismatch/ },
+    { name: "digest", override: { authorization_digest: "f".repeat(64) }, subject: packet.digest, pattern: /authorization digest mismatch/ },
+  ];
+  for (const item of cases) {
+    const authorization = writeAuthorization(repo, env, {
+      task_id: "task-1",
+      gate: "execution",
+      subject_digest: packet.digest,
+      attempt_ordinal: 1,
+      tier: "strong",
+      ...item.override,
+    }, `authorization-${item.name}.json`);
+    const result = run([
+      "run", "--scope", "none", "--artifact", packet.path, "--tier", "strong",
+      "--authorization", authorization.path,
+      "--subject-digest", item.subject,
+      "--json",
+    ], { cwd: repo, env });
+    assert.notEqual(result.status, 0, `${item.name}: ${result.stdout}`);
+    assert.match(result.stderr, item.pattern);
+    assert.doesNotMatch(result.stderr, /reviewer must not launch/);
+  }
+  for (const [name, extraArgs] of [
+    ["focus", ["--focus", "unbound focus"]],
+    ["counter", ["--counter"]],
+    ["guidelines", ["--guidelines", packet.path]],
+    ["positional", ["unbound positional instruction"]],
+  ]) {
+    const authorization = writeAuthorization(repo, env, {
+      task_id: "task-1",
+      gate: "execution",
+      subject_digest: packet.digest,
+      attempt_ordinal: 1,
+      tier: "strong",
+    }, `authorization-instruction-${name}.json`);
+    const result = run([
+      "run", "--scope", "none", "--artifact", packet.path, "--tier", "strong",
+      "--authorization", authorization.path,
+      "--subject-digest", packet.digest,
+      ...extraArgs,
+      "--json",
+    ], { cwd: repo, env });
+    assert.notEqual(result.status, 0, `${name}: ${result.stdout}`);
+    assert.match(result.stderr, /authoritative review does not accept caller or project instructions/);
+    assert.doesNotMatch(result.stderr, /reviewer must not launch/);
+  }
+});
+
+test("authoritative transaction captures Codex native session identity without exposing it", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "base\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  const packet = writeAuthoritativePacket(repo, "codex execution packet");
+  const fakeCodex = join(repo, "bin", "authoritative-codex");
+  const argvFile = join(repo, "codex-argv.json");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeCodex, `#!/usr/bin/env node
+const fs = require("fs");
+if (process.argv[2] === "--version") { console.log("OpenAI Codex vtest-1"); process.exit(0); }
+const argv = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(argv));
+const out = argv[argv.indexOf("--output-last-message") + 1];
+fs.writeFileSync(out, JSON.stringify({ decision: "approved", summary: "codex decision", findings: [], required_next_actions: [] }));
+console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-native-session-1" }));
+`, { mode: 0o755 });
+  const env = { ...testEnv(repo), REVIEW_LOOP_CODEX_BIN: fakeCodex };
+  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    fast: { reviewer: "codex", model: "gpt-5.6-luna-20260701", reasoning_effort: "medium" },
+  });
+  const authorization = writeAuthorization(repo, env, {
+    task_id: "task-1",
+    gate: "execution",
+    subject_digest: packet.digest,
+    attempt_ordinal: 1,
+    tier: "fast",
+  }, "codex-authorization.json");
+  const result = run([
+    "run", "--scope", "none", "--artifact", packet.path, "--tier", "fast",
+    "--authorization", authorization.path,
+    "--subject-digest", authorization.record.subject_digest,
+    "--json",
+  ], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.transaction.outcome, "decision");
+  assert.equal(parsed.transaction.reviewer_identity.provider, "openai");
+  assert.match(parsed.transaction.reviewer_identity.session_id_digest, /^[a-f0-9]{64}$/);
+  assert.ok(JSON.parse(readFileSync(argvFile, "utf8")).includes("--ephemeral"));
+  assert.doesNotMatch(JSON.stringify(parsed), /codex-native-session-1/);
+});
+
+test("authoritative transaction distinguishes unavailable and unparseable without fallback or prose salvage", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "base\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  const packet = writeAuthoritativePacket(repo, "outcome classification packet");
+  const baseEnv = testEnv(repo);
+  baseEnv.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+  });
+  const authorization = writeAuthorization(repo, baseEnv, {
+    task_id: "task-1",
+    gate: "execution",
+    subject_digest: packet.digest,
+    attempt_ordinal: 1,
+    tier: "strong",
+  });
+  const args = [
+    "run", "--scope", "none", "--artifact", packet.path, "--tier", "strong",
+    "--authorization", authorization.path,
+    "--subject-digest", authorization.record.subject_digest,
+    "--json",
+  ];
+  const unavailable = run(args, {
+    cwd: repo,
+    env: {
+      ...baseEnv,
+      REVIEW_LOOP_FAKE_ERROR: "transport unavailable",
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback must not run")),
+    },
+  });
+  assert.equal(unavailable.status, 0, unavailable.stderr);
+  const unavailableResult = JSON.parse(unavailable.stdout);
+  assert.equal(unavailableResult.transaction.outcome, "unavailable");
+  assert.equal(unavailableResult.transaction.invocation_count, 1);
+  assert.equal(unavailableResult.transaction.transport.status, "failed");
+  assert.match(unavailableResult.transaction.transport.diagnostic_digest, /^[a-f0-9]{64}$/);
+  assert.equal(unavailableResult.transaction.envelope.status, "absent");
+  assert.equal(unavailableResult.result, null);
+  assert.doesNotMatch(JSON.stringify(unavailableResult), /fallback must not run/);
+
+  const unparseable = run(args, {
+    cwd: repo,
+    env: {
+      ...baseEnv,
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+        decision: "changes_requested",
+        summary: "test",
+        findings: [finding({ message: "prose must not be salvaged" })],
+        required_next_actions: ["do not salvage"],
+      }),
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback must not run")),
+    },
+  });
+  assert.equal(unparseable.status, 0, unparseable.stderr);
+  const unparseableResult = JSON.parse(unparseable.stdout);
+  assert.equal(unparseableResult.transaction.outcome, "unparseable");
+  assert.equal(unparseableResult.transaction.invocation_count, 1);
+  assert.equal(unparseableResult.transaction.transport.status, "completed");
+  assert.equal(unparseableResult.transaction.envelope.status, "invalid");
+  assert.match(unparseableResult.transaction.envelope.content_digest, /^[a-f0-9]{64}$/);
+  assert.equal(unparseableResult.result, null);
+  assert.doesNotMatch(JSON.stringify(unparseableResult), /prose must not be salvaged|do not salvage|fallback must not run/);
+
+  const repeated = run(args, {
+    cwd: repo,
+    env: {
+      ...baseEnv,
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("second explicit invocation")),
+      REVIEW_LOOP_FAKE_CLAUDE_SESSION_ID: "reviewer-session-2",
+    },
+  });
+  assert.equal(repeated.status, 0, repeated.stderr);
+  const repeatedResult = JSON.parse(repeated.stdout);
+  assert.equal(repeatedResult.transaction.authorization.authorization_digest, authorization.record.authorization_digest);
+  assert.notEqual(repeatedResult.transaction.review_context_id, unparseableResult.transaction.review_context_id);
+});
+
+test("authoritative transaction classifies returned invalid Claude and Codex envelopes as unparseable", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "base\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  const packet = writeAuthoritativePacket(repo, "adapter envelope classification packet");
+  const env = testEnv(repo);
+  const bin = join(repo, "bin");
+
+  const fakeClaude = join(bin, "invalid-envelope-claude");
+  writeFileSync(fakeClaude, `#!/usr/bin/env node
+if (process.argv[2] === "--version") { console.log("2.1.220 (Claude Code)"); process.exit(0); }
+console.log(JSON.stringify({ result: "returned content without structured_output", session_id: "claude-session" }));
+`, { mode: 0o755 });
+  const claudeEnv = {
+    ...env,
+    REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
+  };
+  claudeEnv.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+  }, "claude-envelope-tiers.json");
+  const claudeAuthorization = writeAuthorization(repo, claudeEnv, {
+    task_id: "task-claude",
+    gate: "execution",
+    subject_digest: packet.digest,
+    attempt_ordinal: 1,
+    tier: "strong",
+  }, "claude-envelope-authorization.json");
+  const claude = run([
+    "run", "--scope", "none", "--artifact", packet.path, "--tier", "strong",
+    "--authorization", claudeAuthorization.path,
+    "--subject-digest", packet.digest,
+    "--json",
+  ], { cwd: repo, env: claudeEnv });
+  assert.equal(claude.status, 0, claude.stderr);
+  const claudeResult = JSON.parse(claude.stdout);
+  assert.equal(claudeResult.transaction.outcome, "unparseable");
+  assert.equal(claudeResult.transaction.transport.status, "completed");
+  assert.equal(claudeResult.transaction.envelope.status, "invalid");
+
+  const fakeCodex = join(bin, "invalid-envelope-codex");
+  writeFileSync(fakeCodex, `#!/usr/bin/env node
+const fs = require("fs");
+if (process.argv[2] === "--version") { console.log("OpenAI Codex vtest-1"); process.exit(0); }
+const argv = process.argv.slice(2);
+const out = argv[argv.indexOf("--output-last-message") + 1];
+fs.writeFileSync(out, "not-json");
+console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-session" }));
+`, { mode: 0o755 });
+  const codexEnv = {
+    ...env,
+    REVIEW_LOOP_CODEX_BIN: fakeCodex,
+  };
+  codexEnv.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    fast: { reviewer: "codex", model: "gpt-5.6-luna-20260701", reasoning_effort: "medium" },
+  }, "codex-envelope-tiers.json");
+  const codexAuthorization = writeAuthorization(repo, codexEnv, {
+    task_id: "task-codex",
+    gate: "execution",
+    subject_digest: packet.digest,
+    attempt_ordinal: 1,
+    tier: "fast",
+  }, "codex-envelope-authorization.json");
+  const codex = run([
+    "run", "--scope", "none", "--artifact", packet.path, "--tier", "fast",
+    "--authorization", codexAuthorization.path,
+    "--subject-digest", packet.digest,
+    "--json",
+  ], { cwd: repo, env: codexEnv });
+  assert.equal(codex.status, 0, codex.stderr);
+  const codexResult = JSON.parse(codex.stdout);
+  assert.equal(codexResult.transaction.outcome, "unparseable");
+  assert.equal(codexResult.transaction.transport.status, "completed");
+  assert.equal(codexResult.transaction.envelope.status, "invalid");
 });
 
 test("tiered Claude capabilities reject alternate provider backends", () => {
@@ -2708,6 +3031,54 @@ function writeTierConfig(repo, tiers, name = "reviewer-tiers.json") {
     tiers,
   }));
   return path;
+}
+
+function writeAuthorization(repo, env, fields, name = "authorization.json") {
+  const capabilitiesResult = run(["capabilities", "--json"], { cwd: repo, env });
+  assert.equal(capabilitiesResult.status, 0, capabilitiesResult.stderr);
+  const capabilities = JSON.parse(capabilitiesResult.stdout);
+  const profile = capabilities.tiers[fields.tier].isolation_profile;
+  assert.ok(profile, `missing isolation profile for tier ${fields.tier}`);
+  const payload = {
+    schema_version: "review-loop.authorization.v1",
+    authorization_id: `auth-${name.replace(/[^a-z0-9]/gi, "-")}`,
+    task_id: fields.task_id,
+    gate: fields.gate,
+    subject_digest: fields.subject_digest,
+    policy_version: "kernel-isolation-policy-v1",
+    isolation_profile_digest: profile.profile_digest,
+    attempt_ordinal: fields.attempt_ordinal,
+    issued_at: "2026-07-27T08:00:00.000Z",
+    expires_at: "2099-01-01T00:00:00.000Z",
+  };
+  for (const [key, value] of Object.entries(fields)) {
+    if (key !== "tier") payload[key] = value;
+  }
+  const record = {
+    ...payload,
+    authorization_digest: fields.authorization_digest
+      || createHash("sha256")
+        .update(`review-loop.authorization.v1\0${JSON.stringify(stableValue(payload))}`)
+        .digest("hex"),
+  };
+  const path = join(repo, name);
+  writeFileSync(path, JSON.stringify(record));
+  return { path, record };
+}
+
+function writeAuthoritativePacket(repo, content, name = "gate-packet.md") {
+  const path = join(repo, name);
+  writeFileSync(path, content);
+  return {
+    path,
+    digest: createHash("sha256").update(content).digest("hex"),
+  };
+}
+
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableValue(value[key])]));
 }
 
 function approvedOutput(summary = "ok") {

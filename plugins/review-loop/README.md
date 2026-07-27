@@ -11,7 +11,7 @@ review-loop-setup --init-guidelines
 review-loop
 ```
 
-`review-loop` asks an independent opposite-agent reviewer to evaluate supplied material without editing files. Codex-hosted runs use Claude Code by default; Claude Code-hosted runs use Codex by default. `run` is the canonical engine; counter-review is selected with `--counter`, not a separate command. Old `cc-review` command names are intentionally not preserved.
+`review-loop` asks an independent reviewer to evaluate supplied material without editing files. Direct Codex-hosted runs use Claude Code by default; direct Claude Code-hosted runs use Codex by default. An Agent Kernel-authorized run may use the same provider when the selected tier proves a fresh non-resumed packet-only reviewer context. `run` is the canonical engine; counter-review is selected with `--counter`, not a separate command. Old `cc-review` command names are intentionally not preserved.
 
 ## Features
 
@@ -23,6 +23,7 @@ review-loop
 - Optional background review jobs with status/result/cancel.
 - Automatic Stop-hook review gate for Codex or Claude Code finalization, enabled by default when the hook is installed.
 - Terminal reviewer mode prevents reviewer subprocesses from starting nested review loops.
+- Optional Agent Kernel authorization mode performs exactly one qualified invocation and emits transaction, isolation-profile, and provider-native session identity evidence without owning retries or gate admission.
 
 ## Generic Review Engine
 
@@ -58,6 +59,7 @@ Useful options:
 - `--focus <text>` supplies the reviewer ask.
 - `--counter` runs the loop in counter-review stance, focused on challenging an assumption, risk, or approach.
 - `--tier fast|standard|strong` selects an exact operator-configured reviewer release. Tiered runs fail closed and do not use cross-provider fallback or `--on-reviewer-failure allow`.
+- `--authorization <path> --subject-digest <sha256>` selects transaction mode for an Agent Kernel-issued envelope. It requires a qualified tier, executes once, and bypasses cache, fallback, background execution, continuation, and fail-open behavior.
 - `--continuation-envelope` asks a `strong` tier initial review for a structured closure envelope. It is invalid without `--tier strong`.
 - `--on-reviewer-failure block|allow` controls direct-run mechanism failure behavior. The generic engine defaults to `block`; when the selected opposite-agent reviewer fails and the host agent is known, review-loop first tries one degraded read-only host-agent fallback. An explicit `allow` is consulted only when distinct-host fallback is unavailable or also fails.
 - `--background`, `status`, `result`, and `cancel` work with generic reviews. Persisted job metadata is sanitized; free-form focus text, logs, and errors are not returned raw through status/result JSON.
@@ -68,7 +70,7 @@ Use `review-loop run --context ...` or `review-loop run --artifact ...` for cont
 
 Reviewer assessments must carry an explicit recognized decision. The exact observed schema-repair placeholder (`summary` equal to `test` after trimming and case normalization) is classified as reviewer-mechanism failure before normalization; review-loop then uses its normal distinct-host fallback or blocks when coverage is unavailable. This is corpus-specific integrity protection, not a general proof that arbitrary fluent prose reflects meaningful reasoning. Valid concise summaries such as `ok` remain supported. Private gate-cache entries are integrity-versioned; legacy or placeholder-bearing entries miss and are re-reviewed while the existing target-hash and TTL rules remain authoritative.
 
-`review-loop` does not know whether the caller is satisfying an execution, design, merge, or audit gate. For agent-kernel integration, agent-kernel prepares the context packet, calls `review-loop run`, records the generic result, and maps that result back to its own gate semantics.
+Direct `review-loop` does not know whether the caller is satisfying an execution, design, merge, or audit gate. In authorization mode it validates and echoes the Kernel-supplied gate and subject bindings but still does not decide admission. Agent Kernel owns the attempt ledger, consumed-token rejection, retries, recovery, reviewer-independence classification, and gate semantics.
 
 ## Reviewer Hosts
 
@@ -113,6 +115,44 @@ review-loop run --tier strong --context review-context.md --scope none --json
 ```
 
 Each configured capability includes a release digest over the provider, model, reasoning effort, installed reviewer CLI version, companion/run-wrapper source and version, exact static read-only argv contract, prompt contract, reviewer schemas, deterministic finding policy, and complete operator tier configuration. A tiered normalized result returns that exact identity under `result.reviewer_mechanism.release_identity`. Existing untiered runs remain `legacy_unqualified` and preserve their current host selection and fallback behavior.
+
+Each configured tier also exposes `isolation_profile`, a versioned derivation of
+that release identity and its exact read-only launch contract. The profile
+asserts a fresh context, disabled resume/history persistence, packet-only input,
+and terminal-reviewer behavior. Its digest is the value bound into an Agent
+Kernel authorization; it is not a parallel profile registry.
+
+### Agent Kernel-authorized transactions
+
+Agent Kernel may supply `--authorization <path> --subject-digest <sha256>` with
+a qualified `--tier`, exactly one immutable `--artifact` packet, and explicit
+`--scope none`. The subject digest must equal the packet's actual SHA-256;
+content substitution therefore fails before reviewer launch. Review Loop also
+validates the envelope schema, digest, expiry, attempt ordinal, and selected
+isolation-profile digest. Authoritative mode rejects `--focus`, `--counter`,
+`--guidelines`, and positional reviewer instructions, and ignores discovered
+project/user guidance in favor of fixed adapter-owned instructions covered by
+the adapter release digest. It then performs exactly one invocation and returns a
+`review-loop.transaction-result.v1` object:
+
+- `outcome: decision` means the complete reviewer result was schema-valid and
+  substantive. Valid findings are terminal even when the outer `ok` is false.
+- `outcome: unavailable` means the reviewer transport or process did not return
+  content.
+- `outcome: unparseable` means content was returned but the complete result or
+  required identity evidence was invalid. Review Loop never salvages prose.
+
+The transaction includes the authorization identity, a fresh
+`review_context_id`, the derived isolation profile, exactly
+`invocation_count: 1`, the producer-computed `reviewed_input_digest`, separate
+transport and envelope validity evidence, and a digest of the provider-reported
+native reviewer session ID. Qualified Codex runs include `--ephemeral`, so the
+no-history-persistence claim is enforced by the exact digest-bound launch argv.
+Raw diagnostics,
+invalid reviewer prose, and provider session IDs are not emitted. Review Loop deliberately
+does not persist a replay ledger: Agent Kernel rejects consumed authorizations,
+owns the retry budget and recovery generation, and decides whether the emitted
+evidence is admissible.
 
 Claude tiered runs also compare the configured model with the primary model reported by Claude's result envelope. Silent provider remapping is treated as identity drift and blocks the review. Bedrock, Vertex, and Foundry Claude backends are not currently qualified and fail closed instead of being mislabeled as Anthropic.
 

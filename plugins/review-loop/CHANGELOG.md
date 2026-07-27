@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.6.0
+
+- Add Agent Kernel-authorized single-invocation review transactions with
+  decision, unavailable, and unparseable outcomes.
+- Derive versioned isolation evidence from qualified release identity and emit
+  hashed provider-native reviewer session identity.
+- Bind the authorization subject to the immutable packet bytes, classify
+  returned invalid envelopes separately from transport failures, and enforce
+  ephemeral qualified Codex sessions.
+- Exclude unbound caller, project, and user reviewer instructions from
+  authoritative packet-only transactions.
+- Keep direct advisory review behavior compatible while authoritative mode
+  bypasses cache, fallback, background, continuation, and fail-open paths.
+
 ## 0.5.3
 
 - An explicit `category_block_on: "never"` policy is now a hard exemption even when the reviewer marks the finding blocking, preserving deterministic caller policy precedence.
