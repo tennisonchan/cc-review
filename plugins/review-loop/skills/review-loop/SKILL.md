@@ -36,6 +36,14 @@ Common arguments; append `--help` to the `run` command before using advanced rev
 - `--counter`
 - `--json`
 
+Agent Kernel may provide `--authorization <path> --subject-digest <sha256>`
+with a qualified `--tier`. In that mode, do not add `--background`,
+`--continuation-envelope`, or `--on-reviewer-failure allow`. Review Loop
+validates the envelope, executes exactly once without cache or fallback, and
+emits `decision`, `unavailable`, or `unparseable` transaction evidence. Kernel,
+not this skill, owns consumed-token rejection, retries, recovery, independence
+admission, and the gate decision.
+
 3. Treat the reviewer as read-only. Do not ask the opposite-agent reviewer to patch, edit, commit, delegate, invoke `review-loop`, or continue into implementation.
 
    Completion criterion: every blocking finding is fixed by Codex and re-reviewed, or handed off as unresolved; every advisory finding is considered. A prose rejection does not clear a deterministic gate block.

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Review Loop Kernel Authorization",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "authorization_id",
+    "task_id",
+    "gate",
+    "subject_digest",
+    "policy_version",
+    "isolation_profile_digest",
+    "attempt_ordinal",
+    "issued_at",
+    "expires_at",
+    "authorization_digest"
+  ],
+  "properties": {
+    "schema_version": { "const": "review-loop.authorization.v1" },
+    "authorization_id": { "type": "string", "minLength": 1 },
+    "task_id": { "type": "string", "minLength": 1 },
+    "gate": {
+      "enum": ["design", "execution", "merge", "delivery_validation", "audit"]
+    },
+    "subject_digest": { "$ref": "#/$defs/sha256" },
+    "policy_version": { "type": "string", "minLength": 1 },
+    "isolation_profile_digest": { "$ref": "#/$defs/sha256" },
+    "attempt_ordinal": { "type": "integer", "minimum": 1 },
+    "issued_at": { "type": "string", "format": "date-time" },
+    "expires_at": { "type": "string", "format": "date-time" },
+    "authorization_digest": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}
