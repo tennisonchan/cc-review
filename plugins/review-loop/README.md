@@ -91,17 +91,35 @@ Trusted tier configuration lives outside repositories at `$XDG_STATE_HOME/review
 
 ```json
 {
-  "schema_version": "review-loop.reviewer-tier-config.v1",
+  "schema_version": "review-loop.reviewer-tier-config.v2",
   "tiers": {
     "fast": {
-      "reviewer": "codex",
-      "model": "gpt-release-specific-model-id",
-      "reasoning_effort": "medium"
+      "profiles": [
+        {
+          "reviewer": "codex",
+          "model": "gpt-release-specific-model-id",
+          "reasoning_effort": "medium"
+        },
+        {
+          "reviewer": "claude",
+          "model": "claude-release-specific-model-id",
+          "reasoning_effort": "medium"
+        }
+      ]
     },
     "strong": {
-      "reviewer": "claude",
-      "model": "claude-release-specific-model-id",
-      "reasoning_effort": "high"
+      "profiles": [
+        {
+          "reviewer": "claude",
+          "model": "claude-release-specific-model-id",
+          "reasoning_effort": "high"
+        },
+        {
+          "reviewer": "codex",
+          "model": "gpt-release-specific-model-id",
+          "reasoning_effort": "xhigh"
+        }
+      ]
     }
   }
 }
@@ -114,7 +132,9 @@ review-loop-companion capabilities --json
 review-loop run --tier strong --context review-context.md --scope none --json
 ```
 
-Each configured capability includes a release digest over the provider, model, reasoning effort, installed reviewer CLI version, companion/run-wrapper source and version, exact static read-only argv contract, prompt contract, reviewer schemas, deterministic finding policy, and complete operator tier configuration. A tiered normalized result returns that exact identity under `result.reviewer_mechanism.release_identity`. Existing untiered runs remain `legacy_unqualified` and preserve their current host selection and fallback behavior.
+Each tier may contain one or two ordered profiles. Two-profile tiers must use distinct providers. Capabilities expose the complete `profiles` array and keep `release_identity` and `isolation_profile` as projections of the first profile for existing consumers. Version 1 single-profile configuration remains readable and is exposed with `alternate_profiles_configured: false`.
+
+Each configured profile includes a release digest over the provider, model, reasoning effort, installed reviewer CLI version, companion/run-wrapper source and version, exact static read-only argv contract, prompt contract, reviewer schemas, deterministic finding policy, and complete operator tier configuration. A tiered normalized result returns that exact identity under `result.reviewer_mechanism.release_identity`. In authoritative transaction mode, the authorization's isolation-profile digest selects exactly one configured profile; review-loop never retries or falls back internally. Existing untiered runs remain `legacy_unqualified` and preserve their current host selection and fallback behavior.
 
 Each configured tier also exposes `isolation_profile`, a versioned derivation of
 that release identity and its exact read-only launch contract. The profile
