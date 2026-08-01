@@ -30,7 +30,8 @@ const CLAUDE_ALTERNATE_BACKEND_FLAGS = [
   "CLAUDE_CODE_USE_VERTEX",
   "CLAUDE_CODE_USE_FOUNDRY",
 ];
-const TIER_CONFIG_SCHEMA_VERSION = "review-loop.reviewer-tier-config.v1";
+const TIER_CONFIG_SCHEMA_VERSION = "review-loop.reviewer-tier-config.v2";
+const LEGACY_TIER_CONFIG_SCHEMA_VERSION = "review-loop.reviewer-tier-config.v1";
 const CAPABILITY_SCHEMA_VERSION = "review-loop.capabilities.v1";
 const RELEASE_IDENTITY_SCHEMA_VERSION = "review-loop.reviewer-release-identity.v1";
 const REVIEWER_MECHANISM_SCHEMA_VERSION = "review-loop.reviewer-mechanism.v1";
@@ -2351,14 +2352,24 @@ function resolveReviewerSelection(args = {}) {
   if (!tier) {
     throw new Error(`semantic tier ${args.tier} is not configured in ${config.path}`);
   }
-  const releaseIdentity = buildReleaseIdentity(args.tier, tier, config);
+  const profiles = tierProfiles(tier, config.value.schema_version);
+  let selected = profiles[0];
+  if (args.authorization) {
+    const authorizedDigest = authorizationProfileDigest(args.authorization);
+    selected = profiles.find((profile) => {
+      const releaseIdentity = buildReleaseIdentity(args.tier, profile, config);
+      return isolationProfile(releaseIdentity).profile_digest === authorizedDigest;
+    });
+    if (!selected) throw new Error("authorization isolation profile digest mismatch");
+  }
+  const releaseIdentity = buildReleaseIdentity(args.tier, selected, config);
   const profile = isolationProfile(releaseIdentity);
   return {
     qualified: true,
     semanticTier: args.tier,
-    reviewer: tier.reviewer,
-    model: tier.model,
-    reasoningEffort: tier.reasoning_effort,
+    reviewer: selected.reviewer,
+    model: selected.model,
+    reasoningEffort: selected.reasoning_effort,
     releaseIdentity,
     isolationProfile: profile,
   };
@@ -2370,11 +2381,20 @@ function reviewerCapabilities() {
   for (const semanticTier of SEMANTIC_TIERS) {
     const configured = config?.value.tiers[semanticTier];
     if (configured) {
-      const releaseIdentity = buildReleaseIdentity(semanticTier, configured, config);
+      const profiles = tierProfiles(configured, config.value.schema_version).map((profile) => {
+        const releaseIdentity = buildReleaseIdentity(semanticTier, profile, config);
+        return {
+          release_identity: releaseIdentity,
+          isolation_profile: isolationProfile(releaseIdentity),
+        };
+      });
       tiers[semanticTier] = {
         configured: true,
-        release_identity: releaseIdentity,
-        isolation_profile: isolationProfile(releaseIdentity),
+        profiles,
+        alternate_profiles_configured: profiles.length > 1,
+        // Compatibility projection for existing capability consumers.
+        release_identity: profiles[0].release_identity,
+        isolation_profile: profiles[0].isolation_profile,
       };
     } else {
       tiers[semanticTier] = { configured: false };
@@ -2417,7 +2437,7 @@ function loadTierConfig({ required }) {
   return {
     path,
     value,
-    digest: domainDigest(TIER_CONFIG_SCHEMA_VERSION, value),
+    digest: domainDigest(value.schema_version, value),
   };
 }
 
@@ -2426,8 +2446,8 @@ function validateTierConfig(value, path) {
     throw new Error(`reviewer tier configuration at ${path} must be an object`);
   }
   assertExactKeys(value, ["schema_version", "tiers"], `reviewer tier configuration at ${path}`);
-  if (value.schema_version !== TIER_CONFIG_SCHEMA_VERSION) {
-    throw new Error(`reviewer tier configuration schema_version must be ${TIER_CONFIG_SCHEMA_VERSION}`);
+  if (![TIER_CONFIG_SCHEMA_VERSION, LEGACY_TIER_CONFIG_SCHEMA_VERSION].includes(value.schema_version)) {
+    throw new Error(`reviewer tier configuration schema_version must be ${TIER_CONFIG_SCHEMA_VERSION} or ${LEGACY_TIER_CONFIG_SCHEMA_VERSION}`);
   }
   if (!value.tiers || typeof value.tiers !== "object" || Array.isArray(value.tiers)) {
     throw new Error("reviewer tier configuration tiers must be an object");
@@ -2437,17 +2457,55 @@ function validateTierConfig(value, path) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
       throw new Error(`reviewer tier configuration ${semanticTier} must be an object`);
     }
-    assertExactKeys(entry, ["reviewer", "model", "reasoning_effort"], `reviewer tier configuration ${semanticTier}`);
-    assertReviewer(entry.reviewer, `reviewer tier configuration ${semanticTier}.reviewer`);
-    if (typeof entry.model !== "string" || !entry.model.trim()) {
-      throw new Error(`reviewer tier configuration ${semanticTier}.model is required`);
+    const profiles = tierProfiles(entry, value.schema_version);
+    if (profiles.length < 1 || profiles.length > 2) {
+      throw new Error(`reviewer tier configuration ${semanticTier} must contain between 1 and 2 profiles`);
     }
-    if (isMutableModelAlias(entry.model)) {
-      throw new Error(`reviewer tier configuration ${semanticTier}.model must be an exact model identifier, not mutable alias ${entry.model}`);
+    const providers = new Set();
+    for (const [index, profile] of profiles.entries()) {
+      const label = value.schema_version === TIER_CONFIG_SCHEMA_VERSION
+        ? `reviewer tier configuration ${semanticTier}.profiles[${index}]`
+        : `reviewer tier configuration ${semanticTier}`;
+      validateTierProfile(profile, label);
+      const provider = profile.reviewer === "codex" ? "openai" : "anthropic";
+      if (providers.has(provider)) {
+        throw new Error(`reviewer tier configuration ${semanticTier} contains duplicate provider ${provider}`);
+      }
+      providers.add(provider);
     }
-    if (!REASONING_EFFORTS.includes(entry.reasoning_effort)) {
-      throw new Error(`reviewer tier configuration ${semanticTier}.reasoning_effort must be one of: ${REASONING_EFFORTS.join(", ")}`);
-    }
+  }
+}
+
+function tierProfiles(entry, schemaVersion) {
+  if (schemaVersion === LEGACY_TIER_CONFIG_SCHEMA_VERSION) return [entry];
+  assertExactKeys(entry, ["profiles"], "reviewer tier configuration entry");
+  if (!Array.isArray(entry.profiles)) throw new Error("reviewer tier configuration profiles must be an array");
+  return entry.profiles;
+}
+
+function validateTierProfile(profile, label) {
+  if (!profile || typeof profile !== "object" || Array.isArray(profile)) {
+    throw new Error(`${label} must be an object`);
+  }
+  assertExactKeys(profile, ["reviewer", "model", "reasoning_effort"], label);
+  assertReviewer(profile.reviewer, `${label}.reviewer`);
+  if (typeof profile.model !== "string" || !profile.model.trim()) {
+    throw new Error(`${label}.model is required`);
+  }
+  if (isMutableModelAlias(profile.model)) {
+    throw new Error(`${label}.model must be an exact model identifier, not mutable alias ${profile.model}`);
+  }
+  if (!REASONING_EFFORTS.includes(profile.reasoning_effort)) {
+    throw new Error(`${label}.reasoning_effort must be one of: ${REASONING_EFFORTS.join(", ")}`);
+  }
+}
+
+function authorizationProfileDigest(path) {
+  try {
+    const value = readJson(resolve(path));
+    return value?.isolation_profile_digest;
+  } catch (error) {
+    throw new Error(`invalid authorization: ${error.message}`);
   }
 }
 

@@ -268,7 +268,7 @@ test("capabilities reads its adapter version from a packaged plugin manifest", (
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).adapter_version, "0.6.0");
+  assert.equal(JSON.parse(result.stdout).adapter_version, "0.7.0");
 });
 
 test("capabilities resolves configured tiers to deterministic exact release identities", () => {
@@ -299,6 +299,98 @@ test("capabilities resolves configured tiers to deterministic exact release iden
   ]) {
     assert.match(parsed.tiers.fast.release_identity[field], /^[a-f0-9]{64}$/);
   }
+});
+
+test("capabilities exposes ordered provider-diverse profiles while preserving the primary projection", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    strong: {
+      profiles: [
+        { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+        { reviewer: "codex", model: "gpt-5.6-sol-20260731", reasoning_effort: "xhigh" },
+      ],
+    },
+  }, "reviewer-tiers-v2.json", "review-loop.reviewer-tier-config.v2");
+
+  const result = run(["capabilities", "--json"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  const tier = JSON.parse(result.stdout).tiers.strong;
+  assert.equal(tier.configured, true);
+  assert.equal(tier.alternate_profiles_configured, true);
+  assert.equal(tier.profiles.length, 2);
+  assert.deepEqual(tier.profiles.map((profile) => profile.release_identity.provider), ["anthropic", "openai"]);
+  assert.deepEqual(tier.profiles.map((profile) => profile.release_identity.model), [
+    "claude-opus-4-1-20250805",
+    "gpt-5.6-sol-20260731",
+  ]);
+  assert.deepEqual(tier.release_identity, tier.profiles[0].release_identity);
+  assert.deepEqual(tier.isolation_profile, tier.profiles[0].isolation_profile);
+  assert.notEqual(tier.profiles[0].isolation_profile.profile_digest, tier.profiles[1].isolation_profile.profile_digest);
+
+  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    strong: {
+      profiles: [
+        { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+        { reviewer: "codex", model: "gpt-5.6-sol-20260801", reasoning_effort: "xhigh" },
+      ],
+    },
+  }, "reviewer-tiers-v2-changed.json", "review-loop.reviewer-tier-config.v2");
+  const changed = run(["capabilities", "--json"], { cwd: repo, env });
+  assert.equal(changed.status, 0, changed.stderr);
+  const changedTier = JSON.parse(changed.stdout).tiers.strong;
+  assert.notEqual(changedTier.profiles[0].release_identity.release_digest, tier.profiles[0].release_identity.release_digest);
+  assert.notEqual(changedTier.profiles[1].release_identity.release_digest, tier.profiles[1].release_identity.release_digest);
+});
+
+test("multi-profile tier validation rejects duplicate providers and more than two profiles", () => {
+  const repo = makeGitRepo();
+  const baseEnv = testEnv(repo);
+  const duplicateEnv = {
+    ...baseEnv,
+    REVIEW_LOOP_TIER_CONFIG: writeTierConfig(repo, {
+      strong: {
+        profiles: [
+          { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+          { reviewer: "claude", model: "claude-opus-4-8-20260701", reasoning_effort: "high" },
+        ],
+      },
+    }, "duplicate-reviewer-tiers.json", "review-loop.reviewer-tier-config.v2"),
+  };
+  const duplicate = run(["capabilities", "--json"], { cwd: repo, env: duplicateEnv });
+  assert.notEqual(duplicate.status, 0);
+  assert.match(duplicate.stderr, /duplicate provider anthropic/);
+
+  const excessiveEnv = {
+    ...baseEnv,
+    REVIEW_LOOP_TIER_CONFIG: writeTierConfig(repo, {
+      standard: {
+        profiles: [
+          { reviewer: "claude", model: "claude-sonnet-4-5-20250929", reasoning_effort: "medium" },
+          { reviewer: "codex", model: "gpt-5.6-20260731", reasoning_effort: "medium" },
+          { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+        ],
+      },
+    }, "excessive-reviewer-tiers.json", "review-loop.reviewer-tier-config.v2"),
+  };
+  const excessive = run(["capabilities", "--json"], { cwd: repo, env: excessiveEnv });
+  assert.notEqual(excessive.status, 0);
+  assert.match(excessive.stderr, /between 1 and 2 profiles/);
+});
+
+test("legacy single-profile tiers expose one profile without claiming alternate coverage", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+  });
+  const result = run(["capabilities", "--json"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  const tier = JSON.parse(result.stdout).tiers.strong;
+  assert.equal(tier.alternate_profiles_configured, false);
+  assert.equal(tier.profiles.length, 1);
+  assert.deepEqual(tier.release_identity, tier.profiles[0].release_identity);
+  assert.deepEqual(tier.isolation_profile, tier.profiles[0].isolation_profile);
 });
 
 test("tiered Claude review passes exact model settings and returns immutable mechanism evidence", () => {
@@ -467,6 +559,57 @@ test("authoritative transaction invokes exactly once and emits derived isolation
   assert.equal(parsed.transaction.reviewer_identity.signal, "provider_reported_session_id");
   assert.match(parsed.transaction.reviewer_identity.session_id_digest, /^[a-f0-9]{64}$/);
   assert.doesNotMatch(JSON.stringify(parsed), /reviewer-session-1|fallback must not run/);
+});
+
+test("authoritative transaction selects the exact authorized profile from a multi-profile tier", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "base\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  const packet = writeAuthoritativePacket(repo, "select the exact authorized profile");
+  const fakeCodex = join(repo, "bin", "authorized-codex");
+  const argvFile = join(repo, "authorized-codex-argv.json");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeCodex, `#!/usr/bin/env node
+const fs = require("fs");
+if (process.argv[2] === "--version") { console.log("OpenAI Codex vtest-strong"); process.exit(0); }
+const argv = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(argv));
+const out = argv[argv.indexOf("--output-last-message") + 1];
+fs.writeFileSync(out, JSON.stringify({ decision: "approved", summary: "codex selected", findings: [], required_next_actions: [] }));
+console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-authorized-session" }));
+`, { mode: 0o755 });
+  const env = { ...testEnv(repo), REVIEW_LOOP_CODEX_BIN: fakeCodex };
+  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    strong: {
+      profiles: [
+        { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+        { reviewer: "codex", model: "gpt-5.6-sol-20260731", reasoning_effort: "xhigh" },
+      ],
+    },
+  }, "authorized-reviewer-tiers.json", "review-loop.reviewer-tier-config.v2");
+  const authorization = writeAuthorization(repo, env, {
+    task_id: "task-multi-profile",
+    gate: "execution",
+    subject_digest: packet.digest,
+    attempt_ordinal: 1,
+    tier: "strong",
+    profile_index: 1,
+  }, "multi-profile-authorization.json");
+
+  const result = run([
+    "run", "--scope", "none", "--artifact", packet.path, "--tier", "strong",
+    "--authorization", authorization.path,
+    "--subject-digest", packet.digest,
+    "--json",
+  ], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.transaction.invocation_count, 1);
+  assert.equal(parsed.transaction.reviewer_identity.provider, "openai");
+  assert.equal(parsed.transaction.isolation_profile.profile_digest, authorization.record.isolation_profile_digest);
+  assert.equal(parsed.result.reviewer_mechanism.release_identity.model, "gpt-5.6-sol-20260731");
+  assert.ok(JSON.parse(readFileSync(argvFile, "utf8")).includes("gpt-5.6-sol-20260731"));
 });
 
 test("authoritative transaction rejects invalid bindings before reviewer launch", () => {
@@ -3023,11 +3166,11 @@ function testEnv(repo) {
   };
 }
 
-function writeTierConfig(repo, tiers, name = "reviewer-tiers.json") {
+function writeTierConfig(repo, tiers, name = "reviewer-tiers.json", schemaVersion = "review-loop.reviewer-tier-config.v1") {
   const path = join(repo, ".home", name);
   mkdirSync(join(repo, ".home"), { recursive: true });
   writeFileSync(path, JSON.stringify({
-    schema_version: "review-loop.reviewer-tier-config.v1",
+    schema_version: schemaVersion,
     tiers,
   }));
   return path;
@@ -3037,7 +3180,10 @@ function writeAuthorization(repo, env, fields, name = "authorization.json") {
   const capabilitiesResult = run(["capabilities", "--json"], { cwd: repo, env });
   assert.equal(capabilitiesResult.status, 0, capabilitiesResult.stderr);
   const capabilities = JSON.parse(capabilitiesResult.stdout);
-  const profile = capabilities.tiers[fields.tier].isolation_profile;
+  const tier = capabilities.tiers[fields.tier];
+  const profile = fields.profile_index === undefined
+    ? tier.isolation_profile
+    : tier.profiles?.[fields.profile_index]?.isolation_profile;
   assert.ok(profile, `missing isolation profile for tier ${fields.tier}`);
   const payload = {
     schema_version: "review-loop.authorization.v1",
@@ -3052,7 +3198,7 @@ function writeAuthorization(repo, env, fields, name = "authorization.json") {
     expires_at: "2099-01-01T00:00:00.000Z",
   };
   for (const [key, value] of Object.entries(fields)) {
-    if (key !== "tier") payload[key] = value;
+    if (key !== "tier" && key !== "profile_index") payload[key] = value;
   }
   const record = {
     ...payload,

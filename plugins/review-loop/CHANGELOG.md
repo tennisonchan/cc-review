@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.7.0
+
+- Add ordered, provider-diverse reviewer profiles to each semantic tier.
+- Select exactly one authoritative reviewer by its authorized isolation-profile digest.
+- Preserve version 1 single-profile configuration and primary capability projections.
+- Reject duplicate providers, mutable model aliases, and tiers with more than two profiles.
+
 ## 0.6.0
 
 - Add Agent Kernel-authorized single-invocation review transactions with
