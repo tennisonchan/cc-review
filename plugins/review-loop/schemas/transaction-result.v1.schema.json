@@ -118,7 +118,18 @@
           "required": ["status", "diagnostic_digest"],
           "properties": {
             "status": { "const": "failed" },
-            "diagnostic_digest": { "$ref": "#/$defs/sha256" }
+            "diagnostic_digest": { "$ref": "#/$defs/sha256" },
+            "failure_diagnostic": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["category", "message"],
+              "properties": {
+                "category": {
+                  "enum": ["authentication", "rate_limit", "timeout", "process", "provider", "response", "unknown"]
+                },
+                "message": { "type": "string", "minLength": 1, "maxLength": 512 }
+              }
+            }
           }
         }
       ]
