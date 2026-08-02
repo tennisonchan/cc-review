@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync, copyFileSync, rmSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -183,7 +183,7 @@ Run "<subcommand> --help" for subcommand options.`);
 const SUBCOMMAND_HELP = {
   capabilities: "capabilities [--json]",
   setup: "setup [--desired-tier-config <path>] [--apply-tier-config (--expected-tier-config-digest <sha256>|--expect-tier-config-missing)] [--init-guidelines] [--force] [--enable-review-gate] [--disable-review-gate] [--block-on info|low|medium|high] [--on-reviewer-failure block|allow] [--enable-gate-debug] [--disable-gate-debug] [--json]",
-  run: "run [--background] [--counter] [--context <path>] [--artifact <path>] [--focus <text>] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--reviewer claude|codex] [--tier fast|standard|strong] [--authorization <path> --subject-digest <sha256>] [--continuation-envelope] [--on-reviewer-failure block|allow] [--json]",
+  run: "run [--background] [--counter] [--context <path>] [--artifact <path>] [--focus <text>] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--reviewer claude|codex] [--tier fast|standard|strong] [--authorization <path> --subject-digest <sha256>] [--emit-failure-diagnostic] [--continuation-envelope] [--on-reviewer-failure block|allow] [--json]",
   status: "status [job-id] [--all] [--json]",
   result: "result [job-id] [--json]",
   cancel: "cancel [job-id] [--json]",
@@ -208,6 +208,7 @@ function parseArgs(argv) {
     context: null,
     counter: false,
     continuationEnvelope: false,
+    emitFailureDiagnostic: false,
     desiredTierConfig: null,
     applyTierConfig: false,
     expectedTierConfigDigest: null,
@@ -249,6 +250,9 @@ function parseArgs(argv) {
         break;
       case "--continuation-envelope":
         args.continuationEnvelope = true;
+        break;
+      case "--emit-failure-diagnostic":
+        args.emitFailureDiagnostic = true;
         break;
       case "--apply-tier-config":
         args.applyTierConfig = true;
@@ -328,6 +332,9 @@ function parseArgs(argv) {
   if (args.reviewer) assertReviewer(args.reviewer, "--reviewer");
   if (args.tier) assertSemanticTier(args.tier, "--tier");
   if (args.tier && args.reviewer) throw new Error("--tier and --reviewer cannot be used together");
+  if (args.emitFailureDiagnostic && !args.authorization) {
+    throw new Error("--emit-failure-diagnostic requires an authoritative --authorization");
+  }
   if (args.tier && args.onReviewerFailure === "allow") {
     throw new Error("tiered review cannot use --on-reviewer-failure allow");
   }
@@ -376,11 +383,11 @@ async function setup(args) {
   let catalog = inspectTierCatalog();
   const checks = {
     node: checkCommand(process.execPath, ["--version"]),
-    codex: checkCommand(codexBin(), ["--version"]),
-    codexAuth: checkCommand(codexBin(), ["login", "status"]),
-    claude: checkCommand(claudeBin(), ["--version"]),
-    claudeAuthText: checkCommand(claudeBin(), ["auth", "status", "--text"]),
-    claudeAuthJson: checkCommand(claudeBin(), ["auth", "status", "--json"]),
+    codex: checkReviewerCommand(codexBin(), ["--version"]),
+    codexAuth: checkReviewerCommand(codexBin(), ["login", "status"]),
+    claude: checkReviewerCommand(claudeBin(), ["--version"]),
+    claudeAuthText: checkReviewerCommand(claudeBin(), ["auth", "status", "--text"]),
+    claudeAuthJson: checkReviewerCommand(claudeBin(), ["auth", "status", "--json"]),
   };
   let providers = inspectProviderHealth(catalog, checks);
   const actions = [];
@@ -452,10 +459,9 @@ async function setup(args) {
   }
 
   const result = {
-    ok: checks.node.ok
-      && providers.status !== "unavailable"
-      && !["migration_required", "invalid"].includes(catalog.status)
-      && !actions.some((action) => action.status === "rolled_back"),
+    // Preserve the pre-0.8 compatibility projection exactly. Activation
+    // consumers must use operational_status and the readiness evidence below.
+    ok: checks.node.ok && checks.claude.ok,
     operational_status: catalog.status === "migration_required" || catalog.status === "invalid"
       ? catalog.status
       : checks.node.ok && providers.status !== "unavailable"
@@ -823,6 +829,7 @@ async function runAuthoritativeReview({ args, repo, guidelines, policy, inputs, 
         }),
       };
     }
+    const failureDiagnostic = classifyTransportFailure(error);
     return {
       ok: false,
       repo: repo.root,
@@ -838,6 +845,7 @@ async function runAuthoritativeReview({ args, repo, guidelines, policy, inputs, 
           diagnostic_digest: domainDigest("review-loop.transport-diagnostic.v1", {
             error: error instanceof Error ? error.message : String(error),
           }),
+          ...(args.emitFailureDiagnostic ? { failure_diagnostic: failureDiagnostic } : {}),
         },
         envelope: {
           status: "absent",
@@ -2516,7 +2524,10 @@ function inspectTierCatalog() {
       ...singleProfileTiers.map((tier) => `alternate_profile_missing:${tier}`),
     ];
     return {
-      status: reasonCodes.length ? "degraded" : "ready",
+      // Review Loop readiness requires every semantic tier, but provider diversity is
+      // caller policy. Keep alternate absence machine-readable without degrading the
+      // generic single-provider product.
+      status: missingTiers.length ? "degraded" : "ready",
       path: config.path,
       schema_version: config.value.schema_version,
       digest: config.digest,
@@ -2561,20 +2572,34 @@ function inspectProviderHealth(catalog, checks) {
     referenced.add("codex");
     referenced.add("claude");
   }
-  const codexHealthy = checks.codex.ok && checks.codexAuth.ok;
-  const claudeHealthy = checks.claude.ok && (checks.claudeAuthText.ok || checks.claudeAuthJson.ok);
+  const codexAuthOutput = `${checks.codexAuth.stdout}\n${checks.codexAuth.stderr}`;
+  const codexAuthenticated = checks.codexAuth.ok
+    && /\blogged in\b/i.test(codexAuthOutput)
+    && !/\bnot logged in\b/i.test(codexAuthOutput);
+  const claudeJsonAuthenticated = checks.claudeAuthJson.ok && (() => {
+    try {
+      return JSON.parse(checks.claudeAuthJson.stdout).loggedIn === true;
+    } catch {
+      return false;
+    }
+  })();
+  const claudeTextAuthenticated = checks.claudeAuthText.ok
+    && /\blogin method\s*:/i.test(checks.claudeAuthText.stdout);
+  const claudeAuthenticated = claudeJsonAuthenticated || claudeTextAuthenticated;
+  const codexHealthy = checks.codex.ok && codexAuthenticated;
+  const claudeHealthy = checks.claude.ok && claudeAuthenticated;
   const details = {
     codex: {
       referenced: referenced.has("codex"),
       status: referenced.has("codex") ? codexHealthy ? "healthy" : "unavailable" : "not_required",
       cli_available: checks.codex.ok,
-      authenticated: checks.codexAuth.ok,
+      authenticated: codexAuthenticated,
     },
     claude: {
       referenced: referenced.has("claude"),
       status: referenced.has("claude") ? claudeHealthy ? "healthy" : "unavailable" : "not_required",
       cli_available: checks.claude.ok,
-      authenticated: checks.claudeAuthText.ok || checks.claudeAuthJson.ok,
+      authenticated: claudeAuthenticated,
     },
   };
   const required = Object.values(details).filter((provider) => provider.referenced);
@@ -2598,6 +2623,13 @@ function reconcileTierCatalog(args) {
     throw new Error(`desired reviewer tier configuration must use ${TIER_CONFIG_SCHEMA_VERSION}`);
   }
   const targetPath = tierConfigPath();
+  if (args.applyTierConfig) {
+    return withTierCatalogApplyLock(targetPath, () => reconcileTierCatalogState(args, desiredPath, desiredValue, targetPath));
+  }
+  return reconcileTierCatalogState(args, desiredPath, desiredValue, targetPath);
+}
+
+function reconcileTierCatalogState(args, desiredPath, desiredValue, targetPath) {
   const currentBytes = existsSync(targetPath) ? readFileSync(targetPath, "utf8") : null;
   let current = null;
   if (currentBytes !== null) {
@@ -2638,14 +2670,18 @@ function reconcileTierCatalog(args) {
     throw new Error("--expect-tier-config-missing is required when the active reviewer tier configuration does not exist");
   }
   if (change === "noop") {
-    const capabilities = reviewerCapabilities();
-    if (capabilities.tier_configuration.digest !== desiredDigest) {
-      throw new Error("reviewer tier configuration no-op readback digest mismatch");
-    }
+    assertCatalogReadback(desiredDigest);
+    const capabilityReadback = readCapabilityReadback(desiredDigest);
     return {
       ...preview,
-      status: "verified_noop",
-      capability_readback_digest: capabilities.capability_digest,
+      status: capabilityReadback.ok ? "verified_noop" : "verified_degraded",
+      catalog_readback_digest: desiredDigest,
+      capability_readback_status: capabilityReadback.ok ? "available" : "unavailable",
+      capability_readback_digest: capabilityReadback.digest,
+      ...(capabilityReadback.ok ? {} : {
+        reason_code: "provider_capability_unavailable",
+        error: capabilityReadback.error,
+      }),
     };
   }
 
@@ -2663,28 +2699,36 @@ function reconcileTierCatalog(args) {
 
   try {
     writeJson(targetPath, desiredValue);
-    const capabilities = reviewerCapabilities();
-    if (capabilities.tier_configuration.status !== "configured"
-      || capabilities.tier_configuration.digest !== desiredDigest) {
-      throw new Error("reviewer tier configuration capability readback digest mismatch");
-    }
+    assertCatalogReadback(desiredDigest);
+    const capabilityReadback = readCapabilityReadback(desiredDigest);
     return {
       ...preview,
-      status: "applied",
+      status: capabilityReadback.ok ? "applied" : "applied_degraded",
       backup_path: backupPath,
       backup_digest: current?.digest || null,
       backup_digest_basis: current?.digestBasis || null,
-      capability_readback_digest: capabilities.capability_digest,
+      catalog_readback_digest: desiredDigest,
+      capability_readback_status: capabilityReadback.ok ? "available" : "unavailable",
+      capability_readback_digest: capabilityReadback.digest,
+      ...(capabilityReadback.ok ? {} : {
+        reason_code: "provider_capability_unavailable",
+        error: capabilityReadback.error,
+      }),
     };
   } catch (error) {
     try {
+      if (testFaultEnabled("REVIEW_LOOP_TEST_FORCE_ROLLBACK_FAILURE")) {
+        throw new Error("forced rollback failure api_key=rollback-test-secret");
+      }
       if (previousBytes === null) {
         rmSync(targetPath, { force: true });
       } else {
         writeTextAtomic(targetPath, previousBytes);
       }
     } catch (rollbackError) {
-      throw new Error(`reviewer tier configuration apply failed (${error.message}); rollback failed: ${rollbackError.message}`);
+      const safeApplyError = redact(error instanceof Error ? error.message : String(error));
+      const safeRollbackError = redact(rollbackError instanceof Error ? rollbackError.message : String(rollbackError));
+      throw new Error(`reviewer tier configuration apply failed (${safeApplyError}); rollback failed (${safeRollbackError}); retained backup: ${backupPath || "none"}`);
     }
     return {
       ...preview,
@@ -2693,6 +2737,92 @@ function reconcileTierCatalog(args) {
       backup_digest: current?.digest || null,
       backup_digest_basis: current?.digestBasis || null,
       reason_code: "capability_readback_failed",
+      error: redact(error instanceof Error ? error.message : String(error)),
+    };
+  }
+}
+
+function withTierCatalogApplyLock(targetPath, action) {
+  const lockPath = `${targetPath}.reconcile.lock`;
+  mkdirSync(dirname(lockPath), { recursive: true });
+  let lockFd;
+  try {
+    lockFd = openSync(lockPath, "wx", 0o600);
+    writeFileSync(lockFd, `${JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() })}\n`);
+  } catch (error) {
+    if (lockFd !== undefined) {
+      closeSync(lockFd);
+      rmSync(lockPath, { force: true });
+    }
+    if (error?.code !== "EEXIST") throw error;
+    const owner = readReconciliationLock(lockPath);
+    if (owner.pid !== null && !isProcessAlive(owner.pid)) {
+      const orphanPath = `${lockPath}.orphaned-${owner.pid}-${Date.now()}`;
+      renameSync(lockPath, orphanPath);
+      return withTierCatalogApplyLock(targetPath, action);
+    }
+    const ownerText = owner.pid === null
+      ? "owner_pid=unknown created_at=unknown"
+      : `owner_pid=${owner.pid} created_at=${owner.createdAt || "unknown"}`;
+    throw new Error(`reviewer tier configuration reconciliation is already locked (${ownerText}): ${lockPath}. If no apply is active, inspect and remove or archive this lock before retrying.`);
+  }
+  try {
+    return action();
+  } finally {
+    closeSync(lockFd);
+    unlinkSync(lockPath);
+  }
+}
+
+function readReconciliationLock(lockPath) {
+  try {
+    const value = JSON.parse(readFileSync(lockPath, "utf8"));
+    return {
+      pid: Number.isSafeInteger(value.pid) && value.pid > 0 ? value.pid : null,
+      createdAt: typeof value.created_at === "string" ? value.created_at : null,
+    };
+  } catch {
+    return { pid: null, createdAt: null };
+  }
+}
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function assertCatalogReadback(desiredDigest) {
+  if (testFaultEnabled("REVIEW_LOOP_TEST_FORCE_CATALOG_READBACK_FAILURE")) {
+    throw new Error("forced reviewer tier configuration catalog readback failure");
+  }
+  const catalog = inspectTierCatalog();
+  if (!["ready", "degraded"].includes(catalog.status) || catalog.digest !== desiredDigest) {
+    throw new Error("reviewer tier configuration catalog readback digest mismatch");
+  }
+}
+
+function testFaultEnabled(name) {
+  return process.env.NODE_ENV === "test"
+    && process.env.REVIEW_LOOP_TEST_MODE === "1"
+    && process.env[name] === "1";
+}
+
+function readCapabilityReadback(desiredDigest) {
+  try {
+    const capabilities = reviewerCapabilities();
+    if (capabilities.tier_configuration.status !== "configured"
+      || capabilities.tier_configuration.digest !== desiredDigest) {
+      throw new Error("reviewer tier configuration capability readback digest mismatch");
+    }
+    return { ok: true, digest: capabilities.capability_digest, error: null };
+  } catch (error) {
+    return {
+      ok: false,
+      digest: null,
       error: redact(error instanceof Error ? error.message : String(error)),
     };
   }
@@ -3314,6 +3444,11 @@ function checkCommand(command, args) {
   };
 }
 
+function checkReviewerCommand(command, args) {
+  const base = basename(command).toLowerCase();
+  return checkCommand(command, ["akx", "akc", "akx+", "akc+"].includes(base) ? ["--", ...args] : args);
+}
+
 function git(args, { cwd, optional = false } = {}) {
   const result = spawnSync("git", args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
   // Spawn errors (ENOBUFS on a giant diff, ENOENT) must throw even for
@@ -3375,5 +3510,39 @@ function redact(text) {
     .replace(/sk-[A-Za-z0-9_-]{16,}/g, "sk-REDACTED")
     .replace(/\b(ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{16,}\b/g, "$1_REDACTED")
     .replace(/\b(AKIA|ASIA)[0-9A-Z]{16}\b/g, "$1REDACTED")
+    .replace(/authorization\s*:\s*(?:Bearer\s+)?\S+/gi, "Authorization: REDACTED")
+    .replace(/Bearer\s+\S+/gi, "Bearer REDACTED")
     .replace(/(token|api[_-]?key|authorization)(=|:)\s*["']?[^"'\s]+/gi, "$1$2 REDACTED");
+}
+
+function classifyTransportFailure(error) {
+  const raw = error instanceof Error ? error.message : String(error);
+  const normalized = raw.toLowerCase();
+  let category = "unknown";
+  if (/auth|login|unauthori[sz]ed|forbidden|\b401\b|\b403\b/.test(normalized)) {
+    category = "authentication";
+  } else if (/rate.?limit|capacity|quota|\b429\b/.test(normalized)) {
+    category = "rate_limit";
+  } else if (/timed? ?out|timeout|etimedout|deadline/.test(normalized)) {
+    category = "timeout";
+  } else if (/json|structured output|envelope|malformed|parse|response/.test(normalized)) {
+    category = "response";
+  } else if (/spawn|enoent|exit|signal|process|command not found/.test(normalized)) {
+    category = "process";
+  } else if (/provider|overload|unavailable|service|connection|network/.test(normalized)) {
+    category = "provider";
+  }
+  const messages = {
+    authentication: "Reviewer authentication failed.",
+    rate_limit: "Reviewer provider rate limit or capacity was unavailable.",
+    timeout: "Reviewer transport timed out.",
+    process: "Reviewer process failed before returning a result.",
+    provider: "Reviewer provider or network was unavailable.",
+    response: "Reviewer returned an unusable response envelope.",
+    unknown: "Reviewer transport failed without a safe diagnostic category.",
+  };
+  return {
+    category,
+    message: messages[category],
+  };
 }

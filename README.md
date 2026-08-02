@@ -87,6 +87,33 @@ Review-loop exposes `fast`, `standard`, `strong`, and `legacy_unqualified` as pr
 
 Trusted tier configuration lives outside repositories at `$XDG_STATE_HOME/review-loop/reviewer-tiers.json` (or `~/.local/state/review-loop/reviewer-tiers.json` when `XDG_STATE_HOME` is unset). An operator may point `REVIEW_LOOP_TIER_CONFIG` at another trusted file. Repository files cannot configure reviewer tiers.
 
+Setup's `ok` field preserves its pre-0.8 meaning exactly: Node and the Claude CLI version
+probe succeeded. It does not cover authentication, Codex, catalog state, rollback, or
+activation.
+Activation consumers must ignore `ok`. `operational_status: ready` is the only Review
+Loop-ready state. Its catalog evidence is
+`catalog.status`, `catalog.schema_version`, `catalog.reason_codes`, and `catalog.digest`;
+its provider evidence is `providers.codex.status` and `providers.claude.status`. Agent
+Kernel then reads `capabilities --json` and requires
+`tier_configuration.schema_version`, `tier_configuration.digest`, each semantic tier's
+`configured`, `profiles`, and `alternate_profiles_configured` fields, plus the profile
+release/isolation digests. The stable catalog reason codes are `catalog_missing`,
+`tier_missing:<tier>`, `alternate_profile_missing:<tier>`, `legacy_schema`, and
+`invalid_configuration`. Missing catalogs and missing semantic tiers block Review Loop
+activation; legacy and invalid catalogs are also blocking. An absent alternate profile
+is informational: a complete healthy single-provider v2 catalog is Review Loop-ready.
+Referenced provider status `unavailable` blocks readiness; `not_required` is
+informational. Agent Kernel additionally treats every alternate-profile code and
+`not_required` provider as blocking because its deployment requires exactly six
+profiles across both providers.
+`ok` is retained only for backwards compatibility and is deprecated for any readiness
+decision.
+`operational_status` is closed to `ready`, `degraded`, `migration_required`,
+`invalid`, and `unavailable`. Catalog `migration_required` and `invalid` take
+precedence; otherwise runtime/provider unavailability yields `unavailable`, complete
+catalog plus healthy referenced providers yields `ready`, and other usable states are
+`degraded`.
+
 ```json
 {
   "schema_version": "review-loop.reviewer-tier-config.v2",
@@ -150,7 +177,33 @@ review-loop-setup \
   --json
 ```
 
-Apply performs backup, atomic replacement, and production capability readback. A stale expectation is rejected before mutation; a failed readback restores the prior catalog. Review Loop never invents model choices or silently converts v1 data.
+Apply serializes the digest check through atomic replacement, retains a digest-named
+backup, and performs catalog plus production capability readback. A stale expectation is
+rejected before mutation; catalog-readback failure restores the prior catalog, while
+provider unavailability retains the valid catalog as `applied_degraded`. Backups remain
+available after success or rollback. If restoration itself fails, setup reports both
+redacted failures and the retained backup path and never reports the candidate ready.
+The lock records its PID and creation time; a dead-owner lock is archived and recovered
+automatically, while a live or unreadable lock reports its owner evidence and explicit
+operator recovery instruction.
+PID liveness assumes the trusted state directory is local to one host. Digest-named
+backups use ordinary OS copy permissions, belong to the invoking operator, and are never
+deleted automatically; that operator owns retention/removal after validation.
+Archived orphan-lock records follow the same operator-owned retention policy. A crash
+after atomic replacement but before readback leaves either complete old or complete new
+bytes; the next setup re-inspects the active catalog, and the next explicit apply
+archives the dead lock and must bind to the active digest before verification or change.
+Review Loop never invents model choices or silently converts v1 data.
+
+Authoritative callers that admit the optional transaction diagnostic may pass
+`--emit-failure-diagnostic`. Without that explicit negotiation, unavailable results
+retain the pre-change digest-only transport shape, so strict older consumers never see
+an unknown property.
+The negotiation flag and consumer schema must be installed and rolled back as one caller
+unit. Agent Kernel enforces this by shipping both in the same plugin version; other
+callers assume the same obligation. Negotiated diagnostics ship here because the same
+outage exposed the missing evidence, but the default-off flag/schema addition is
+independently reversible without reverting catalog reconciliation.
 
 Each configured profile includes a release digest over the provider, model, reasoning effort, installed reviewer CLI version, companion/run-wrapper source and version, exact static read-only argv contract, prompt contract, reviewer schemas, deterministic finding policy, and complete operator tier configuration. A tiered normalized result returns that exact identity under `result.reviewer_mechanism.release_identity`. In authoritative transaction mode, the authorization's isolation-profile digest selects exactly one configured profile; review-loop never retries or falls back internally. Existing untiered runs remain `legacy_unqualified` and preserve their current host selection and fallback behavior.
 

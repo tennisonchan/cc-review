@@ -8,6 +8,9 @@
 - Add machine-readable catalog and provider readiness, including both reviewer CLIs and authentication, while keeping valid single-provider v2 catalogs usable but degraded.
 - Add explicit operator-authored v2 reconciliation with preview, optimistic digest binding, backup, atomic write, production capability readback, and rollback.
 - Refuse silent model selection, implicit migration, stale writes, and misleading setup success for legacy or invalid catalogs.
+- Add an explicitly negotiated bounded failure category with a fixed safe message for authoritative unavailable outcomes; non-negotiating callers retain the old digest-only shape and raw provider/process detail always remains digest-only.
+- Serialize catalog apply across digest comparison and atomic rename, recover dead-owner locks, retain recovery backups, and preserve setup `ok` compatibility while activation reads explicit readiness fields.
+- Keep complete healthy single-provider catalogs Review Loop-ready while exposing missing alternates as stable informational reason codes for stricter callers such as Agent Kernel.
 
 ## 0.7.0
 
