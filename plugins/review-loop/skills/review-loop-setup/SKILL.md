@@ -1,6 +1,6 @@
 ---
 name: review-loop-setup
-description: Report catalog and provider readiness, explicitly reconcile trusted reviewer configuration, initialize review guidelines, and configure the default review-loop gate.
+description: Report Review Loop execution readiness, legacy bridge-catalog diagnostics, initialize review guidelines, and configure the default review-loop gate.
 ---
 
 # review-loop setup
@@ -28,4 +28,4 @@ Supported arguments:
 - `--enable-gate-debug`
 - `--disable-gate-debug`
 
-Treat v1 tier configuration as migration input, never runtime-ready configuration. Never invent a v2 catalog or model choice. Preview before apply; apply only an operator-supplied v2 file with an explicit active-state expectation. Setup also checks both reviewer CLIs and authentication, initializes guidelines when requested, and configures the default gate when the current Codex hook surface supports it.
+Execution readiness requires one usable provider and never requires a semantic-tier catalog. Tier reconciliation remains a deprecated old-Kernel bridge: treat v1 configuration as migration input, never invent a v2 catalog or model choice, preview before apply, and apply only an operator-supplied v2 file with an explicit active-state expectation. Setup also checks both reviewer CLIs and authentication, initializes guidelines when requested, and configures the default gate when the current Codex hook surface supports it.

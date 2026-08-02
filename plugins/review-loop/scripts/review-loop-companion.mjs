@@ -33,6 +33,7 @@ const CLAUDE_ALTERNATE_BACKEND_FLAGS = [
 const TIER_CONFIG_SCHEMA_VERSION = "review-loop.reviewer-tier-config.v2";
 const LEGACY_TIER_CONFIG_SCHEMA_VERSION = "review-loop.reviewer-tier-config.v1";
 const CAPABILITY_SCHEMA_VERSION = "review-loop.capabilities.v1";
+const EXECUTION_CONTRACT_SCHEMA_VERSION = "review-loop.execution-contract.v1";
 const RELEASE_IDENTITY_SCHEMA_VERSION = "review-loop.reviewer-release-identity.v1";
 const REVIEWER_MECHANISM_SCHEMA_VERSION = "review-loop.reviewer-mechanism.v1";
 const CODEX_REPOSITORY_ROOT_TOKEN = "<repository-root>";
@@ -98,6 +99,21 @@ class ReviewerEnvelopeFailure extends Error {
     super(message);
     this.name = "ReviewerEnvelopeFailure";
     this.contentDigest = domainDigest("review-loop.reviewer-envelope.v1", content);
+    this.hasSubstantiveContent = hasRecoverableSubstantiveContent(content);
+  }
+}
+
+class ReviewerIdentityFailure extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ReviewerIdentityFailure";
+  }
+}
+
+class ReviewPolicyFailure extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ReviewPolicyFailure";
   }
 }
 
@@ -183,7 +199,7 @@ Run "<subcommand> --help" for subcommand options.`);
 const SUBCOMMAND_HELP = {
   capabilities: "capabilities [--json]",
   setup: "setup [--desired-tier-config <path>] [--apply-tier-config (--expected-tier-config-digest <sha256>|--expect-tier-config-missing)] [--init-guidelines] [--force] [--enable-review-gate] [--disable-review-gate] [--block-on info|low|medium|high] [--on-reviewer-failure block|allow] [--enable-gate-debug] [--disable-gate-debug] [--json]",
-  run: "run [--background] [--counter] [--context <path>] [--artifact <path>] [--focus <text>] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--reviewer claude|codex] [--tier fast|standard|strong] [--authorization <path> --subject-digest <sha256>] [--emit-failure-diagnostic] [--continuation-envelope] [--on-reviewer-failure block|allow] [--json]",
+  run: "run [--background] [--counter] [--context <path>] [--artifact <path>] [--focus <text>] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--reviewer claude|codex] [--model <exact-id> [--reasoning-effort low|medium|high|xhigh|max]] [--tier fast|standard|strong] [--authorization <path> --subject-digest <sha256>] [--emit-failure-diagnostic] [--continuation-envelope] [--on-reviewer-failure block|allow] [--json]",
   status: "status [job-id] [--all] [--json]",
   result: "result [job-id] [--json]",
   cancel: "cancel [job-id] [--json]",
@@ -220,6 +236,8 @@ function parseArgs(argv) {
     guidelines: null,
     initGuidelines: false,
     json: false,
+    model: null,
+    reasoningEffort: null,
     reviewer: null,
     tier: null,
     scope: "auto",
@@ -284,6 +302,8 @@ function parseArgs(argv) {
       case "--authorization":
       case "--focus":
       case "--guidelines":
+      case "--model":
+      case "--reasoning-effort":
       case "--reviewer":
       case "--tier":
       case "--scope":
@@ -298,6 +318,8 @@ function parseArgs(argv) {
         if (arg === "--authorization") args.authorization = value;
         if (arg === "--focus") args.focus = value;
         if (arg === "--guidelines") args.guidelines = value;
+        if (arg === "--model") args.model = value;
+        if (arg === "--reasoning-effort") args.reasoningEffort = value;
         if (arg === "--reviewer") args.reviewer = value;
         if (arg === "--tier") args.tier = value;
         if (arg === "--scope") {
@@ -330,8 +352,19 @@ function parseArgs(argv) {
     throw new Error(`invalid --on-reviewer-failure: ${args.onReviewerFailure}`);
   }
   if (args.reviewer) assertReviewer(args.reviewer, "--reviewer");
+  if (args.model) {
+    if (!args.reviewer) throw new Error("--model requires --reviewer");
+    if (isMutableModelAlias(args.model)) throw new Error(`--model must be an exact model identifier, not mutable alias ${args.model}`);
+  }
+  if (args.reasoningEffort) {
+    if (!args.model) throw new Error("--reasoning-effort requires --model");
+    if (!REASONING_EFFORTS.includes(args.reasoningEffort)) {
+      throw new Error(`--reasoning-effort must be one of: ${REASONING_EFFORTS.join(", ")}`);
+    }
+  }
   if (args.tier) assertSemanticTier(args.tier, "--tier");
   if (args.tier && args.reviewer) throw new Error("--tier and --reviewer cannot be used together");
+  if (args.tier && args.model) throw new Error("--tier and --model cannot be used together");
   if (args.emitFailureDiagnostic && !args.authorization) {
     throw new Error("--emit-failure-diagnostic requires an authoritative --authorization");
   }
@@ -458,18 +491,21 @@ async function setup(args) {
     });
   }
 
+  const usableProviders = ["codex", "claude"].filter((provider) => (
+    providers[provider].cli_available && providers[provider].authenticated
+  ));
+  const executionReadiness = {
+    status: checks.node.ok && usableProviders.length > 0 ? "ready" : "unavailable",
+    catalog_required: false,
+    usable_providers: usableProviders,
+    reason_codes: checks.node.ok && usableProviders.length > 0 ? [] : ["no_usable_host_reviewer"],
+  };
   const result = {
     // Preserve the pre-0.8 compatibility projection exactly. Activation
     // consumers must use operational_status and the readiness evidence below.
     ok: checks.node.ok && checks.claude.ok,
-    operational_status: catalog.status === "migration_required" || catalog.status === "invalid"
-      ? catalog.status
-      : checks.node.ok && providers.status !== "unavailable"
-        && catalog.status === "ready" && providers.status === "healthy"
-        ? "ready"
-        : checks.node.ok && providers.status !== "unavailable"
-          ? "degraded"
-          : "unavailable",
+    operational_status: executionReadiness.status,
+    execution_readiness: executionReadiness,
     repo: repo.root,
     catalog,
     providers,
@@ -557,8 +593,27 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
   const guidelines = args.authorization
     ? authoritativeRuntimeGuidelines()
     : resolveGuidelines(args.guidelines, cwd, repo.root);
-  const policy = guidelinePolicy(guidelines);
   const inputs = collectGenericReviewInputs(repo.root, args, cwd);
+  let policy;
+  try {
+    policy = guidelinePolicy(guidelines);
+  } catch (error) {
+    if (!(error instanceof ReviewPolicyFailure)) throw error;
+    const summary = redact(error.message);
+    return {
+      ok: false,
+      repo: repo.root,
+      guidelines: summarizeGuidelines(guidelines),
+      result: validateNormalizedResult(syntheticNormalizedFailure(
+        "invalid_input",
+        summary,
+        inputs.reviewed_inputs,
+        ["Correct the explicit review policy and rerun review-loop."],
+      )),
+      raw: "",
+      reviewer_mechanism: { skipped: true, reason: "invalid_policy" },
+    };
+  }
   const stance = args.counter ? "counter" : "standard";
   const selection = resolveReviewerSelection(args);
   const reviewer = selection.reviewer;
@@ -656,28 +711,78 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
   }
   let reviewerResult;
   let reviewerOutput;
+  let reviewExecutionOverride = null;
   try {
     reviewerResult = await runReviewer(prompt, {
       reviewer,
       schemaPath: args.continuationEnvelope ? REVIEWER_CONTINUATION_SCHEMA_PATH : REVIEWER_OUTPUT_SCHEMA_PATH,
       cwd: repo.root,
       tierSelection: selection,
+      fakeErrorEnv: reviewer === "claude" ? "REVIEW_LOOP_FAKE_ERROR" : "REVIEW_LOOP_FAKE_CODEX_ERROR",
     });
-    reviewerOutput = validateReviewerOutput(reviewerResult.structuredOutput, {
-      allowContinuationEnvelope: args.continuationEnvelope,
-    });
+    try {
+      reviewerOutput = validateReviewerOutput(reviewerResult.structuredOutput, {
+        allowContinuationEnvelope: args.continuationEnvelope,
+      });
+    } catch (error) {
+      throw new ReviewerEnvelopeFailure(error instanceof Error ? error.message : String(error), reviewerResult.structuredOutput);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const primaryFailure = classifyTransportFailure(error);
+    if (error instanceof ReviewerEnvelopeFailure && error.hasSubstantiveContent) {
+      return genericMechanismFailureResult({
+        repo,
+        guidelines,
+        policy,
+        args,
+        inputs,
+        selection,
+        outcome: "invalid_review_evidence",
+        summary: `Reviewer output was invalid but contained recoverable substantive review content; no fallback reviewer was invoked. Validation: ${redact(message)}`,
+        primaryFailure,
+      });
+    }
     if (args.onReviewerFailure === "throw") {
       throw new ReviewToolFailure(message);
     }
-    const fallbackReviewer = selection.qualified ? null : resolveFallbackReviewer(reviewer);
+    const fallbackReviewer = selection.qualified
+      ? null
+      : resolveFallbackReviewer(reviewer, { requestedModel: selection.model });
     let fallbackMessage = null;
+    let fallbackFailureDiagnostic = null;
     if (fallbackReviewer) {
       try {
-        return await runFallbackReview({ args, cwd, primaryReviewer: reviewer, fallbackReviewer, primaryFailure: message });
+        return await runFallbackReview({
+          args,
+          cwd,
+          selection,
+          primaryReviewer: reviewer,
+          fallbackReviewer,
+          primaryFailure: message,
+          primaryFailureDiagnostic: primaryFailure,
+        });
       } catch (fallbackError) {
         fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+        fallbackFailureDiagnostic = fallbackError instanceof ReviewerIdentityFailure
+          ? failureDiagnostic("identity", fallbackError)
+          : classifyTransportFailure(fallbackError);
+        if (fallbackError instanceof ReviewerEnvelopeFailure && fallbackError.hasSubstantiveContent) {
+          return genericMechanismFailureResult({
+            repo,
+            guidelines,
+            policy,
+            args,
+            inputs,
+            selection,
+            outcome: "invalid_review_evidence",
+            summary: `Host fallback output was invalid but contained recoverable substantive review content; no further reviewer was invoked. Validation: ${redact(fallbackMessage)}`,
+            primaryFailure,
+            fallbackReviewer,
+            fallbackFailureDiagnostic,
+            fallbackAttemptStatus: "invalid_review_evidence",
+          });
+        }
       }
     }
     if (args.onReviewerFailure === "allow") {
@@ -701,6 +806,13 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
           ...(fallbackMessage ? { fallback_failed: true } : {}),
         },
       };
+      reviewExecutionOverride = reviewExecutionFailure({
+        selection,
+        outcome: "unavailable",
+        primaryFailure,
+        fallbackReviewer,
+        fallbackFailureDiagnostic,
+      });
     } else {
       if (!fallbackReviewer) {
         const mechanism = selection.qualified
@@ -721,6 +833,11 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
           reviewer_mechanism: selection.qualified
             ? reviewerMechanismEvidence(selection, { failed: true })
             : { failed: true, on_reviewer_failure: "block" },
+          review_execution: reviewExecutionFailure({
+            selection,
+            outcome: "unavailable",
+            primaryFailure,
+          }),
         };
       }
       return {
@@ -734,6 +851,13 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
         )),
         raw: "",
         reviewer_mechanism: { failed: true, on_reviewer_failure: "block", fallback_failed: true },
+        review_execution: reviewExecutionFailure({
+          selection,
+          outcome: "unavailable",
+          primaryFailure,
+          fallbackReviewer,
+          fallbackFailureDiagnostic,
+        }),
       };
     }
   }
@@ -753,7 +877,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
       target_hash: targetHash,
       result: normalized,
       raw: reviewerResult.resultText,
-      meta: reviewerResult.meta,
+      meta: publicReviewerMeta(reviewerResult.meta),
       created_at: new Date().toISOString(),
     });
   }
@@ -765,7 +889,9 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     raw: reviewerResult.resultText,
     reviewer_mechanism: selection.qualified
       ? reviewerMechanismEvidence(selection, reviewerResult.meta)
-      : reviewerResult.meta,
+      : publicReviewerMeta(reviewerResult.meta),
+    review_execution: reviewExecutionOverride
+      || reviewExecutionDecision({ selection, effectiveReviewer: reviewer, meta: reviewerResult.meta }),
   };
 }
 
@@ -1014,7 +1140,7 @@ function validateTransactionResult(value) {
   return value;
 }
 
-async function runFallbackReview({ args, cwd, primaryReviewer, fallbackReviewer, primaryFailure }) {
+async function runFallbackReview({ args, cwd, selection, primaryReviewer, fallbackReviewer, primaryFailure, primaryFailureDiagnostic }) {
   const repo = resolveWorkspace(cwd);
   const guidelines = resolveGuidelines(args.guidelines, cwd, repo.root);
   const policy = guidelinePolicy(guidelines);
@@ -1022,7 +1148,16 @@ async function runFallbackReview({ args, cwd, primaryReviewer, fallbackReviewer,
 
   const prompt = buildFallbackPrompt({ guidelines, inputs, primaryReviewer, fallbackReviewer, primaryFailure });
   const fallback = await runFallbackReviewer(prompt, { fallbackReviewer, repoRoot: repo.root });
-  const reviewerOutput = validateReviewerOutput(fallback.structuredOutput);
+  let reviewerOutput;
+  try {
+    reviewerOutput = validateReviewerOutput(fallback.structuredOutput);
+  } catch (error) {
+    throw new ReviewerEnvelopeFailure(error instanceof Error ? error.message : String(error), fallback.structuredOutput);
+  }
+  const reviewerIdentity = reviewerIdentityEvidence(fallbackReviewer, fallback.meta);
+  if (!reviewerIdentity) {
+    throw new ReviewerIdentityFailure(`${reviewerDisplayName(fallbackReviewer)} fallback reviewer did not report a fresh native session id`);
+  }
   const normalized = validateNormalizedResult(normalizeReviewOutput(reviewerOutput, {
     policy,
     blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
@@ -1035,9 +1170,216 @@ async function runFallbackReview({ args, cwd, primaryReviewer, fallbackReviewer,
     guidelines: summarizeGuidelines(guidelines),
     result: normalized,
     raw: fallback.resultText,
-    reviewer_mechanism: fallback.meta,
+    reviewer_mechanism: publicReviewerMeta(fallback.meta),
     fallback: fallback.meta.fake ? { fake: true, reviewer: fallbackReviewer } : { status: fallback.meta.status, reviewer: fallbackReviewer },
+    review_execution: reviewExecutionDecision({
+      selection,
+      effectiveReviewer: fallbackReviewer,
+      meta: fallback.meta,
+      fallbackUsed: true,
+      fallbackReason: primaryFailureDiagnostic.category,
+      primaryFailure: primaryFailureDiagnostic,
+    }),
   };
+}
+
+function genericMechanismFailureResult({
+  repo,
+  guidelines,
+  policy,
+  args,
+  inputs,
+  selection,
+  outcome,
+  summary,
+  primaryFailure,
+  fallbackReviewer = null,
+  fallbackFailureDiagnostic = null,
+  fallbackAttemptStatus = "unavailable",
+}) {
+  return {
+    ok: false,
+    repo: repo.root,
+    guidelines: summarizeGuidelines(guidelines),
+    result: validateNormalizedResult(syntheticNormalizedFailure(
+      "blocked",
+      summary,
+      inputs.reviewed_inputs,
+      [],
+      selection.qualified ? reviewerMechanismEvidence(selection, { failed: true }) : "review-loop",
+    )),
+    raw: "",
+    reviewer_mechanism: { failed: true, on_reviewer_failure: "block" },
+    review_execution: reviewExecutionFailure({
+      selection,
+      outcome,
+      primaryFailure,
+      fallbackReviewer,
+      fallbackFailureDiagnostic,
+      fallbackAttemptStatus,
+    }),
+  };
+}
+
+function reviewExecutionDecision({ selection, effectiveReviewer, meta, fallbackUsed = false, fallbackReason = null, primaryFailure = null }) {
+  const identity = reviewerIdentityEvidence(effectiveReviewer, meta);
+  const attempts = [];
+  if (fallbackUsed) {
+    attempts.push(reviewExecutionAttempt({
+      ordinal: 1,
+      role: "requested",
+      reviewer: selection.reviewer,
+      model: selection.model || null,
+      status: "unavailable",
+      failureCategory: primaryFailure?.category || "unknown",
+      diagnosticDigest: primaryFailure?.diagnostic_digest || null,
+    }));
+  }
+  attempts.push(reviewExecutionAttempt({
+    ordinal: fallbackUsed ? 2 : 1,
+    role: fallbackUsed ? "host_fallback" : "requested",
+    reviewer: effectiveReviewer,
+    model: fallbackUsed ? null : selection.model || null,
+    status: "decision",
+    sessionIdDigest: identity?.session_id_digest || null,
+  }));
+  return validateReviewExecution({
+    schema_version: "review-loop.execution-result.v1",
+    outcome: "decision",
+    requested_route: requestedRoute(selection),
+    effective_route: effectiveRoute(effectiveReviewer, fallbackUsed ? null : selection.model || null),
+    fallback_used: fallbackUsed,
+    fallback_reason: fallbackReason,
+    attempts,
+    reviewer_identity: identity,
+    read_only: true,
+  });
+}
+
+function reviewExecutionFailure({
+  selection,
+  outcome,
+  primaryFailure,
+  fallbackReviewer = null,
+  fallbackFailureDiagnostic = null,
+  fallbackAttemptStatus = "unavailable",
+}) {
+  const attempts = [reviewExecutionAttempt({
+    ordinal: 1,
+    role: "requested",
+    reviewer: selection.reviewer,
+    model: selection.model || null,
+    status: !fallbackReviewer && outcome === "invalid_review_evidence" ? "invalid_review_evidence" : "unavailable",
+    failureCategory: primaryFailure?.category || "unknown",
+    diagnosticDigest: primaryFailure?.diagnostic_digest || null,
+  })];
+  if (fallbackReviewer) {
+    attempts.push(reviewExecutionAttempt({
+      ordinal: 2,
+      role: "host_fallback",
+      reviewer: fallbackReviewer,
+      model: null,
+      status: fallbackAttemptStatus,
+      failureCategory: fallbackFailureDiagnostic?.category || "unknown",
+      diagnosticDigest: fallbackFailureDiagnostic?.diagnostic_digest || null,
+    }));
+  }
+  return validateReviewExecution({
+    schema_version: "review-loop.execution-result.v1",
+    outcome,
+    requested_route: requestedRoute(selection),
+    effective_route: null,
+    fallback_used: Boolean(fallbackReviewer),
+    fallback_reason: primaryFailure?.category || null,
+    attempts,
+    reviewer_identity: null,
+    read_only: true,
+  });
+}
+
+function reviewExecutionAttempt({ ordinal, role, reviewer, model, status, failureCategory = null, diagnosticDigest = null, sessionIdDigest = null }) {
+  return {
+    ordinal,
+    role,
+    reviewer,
+    model,
+    status,
+    ...(failureCategory ? { failure_category: failureCategory } : {}),
+    ...(diagnosticDigest ? { diagnostic_digest: diagnosticDigest } : {}),
+    ...(sessionIdDigest ? { session_id_digest: sessionIdDigest } : {}),
+  };
+}
+
+function requestedRoute(selection) {
+  return {
+    reviewer: selection.reviewer,
+    model: selection.model || null,
+    reasoning_effort: selection.reasoningEffort || null,
+  };
+}
+
+function effectiveRoute(reviewer, model) {
+  return {
+    reviewer,
+    model,
+    model_identity_evidence: model ? (reviewer === "claude" ? "provider_reported" : "explicit_argv") : "host_default_unreported",
+  };
+}
+
+function reviewerIdentityEvidence(reviewer, meta) {
+  const sessionId = typeof meta?.session_id === "string" ? meta.session_id.trim() : "";
+  if (!sessionId) return null;
+  return {
+    provider: reviewer === "claude" ? "anthropic" : "openai",
+    signal: "provider_reported_session_id",
+    session_id_digest: domainDigest("review-loop.provider-session.v1", {
+      provider: reviewer === "claude" ? "anthropic" : "openai",
+      session_id: sessionId,
+    }),
+  };
+}
+
+function publicReviewerMeta(meta) {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return meta;
+  const { session_id: _sessionId, ...safe } = meta;
+  return safe;
+}
+
+function validateReviewExecution(value) {
+  if (!value || value.schema_version !== "review-loop.execution-result.v1") {
+    throw new Error("review execution schema_version is invalid");
+  }
+  if (!["decision", "invalid_review_evidence", "unavailable"].includes(value.outcome)) {
+    throw new Error("review execution outcome is invalid");
+  }
+  if (!Array.isArray(value.attempts) || value.attempts.length < 1 || value.attempts.length > 2) {
+    throw new Error("review execution attempts must contain one or two entries");
+  }
+  for (const [index, attempt] of value.attempts.entries()) {
+    if (attempt.ordinal !== index + 1) throw new Error("review execution attempt ordinals must be contiguous");
+    const expectedRole = index === 0 ? "requested" : "host_fallback";
+    if (attempt.role !== expectedRole) throw new Error(`review execution attempt ${attempt.ordinal} role must be ${expectedRole}`);
+    if (!["decision", "invalid_review_evidence", "unavailable"].includes(attempt.status)) {
+      throw new Error(`review execution attempt ${attempt.ordinal} status is invalid`);
+    }
+    if (attempt.status !== "decision") {
+      if (!["authentication", "rate_limit", "timeout", "process", "provider", "response", "identity", "unknown"].includes(attempt.failure_category)) {
+        throw new Error(`review execution attempt ${attempt.ordinal} failure_category is invalid`);
+      }
+      assertSha256(attempt.diagnostic_digest, `review execution attempt ${attempt.ordinal} diagnostic_digest`);
+    }
+  }
+  if (value.fallback_used !== (value.attempts.length === 2)) {
+    throw new Error("review execution fallback_used does not match attempts");
+  }
+  if (value.outcome === "decision" && !value.effective_route) {
+    throw new Error("decision review execution requires an effective route");
+  }
+  if (value.outcome !== "decision" && value.effective_route !== null) {
+    throw new Error("non-decision review execution must not expose an effective route");
+  }
+  if (value.read_only !== true) throw new Error("review execution must be read-only");
+  return value;
 }
 
 async function runFallbackReviewer(prompt, { fallbackReviewer, repoRoot }) {
@@ -1114,7 +1456,9 @@ function runCodexReviewerPrimitive(prompt, options) {
       meta: {
         fake: true,
         reviewer_mechanism: options.fakeMechanism,
-        session_id: process.env.REVIEW_LOOP_FAKE_CODEX_SESSION_ID || null,
+        session_id: options.useFallbackSentinel
+          ? process.env.REVIEW_LOOP_FAKE_FALLBACK_SESSION_ID || null
+          : process.env.REVIEW_LOOP_FAKE_CODEX_SESSION_ID || null,
       },
     };
   }
@@ -1127,19 +1471,19 @@ function runCodexReviewerPrimitive(prompt, options) {
   const timeoutMs = Number(process.env[options.timeoutEnv] || DEFAULT_FALLBACK_TIMEOUT_MS);
   const childEnv = { ...process.env, REVIEW_LOOP_TERMINAL_REVIEWER: "1" };
   if (fallbackToken) childEnv.REVIEW_LOOP_FALLBACK_TOKEN = fallbackToken;
-  const reviewerArgs = options.tierSelection?.qualified
+  const reviewerArgs = options.tierSelection?.model
     ? tierReviewerStaticArgs(options.tierSelection)
     : ["--sandbox", "read-only"];
   const result = spawnSync(codexBin(), [
     "exec",
     ...reviewerArgs,
-    ...(options.tierSelection?.qualified ? tierCodexWorkspaceArgs(options.repoRoot) : ["--cd", options.repoRoot]),
+    ...(options.tierSelection?.model ? tierCodexWorkspaceArgs(options.repoRoot) : ["--cd", options.repoRoot]),
     "--json",
     "--output-schema", options.schemaPath || REVIEWER_OUTPUT_SCHEMA_PATH,
     "--output-last-message", outPath,
     "-",
   ], {
-    cwd: options.tierSelection?.qualified ? tierCodexNeutralRoot() : options.repoRoot,
+    cwd: options.tierSelection?.model ? tierCodexNeutralRoot() : options.repoRoot,
     encoding: "utf8",
     input: prompt,
     timeout: timeoutMs,
@@ -1310,7 +1654,9 @@ async function runClaudeReviewer(prompt, options = {}) {
     }
     const meta = {
       fake: true,
-      session_id: process.env.REVIEW_LOOP_FAKE_CLAUDE_SESSION_ID || null,
+      session_id: options.useFallbackSentinel
+        ? process.env.REVIEW_LOOP_FAKE_FALLBACK_SESSION_ID || null
+        : process.env.REVIEW_LOOP_FAKE_CLAUDE_SESSION_ID || null,
     };
     if (options.fakeMechanism) meta.reviewer_mechanism = options.fakeMechanism;
     return { structuredOutput, resultText: "", meta };
@@ -1318,7 +1664,7 @@ async function runClaudeReviewer(prompt, options = {}) {
 
   // Read-only context tools so the reviewer can see beyond the diff (the
   // enclosing function, callers, tests); plan mode prevents writes.
-  const reviewerArgs = options.tierSelection?.qualified
+  const reviewerArgs = options.tierSelection?.model
     ? tierReviewerStaticArgs(options.tierSelection)
     : ["--permission-mode", "plan", "--tools", "Read,Grep,Glob"];
   const args = [
@@ -1418,7 +1764,7 @@ async function runClaudeReviewer(prompt, options = {}) {
   if (!envelope.structured_output) {
     throw new ReviewerEnvelopeFailure("claude JSON envelope did not include structured_output", envelope);
   }
-  if (options.tierSelection?.qualified) {
+  if (options.tierSelection?.model) {
     try {
       assertClaudeResolvedModel(envelope, options.tierSelection.model);
     } catch (error) {
@@ -1949,7 +2295,15 @@ async function gateCommand(args) {
       return;
     }
     try {
-      const fallback = await runFallbackReview({ args: gateArgs, cwd: process.cwd(), primaryReviewer: selectedReviewer, fallbackReviewer, primaryFailure: message });
+      const fallback = await runFallbackReview({
+        args: gateArgs,
+        cwd: process.cwd(),
+        selection: resolveReviewerSelection(gateArgs),
+        primaryReviewer: selectedReviewer,
+        fallbackReviewer,
+        primaryFailure: message,
+        primaryFailureDiagnostic: classifyTransportFailure(error),
+      });
       reviewResult = fallback;
       fallbackDisclosure = [
         `${reviewerDisplayName(selectedReviewer)} reviewer was unavailable; used degraded ${reviewerDisplayName(fallbackReviewer)} fallback review.`,
@@ -1995,6 +2349,13 @@ async function gateCommand(args) {
   const taskState = freshTaskState(state.tasks[taskKey]);
   const targetSummary = gateTargetSummary(reviewResult.result);
   if (fallbackTaskKey !== taskKey) delete state.tasks[fallbackTaskKey];
+
+  if (["invalid_input", "blocked"].includes(reviewResult.result.decision)) {
+    delete state.tasks[taskKey];
+    writeGateState(repo.root, state);
+    outputHookBlock(reviewResult.result.summary);
+    return;
+  }
 
   if (!blocking.length) {
     delete state.tasks[taskKey];
@@ -2061,23 +2422,27 @@ function guidelinePolicy(guidelines) {
   try {
     parsed = JSON.parse(match[1]);
   } catch (error) {
-    throw new Error(`invalid review-loop policy block in ${guidelines.path}: ${error.message}`);
+    throw new ReviewPolicyFailure(`invalid review-loop policy block in ${guidelines.path}: ${error.message}`);
   }
   for (const key of Object.keys(parsed)) {
     if (!["block_on", "category_block_on"].includes(key)) {
-      throw new Error(`unknown review-loop policy key in ${guidelines.path}: ${key}`);
+      throw new ReviewPolicyFailure(`unknown review-loop policy key in ${guidelines.path}: ${key}`);
     }
   }
   if (parsed.block_on !== undefined) {
-    assertSeverity(parsed.block_on, "guidelines block_on");
+    if (!SEVERITIES.includes(parsed.block_on)) {
+      throw new ReviewPolicyFailure(`guidelines block_on must be one of: ${SEVERITIES.join(", ")}`);
+    }
     policy.blockOn = parsed.block_on;
   }
   if (parsed.category_block_on !== undefined) {
     if (!parsed.category_block_on || typeof parsed.category_block_on !== "object" || Array.isArray(parsed.category_block_on)) {
-      throw new Error(`guidelines category_block_on must be an object in ${guidelines.path}`);
+      throw new ReviewPolicyFailure(`guidelines category_block_on must be an object in ${guidelines.path}`);
     }
     for (const [category, value] of Object.entries(parsed.category_block_on)) {
-      if (value !== "never") assertSeverity(value, `guidelines category_block_on.${category}`);
+      if (value !== "never" && !SEVERITIES.includes(value)) {
+        throw new ReviewPolicyFailure(`guidelines category_block_on.${category} must be one of: ${SEVERITIES.join(", ")}, never`);
+      }
       policy.categories[category] = value;
     }
   }
@@ -2404,6 +2769,9 @@ function resolveReviewerSelection(args = {}) {
       qualified: false,
       semanticTier: "legacy_unqualified",
       reviewer: resolveReviewer(args),
+      model: args.model || null,
+      reasoningEffort: args.reasoningEffort || null,
+      resolvedRoute: Boolean(args.model),
       releaseIdentity: null,
     };
   }
@@ -2468,6 +2836,23 @@ function reviewerCapabilities() {
     schema_version: CAPABILITY_SCHEMA_VERSION,
     adapter_version: adapterVersion(),
     semantic_tiers: [...SEMANTIC_TIERS, "legacy_unqualified"],
+    execution_contract: {
+      schema_version: EXECUTION_CONTRACT_SCHEMA_VERSION,
+      risk_translation: false,
+      optional_policy: true,
+      optional_model: true,
+      automatic_host_fallback: true,
+      max_mechanism_attempts: 2,
+      action_neutral_result: true,
+    },
+    execution_readiness: {
+      status: "ready",
+      catalog_required: false,
+    },
+    tier_bridge: {
+      status: "deprecated",
+      removal_owner: "RL-CLEANUP",
+    },
     tier_configuration: migrationRequired
       ? {
           status: "migration_required",
@@ -3017,26 +3402,32 @@ function reviewerMechanismEvidence(selection, meta = {}) {
 
 function tierReviewerStaticArgs(selection) {
   if (selection.reviewer === "codex") {
-    return [
+    const args = [
       "--ephemeral",
       "--ignore-user-config",
       "--ignore-rules",
       "--strict-config",
       "--model", selection.model,
-      "--config", `model_reasoning_effort=${JSON.stringify(selection.reasoningEffort)}`,
+    ];
+    if (selection.reasoningEffort) {
+      args.push("--config", `model_reasoning_effort=${JSON.stringify(selection.reasoningEffort)}`);
+    }
+    args.push(
       "--config", "project_doc_max_bytes=0",
       "--config", "project_doc_fallback_filenames=[]",
       "--sandbox", "read-only",
-    ];
+    );
+    return args;
   }
-  return [
+  const args = [
     "--safe-mode",
     "--model", selection.model,
-    "--effort", selection.reasoningEffort,
     "--no-session-persistence",
     "--permission-mode", "plan",
     "--tools", "Read,Grep,Glob",
   ];
+  if (selection.reasoningEffort) args.splice(3, 0, "--effort", selection.reasoningEffort);
+  return args;
 }
 
 function readOnlyContract(selection) {
@@ -3120,9 +3511,9 @@ function canonicalJson(value) {
   return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
 }
 
-function resolveFallbackReviewer(primaryReviewer) {
+function resolveFallbackReviewer(primaryReviewer, { requestedModel = null } = {}) {
   const host = resolveHost();
-  return host && host !== primaryReviewer ? host : null;
+  return host && (host !== primaryReviewer || requestedModel) ? host : null;
 }
 
 function reviewerDisplayName(reviewer) {
@@ -3544,5 +3935,29 @@ function classifyTransportFailure(error) {
   return {
     category,
     message: messages[category],
+    diagnostic_digest: failureDiagnostic(category, error).diagnostic_digest,
   };
+}
+
+function failureDiagnostic(category, error) {
+  const raw = error instanceof Error ? error.message : String(error);
+  return {
+    category,
+    diagnostic_digest: domainDigest("review-loop.failure-diagnostic.v1", {
+      category,
+      diagnostic: redact(raw).slice(0, 2000),
+    }),
+  };
+}
+
+function hasRecoverableSubstantiveContent(content) {
+  if (content && typeof content === "object" && !Array.isArray(content)) {
+    const decision = typeof content.decision === "string" ? content.decision : "";
+    const findings = Array.isArray(content.findings) ? content.findings : [];
+    return ["changes_requested", "invalid_input", "blocked"].includes(decision) || findings.length > 0;
+  }
+  const raw = typeof content === "string" ? content : canonicalJson(content);
+  if (/"decision"\s*:\s*"(?:changes_requested|invalid_input|blocked)"/i.test(raw)) return true;
+  const findingsMatch = raw.match(/"findings"\s*:\s*\[([\s\S]*)/i);
+  return Boolean(findingsMatch && /"(?:id|message|required_action)"\s*:/.test(findingsMatch[1]));
 }
