@@ -60,6 +60,7 @@ Useful options:
 - `--scope none|auto|working-tree|branch` selects repository diff input. For `run`, context/artifact-only reviews default to `none`; otherwise the default is `auto`.
 - `--focus <text>` supplies the reviewer ask.
 - `--counter` runs the loop in counter-review stance, focused on challenging an assumption, risk, or approach.
+- `--reviewer claude|codex` optionally selects a preferred reviewer. `--model <exact-id>` (with optional `--reasoning-effort low|medium|high|xhigh|max`) requires `--reviewer`; mutable aliases such as `latest` are rejected. If that exact mechanism fails before substantive review content exists, Review Loop attempts one fresh host-model fallback automatically.
 - `--tier fast|standard|strong` selects an exact operator-configured reviewer release. Tiered runs fail closed and do not use cross-provider fallback or `--on-reviewer-failure allow`.
 - `--authorization <path> --subject-digest <sha256>` selects transaction mode for an Agent Kernel-issued envelope. It requires a qualified tier, executes once, and bypasses cache, fallback, background execution, continuation, and fail-open behavior.
 - `--continuation-envelope` asks a `strong` tier initial review for a structured closure envelope. It is invalid without `--tier strong`.
@@ -67,6 +68,8 @@ Useful options:
 - `--background`, `status`, `result`, and `cancel` work with generic reviews. Persisted job metadata is sanitized; free-form focus text, logs, and errors are not returned raw through status/result JSON.
 
 JSON output uses snake_case fields. The normalized result is under `result` and includes `decision`, `blocking_findings`, `advisory_findings`, `required_next_actions`, `reviewed_inputs`, `reviewer_mechanism`, and `read_only`.
+
+Ordinary reviewer execution also returns the action-neutral top-level `review_execution` object with outcome `decision`, `invalid_review_evidence`, or `unavailable`, requested/effective routes, bounded attempts, fallback provenance, and hashed reviewer identity. It is absent when reviewer execution never begins (for example invalid explicit policy or an empty target) and when an unchanged gate cache result is reused; bridge-window consumers must use the legacy `result` projection on those paths.
 
 Coordinating consumers must durably admit the complete normalized result before publishing or interpreting a workflow outcome. Reviewer sessions are intentionally non-persistent, so decision/result digests alone cannot recover findings after a downstream publication failure. A replay must use the admitted result and original packet binding without invoking another reviewer.
 
@@ -85,7 +88,7 @@ Host plugins select the opposite reviewer by default:
 
 Reviewer agents are terminal. A reviewer may inspect code and return structured findings, but must not invoke `review-loop`, run another reviewer, delegate work, or modify files. Internally, reviewer subprocesses receive `REVIEW_LOOP_TERMINAL_REVIEWER=1`; `review-loop run` refuses nested review execution and the Stop hook allows/no-ops in that mode.
 
-`REVIEW_LOOP_REVIEWER=claude|codex` and `--reviewer claude|codex` exist for internal/plugin routing and tests. Normal users should rely on the host defaults.
+`REVIEW_LOOP_REVIEWER=claude|codex` and `--reviewer claude|codex` can override the host default when a caller has already resolved a preferred route. Omit them to retain host-aware default selection.
 
 ## Semantic Reviewer Tiers
 

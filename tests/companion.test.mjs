@@ -7,6 +7,69 @@ import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 
 const companion = new URL("../plugins/review-loop/scripts/review-loop-companion.mjs", import.meta.url).pathname;
+const executionResultSchema = JSON.parse(readFileSync(
+  new URL("../plugins/review-loop/schemas/execution-result.v1.schema.json", import.meta.url),
+  "utf8",
+));
+
+function assertSchemaKeys(value, schema, label) {
+  for (const key of schema.required || []) assert.ok(Object.hasOwn(value, key), `${label}.${key} is required`);
+  if (schema.additionalProperties === false) {
+    assert.deepEqual(
+      Object.keys(value).filter((key) => !Object.hasOwn(schema.properties, key)),
+      [],
+      `${label} has properties outside the published schema`,
+    );
+  }
+}
+
+function assertExecutionResultSchema(value) {
+  const schema = executionResultSchema;
+  assertSchemaKeys(value, schema, "review_execution");
+  assert.equal(value.schema_version, schema.properties.schema_version.const);
+  assert.ok(schema.properties.outcome.enum.includes(value.outcome));
+  assert.ok(schema.properties.fallback_reason.enum.includes(value.fallback_reason));
+  assert.equal(value.read_only, schema.properties.read_only.const);
+
+  const requested = schema.$defs.requested_route;
+  assertSchemaKeys(value.requested_route, requested, "requested_route");
+  assert.ok(requested.properties.reviewer.enum.includes(value.requested_route.reviewer));
+  assert.ok(requested.properties.reasoning_effort.enum.includes(value.requested_route.reasoning_effort));
+
+  if (value.effective_route !== null) {
+    const effective = schema.$defs.effective_route;
+    assertSchemaKeys(value.effective_route, effective, "effective_route");
+    assert.ok(effective.properties.reviewer.enum.includes(value.effective_route.reviewer));
+    assert.ok(effective.properties.model_identity_evidence.enum.includes(value.effective_route.model_identity_evidence));
+  }
+
+  assert.ok(value.attempts.length >= schema.properties.attempts.minItems);
+  assert.ok(value.attempts.length <= schema.properties.attempts.maxItems);
+  for (const [index, attempt] of value.attempts.entries()) {
+    const attemptSchema = schema.$defs.attempt;
+    assertSchemaKeys(attempt, attemptSchema, `attempts[${index}]`);
+    assert.ok(attempt.ordinal >= attemptSchema.properties.ordinal.minimum);
+    assert.ok(attempt.ordinal <= attemptSchema.properties.ordinal.maximum);
+    assert.ok(attemptSchema.properties.role.enum.includes(attempt.role));
+    assert.ok(attemptSchema.properties.reviewer.enum.includes(attempt.reviewer));
+    assert.ok(attemptSchema.properties.status.enum.includes(attempt.status));
+    if (attempt.status !== "decision") {
+      assert.ok(attemptSchema.properties.failure_category.enum.includes(attempt.failure_category));
+      assert.match(attempt.diagnostic_digest, new RegExp(schema.$defs.sha256.pattern));
+    }
+    if (attempt.session_id_digest !== undefined) {
+      assert.match(attempt.session_id_digest, new RegExp(schema.$defs.sha256.pattern));
+    }
+  }
+
+  if (value.reviewer_identity !== null) {
+    const identity = schema.$defs.reviewer_identity;
+    assertSchemaKeys(value.reviewer_identity, identity, "reviewer_identity");
+    assert.ok(identity.properties.provider.enum.includes(value.reviewer_identity.provider));
+    assert.equal(value.reviewer_identity.signal, identity.properties.signal.const);
+    assert.match(value.reviewer_identity.session_id_digest, new RegExp(schema.$defs.sha256.pattern));
+  }
+}
 
 test("setup initializes project review guidelines without overwriting", () => {
   const repo = makeGitRepo();
@@ -2002,6 +2065,57 @@ test("run accepts an exact optional model and reports automatic host fallback pr
   assert.equal(parsed.review_execution.reviewer_identity.provider, "openai");
   assert.match(parsed.review_execution.reviewer_identity.session_id_digest, /^[a-f0-9]{64}$/);
   assert.doesNotMatch(JSON.stringify(parsed), /fresh-codex-review-session/);
+  assertExecutionResultSchema(parsed.review_execution);
+});
+
+test("run never answer-shops when an exact Claude model drifts after substantive findings", () => {
+  const repo = makeGitRepo();
+  const fakeClaude = join(repo, "bin", "claude-exact-model-drift");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeClaude, `#!/usr/bin/env node
+if (process.argv[2] === "--version") { console.log("2.1.220 (Claude Code)"); process.exit(0); }
+console.log(JSON.stringify({
+  structured_output: {
+    decision: "changes_requested",
+    summary: "The requested-model review found a substantive blocker.",
+    findings: [{
+      id: "drifted-model-blocker",
+      severity: "high",
+      category: "correctness",
+      message: "Do not discard this finding.",
+      locations: ["src/example.js:1"],
+      required_action: "Preserve the finding as invalid review evidence.",
+      reviewer_disposition: "blocking"
+    }],
+    required_next_actions: ["Preserve the finding as invalid review evidence."]
+  },
+  result: "review completed",
+  session_id: "drifted-claude-session",
+  modelUsage: { "claude-opus-4-8": { outputTokens: 12 } }
+}));
+`, { mode: 0o755 });
+
+  const result = run([
+    "run", "--scope", "none", "--reviewer", "claude",
+    "--model", "claude-opus-5", "--reasoning-effort", "high", "--json",
+  ], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("answer-shopping fallback")),
+      REVIEW_LOOP_FAKE_CODEX_SESSION_ID: "fallback-session-that-must-not-run",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.equal(parsed.review_execution.fallback_used, false);
+  assert.equal(parsed.review_execution.attempts.length, 1);
+  assert.equal(parsed.review_execution.attempts[0].status, "invalid_review_evidence");
+  assert.doesNotMatch(JSON.stringify(parsed), /answer-shopping fallback/);
 });
 
 test("run falls back from a failed exact model to the same-provider host default", () => {
@@ -2096,6 +2210,7 @@ test("run does not answer-shop when malformed output contains recoverable findin
   assert.equal(parsed.review_execution.fallback_used, false);
   assert.equal(parsed.review_execution.attempts.length, 1);
   assert.doesNotMatch(JSON.stringify(parsed), /fallback must not run|unused-fallback-session/);
+  assertExecutionResultSchema(parsed.review_execution);
 });
 
 test("run treats a malformed invalid_input decision as terminal review evidence", () => {
@@ -2174,6 +2289,7 @@ test("run reports unavailable when host fallback lacks a fresh native session id
   assert.match(parsed.review_execution.attempts[0].diagnostic_digest, /^[a-f0-9]{64}$/);
   assert.equal(parsed.review_execution.attempts[1].failure_category, "identity");
   assert.match(parsed.review_execution.attempts[1].diagnostic_digest, /^[a-f0-9]{64}$/);
+  assertExecutionResultSchema(parsed.review_execution);
 });
 
 test("run uses Claude fallback when Codex is unavailable under a Claude host", () => {

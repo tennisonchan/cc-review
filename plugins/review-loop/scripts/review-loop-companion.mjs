@@ -3952,6 +3952,10 @@ function failureDiagnostic(category, error) {
 
 function hasRecoverableSubstantiveContent(content) {
   if (content && typeof content === "object" && !Array.isArray(content)) {
+    if (content.structured_output !== undefined
+      && hasRecoverableSubstantiveContent(content.structured_output)) {
+      return true;
+    }
     const decision = typeof content.decision === "string" ? content.decision : "";
     const findings = Array.isArray(content.findings) ? content.findings : [];
     return ["changes_requested", "invalid_input", "blocked"].includes(decision) || findings.length > 0;
