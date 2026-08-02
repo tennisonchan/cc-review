@@ -3709,10 +3709,16 @@ test("manifest wires Codex Stop hook", () => {
 });
 
 test("Claude plugin surface routes commands and Stop hook through shared runtime", () => {
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   const marketplace = JSON.parse(readFileSync(new URL("../.claude-plugin/marketplace.json", import.meta.url), "utf8"));
   assert.equal(marketplace.plugins[0].source, "./plugins/review-loop");
   const manifest = JSON.parse(readFileSync(new URL("../plugins/review-loop/.claude-plugin/plugin.json", import.meta.url), "utf8"));
   assert.equal(manifest.name, "review-loop");
+  const codexManifest = JSON.parse(readFileSync(new URL("../plugins/review-loop/.codex-plugin/plugin.json", import.meta.url), "utf8"));
+  assert.equal(manifest.version, pkg.version);
+  assert.equal(codexManifest.version, pkg.version);
+  assert.equal(marketplace.metadata.version, pkg.version);
+  assert.equal(marketplace.plugins[0].version, pkg.version);
   const hooks = JSON.parse(readFileSync(new URL("../plugins/review-loop/hooks/hooks.json", import.meta.url), "utf8"));
   const commandHook = hooks.hooks.Stop[0].hooks[0];
   assert.doesNotMatch(commandHook.command, /REVIEW_LOOP_HOST=claude/);

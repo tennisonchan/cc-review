@@ -159,7 +159,7 @@ review-loop run --tier strong --context review-context.md --scope none --json
 
 Each tier may contain one or two ordered profiles. Two-profile tiers must use distinct providers. Capabilities expose the complete `profiles` array and keep `release_identity` and `isolation_profile` as projections of the first profile for existing consumers. Version 1 is migration input only: setup reports `migration_required`, capabilities advertise no qualified tier routes, and tiered execution refuses to run until an operator explicitly applies a v2 catalog.
 
-`review-loop-setup --json` reports catalog state (`ready`, `degraded`, `migration_required`, or `invalid`) separately from referenced-provider CLI and authentication health. A valid single-provider v2 catalog remains usable but degraded; dual-provider coverage is a caller deployment policy, not a universal Review Loop restriction.
+`review-loop-setup --json` reports catalog state (`ready`, `degraded`, `migration_required`, or `invalid`) separately from referenced-provider CLI and authentication health. A complete healthy single-provider v2 catalog is Review Loop-ready; dual-provider coverage is a caller deployment policy, not a universal Review Loop restriction.
 
 Preview an operator-authored v2 catalog without changing active state:
 

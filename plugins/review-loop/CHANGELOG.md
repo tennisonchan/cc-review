@@ -5,7 +5,7 @@
 ## 0.8.0
 
 - Make v1 reviewer-tier catalogs migration-only instead of projecting them as qualified runtime routes.
-- Add machine-readable catalog and provider readiness, including both reviewer CLIs and authentication, while keeping valid single-provider v2 catalogs usable but degraded.
+- Add machine-readable catalog and provider readiness, including both reviewer CLIs and authentication, while keeping complete healthy single-provider v2 catalogs Review Loop-ready.
 - Add explicit operator-authored v2 reconciliation with preview, optimistic digest binding, backup, atomic write, production capability readback, and rollback.
 - Refuse silent model selection, implicit migration, stale writes, and misleading setup success for legacy or invalid catalogs.
 - Add an explicitly negotiated bounded failure category with a fixed safe message for authoritative unavailable outcomes; non-negotiating callers retain the old digest-only shape and raw provider/process detail always remains digest-only.
