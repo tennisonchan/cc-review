@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.9.0
+
+- Add optional exact reviewer/model input and action-neutral execution provenance.
+- Automatically attempt one fresh host reviewer for eligible mechanism failures without operator prompts.
+- Prevent answer-shopping when malformed output contains recoverable findings, and require native session identity for completed fallback.
+- Decouple operational readiness from the deprecated semantic-tier catalog while retaining a narrow old-Kernel rollout bridge.
+
 ## 0.8.0
 
 - Make v1 reviewer-tier catalogs migration-only instead of projecting them as qualified runtime routes.

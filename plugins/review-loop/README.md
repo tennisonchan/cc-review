@@ -2,6 +2,8 @@
 
 Multi-agent review loops for structured, policy-aware code gates.
 
+Review Loop owns read-only reviewer execution and one automatic fresh host-model fallback. It does not own risk tiers or workflow actions. Policy and exact model inputs are optional; malformed explicit policy is rejected, and substantive review content is never discarded to seek another answer. See [`docs/product-boundary.md`](../../docs/product-boundary.md).
+
 `review-loop` is a gate-agnostic, read-only review execution engine: callers provide context, artifacts, focus, and optional guidelines; higher-level agents decide when a review is needed and what gate or policy the result satisfies. Codex and Claude Code surfaces are host adapters over the same engine.
 
 The core workflow is agent-first:
@@ -58,6 +60,7 @@ Useful options:
 - `--scope none|auto|working-tree|branch` selects repository diff input. For `run`, context/artifact-only reviews default to `none`; otherwise the default is `auto`.
 - `--focus <text>` supplies the reviewer ask.
 - `--counter` runs the loop in counter-review stance, focused on challenging an assumption, risk, or approach.
+- `--reviewer claude|codex` optionally selects a preferred reviewer. `--model <exact-id>` (with optional `--reasoning-effort low|medium|high|xhigh|max`) requires `--reviewer`; mutable aliases such as `latest` are rejected. If that exact mechanism fails before substantive review content exists, Review Loop attempts one fresh host-model fallback automatically.
 - `--tier fast|standard|strong` selects an exact operator-configured reviewer release. Tiered runs fail closed and do not use cross-provider fallback or `--on-reviewer-failure allow`.
 - `--authorization <path> --subject-digest <sha256>` selects transaction mode for an Agent Kernel-issued envelope. It requires a qualified tier, executes once, and bypasses cache, fallback, background execution, continuation, and fail-open behavior.
 - `--continuation-envelope` asks a `strong` tier initial review for a structured closure envelope. It is invalid without `--tier strong`.
@@ -66,9 +69,13 @@ Useful options:
 
 JSON output uses snake_case fields. The normalized result is under `result` and includes `decision`, `blocking_findings`, `advisory_findings`, `required_next_actions`, `reviewed_inputs`, `reviewer_mechanism`, and `read_only`.
 
+Ordinary reviewer execution also returns the action-neutral top-level `review_execution` object with outcome `decision`, `invalid_review_evidence`, or `unavailable`, requested/effective routes, bounded attempts, fallback provenance, and hashed reviewer identity. It is absent when reviewer execution never begins (for example invalid explicit policy or an empty target) and when an unchanged gate cache result is reused; bridge-window consumers must use the legacy `result` projection on those paths.
+
+Coordinating consumers must durably admit the complete normalized result before publishing or interpreting a workflow outcome. Reviewer sessions are intentionally non-persistent, so decision/result digests alone cannot recover findings after a downstream publication failure. A replay must use the admitted result and original packet binding without invoking another reviewer.
+
 Use `review-loop run --context ...` or `review-loop run --artifact ...` for context/artifact-only reviews. Bare `review-loop --context ...` uses the `review-loop` binary default of `--scope auto` and reviews the diff too. The normalized `decision` is derived from normalized blocking findings; reviewer `approved`/`changes_requested` proposals are advisory except for `invalid_input` and `blocked`.
 
-Reviewer assessments must carry an explicit recognized decision. The exact observed schema-repair placeholder (`summary` equal to `test` after trimming and case normalization) is classified as reviewer-mechanism failure before normalization; review-loop then uses its normal distinct-host fallback or blocks when coverage is unavailable. This is corpus-specific integrity protection, not a general proof that arbitrary fluent prose reflects meaningful reasoning. Valid concise summaries such as `ok` remain supported. Private gate-cache entries are integrity-versioned; legacy or placeholder-bearing entries miss and are re-reviewed while the existing target-hash and TTL rules remain authoritative.
+Reviewer assessments must carry an explicit recognized decision. The exact observed schema-repair placeholder (`summary` equal to `test` after trimming and case normalization) is classified as invalid review evidence before normalization. Review Loop uses its normal distinct-host fallback only when that invalid envelope contains no recoverable substantive decision or finding; otherwise it returns `invalid_review_evidence` without invoking another reviewer. This is corpus-specific integrity protection, not a general proof that arbitrary fluent prose reflects meaningful reasoning. Valid concise summaries such as `ok` remain supported. Private gate-cache entries are integrity-versioned; legacy or placeholder-bearing entries miss and are re-reviewed while the existing target-hash and TTL rules remain authoritative.
 
 Direct `review-loop` does not know whether the caller is satisfying an execution, design, merge, or audit gate. In authorization mode it validates and echoes the Kernel-supplied gate and subject bindings but still does not decide admission. Agent Kernel owns the attempt ledger, consumed-token rejection, retries, recovery, reviewer-independence classification, and gate semantics.
 
@@ -81,7 +88,7 @@ Host plugins select the opposite reviewer by default:
 
 Reviewer agents are terminal. A reviewer may inspect code and return structured findings, but must not invoke `review-loop`, run another reviewer, delegate work, or modify files. Internally, reviewer subprocesses receive `REVIEW_LOOP_TERMINAL_REVIEWER=1`; `review-loop run` refuses nested review execution and the Stop hook allows/no-ops in that mode.
 
-`REVIEW_LOOP_REVIEWER=claude|codex` and `--reviewer claude|codex` exist for internal/plugin routing and tests. Normal users should rely on the host defaults.
+`REVIEW_LOOP_REVIEWER=claude|codex` and `--reviewer claude|codex` can override the host default when a caller has already resolved a preferred route. Omit them to retain host-aware default selection.
 
 ## Semantic Reviewer Tiers
 
@@ -362,7 +369,7 @@ Restore fail-closed behavior after an outage with the same command and `block`. 
 
 The gate blocks finalization when the normalized result contains `blocking_findings`. Each blocked stop is re-reviewed, so fixes are verified before finalization. Loop prevention is bounded per task: three blocks for the same finding set and five blocks total; past those caps the gate allows finalization and reports the unresolved findings instead. A stop that changed nothing reuses the previous review decision instead of invoking the reviewer again.
 
-When the opposite-agent reviewer has a tool or provider failure, review-loop can trigger one degraded read-only fallback review by the host agent: Codex-hosted runs fall back from Claude Code to Codex, and Claude Code-hosted runs fall back from Codex to Claude Code. This includes auth failures, rate limits, session limits, missing CLI failures, timeouts, malformed envelopes, semantic integrity rejection, and other reviewer mechanism blockers. Findings from the fallback review still use the same `block_on` / `category_block_on` policy and can block finalization. If both mechanisms fail, direct review and the automatic Stop gate block missing review coverage by default; only the explicit automatic-gate `allow` configuration above permits report-only finalization. If no distinct host fallback reviewer is known, reviewer mechanism failures follow the configured reviewer-failure policy. The separate cap-forced-finalization path for repeated substantive findings remains unchanged.
+When the opposite-agent reviewer has a tool or provider failure, review-loop can trigger one degraded read-only fallback review by the host agent: Codex-hosted runs fall back from Claude Code to Codex, and Claude Code-hosted runs fall back from Codex to Claude Code. Eligible failures include authentication, rate limits, session limits, missing CLIs, timeouts, provider/process failures, and wholly non-substantive malformed or absent envelopes. Malformed output carrying a recoverable substantive decision or finding returns `invalid_review_evidence` without fallback. Findings from a completed fallback review still use the same `block_on` / `category_block_on` policy and can block finalization. If both mechanisms fail, direct review and the automatic Stop gate block missing review coverage by default; only the explicit automatic-gate `allow` configuration above permits report-only finalization. If no distinct host fallback reviewer is known, reviewer mechanism failures follow the configured reviewer-failure policy. The separate cap-forced-finalization path for repeated substantive findings remains unchanged.
 
 Disable the gate with:
 

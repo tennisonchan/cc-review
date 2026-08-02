@@ -7,6 +7,69 @@ import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 
 const companion = new URL("../plugins/review-loop/scripts/review-loop-companion.mjs", import.meta.url).pathname;
+const executionResultSchema = JSON.parse(readFileSync(
+  new URL("../plugins/review-loop/schemas/execution-result.v1.schema.json", import.meta.url),
+  "utf8",
+));
+
+function assertSchemaKeys(value, schema, label) {
+  for (const key of schema.required || []) assert.ok(Object.hasOwn(value, key), `${label}.${key} is required`);
+  if (schema.additionalProperties === false) {
+    assert.deepEqual(
+      Object.keys(value).filter((key) => !Object.hasOwn(schema.properties, key)),
+      [],
+      `${label} has properties outside the published schema`,
+    );
+  }
+}
+
+function assertExecutionResultSchema(value) {
+  const schema = executionResultSchema;
+  assertSchemaKeys(value, schema, "review_execution");
+  assert.equal(value.schema_version, schema.properties.schema_version.const);
+  assert.ok(schema.properties.outcome.enum.includes(value.outcome));
+  assert.ok(schema.properties.fallback_reason.enum.includes(value.fallback_reason));
+  assert.equal(value.read_only, schema.properties.read_only.const);
+
+  const requested = schema.$defs.requested_route;
+  assertSchemaKeys(value.requested_route, requested, "requested_route");
+  assert.ok(requested.properties.reviewer.enum.includes(value.requested_route.reviewer));
+  assert.ok(requested.properties.reasoning_effort.enum.includes(value.requested_route.reasoning_effort));
+
+  if (value.effective_route !== null) {
+    const effective = schema.$defs.effective_route;
+    assertSchemaKeys(value.effective_route, effective, "effective_route");
+    assert.ok(effective.properties.reviewer.enum.includes(value.effective_route.reviewer));
+    assert.ok(effective.properties.model_identity_evidence.enum.includes(value.effective_route.model_identity_evidence));
+  }
+
+  assert.ok(value.attempts.length >= schema.properties.attempts.minItems);
+  assert.ok(value.attempts.length <= schema.properties.attempts.maxItems);
+  for (const [index, attempt] of value.attempts.entries()) {
+    const attemptSchema = schema.$defs.attempt;
+    assertSchemaKeys(attempt, attemptSchema, `attempts[${index}]`);
+    assert.ok(attempt.ordinal >= attemptSchema.properties.ordinal.minimum);
+    assert.ok(attempt.ordinal <= attemptSchema.properties.ordinal.maximum);
+    assert.ok(attemptSchema.properties.role.enum.includes(attempt.role));
+    assert.ok(attemptSchema.properties.reviewer.enum.includes(attempt.reviewer));
+    assert.ok(attemptSchema.properties.status.enum.includes(attempt.status));
+    if (attempt.status !== "decision") {
+      assert.ok(attemptSchema.properties.failure_category.enum.includes(attempt.failure_category));
+      assert.match(attempt.diagnostic_digest, new RegExp(schema.$defs.sha256.pattern));
+    }
+    if (attempt.session_id_digest !== undefined) {
+      assert.match(attempt.session_id_digest, new RegExp(schema.$defs.sha256.pattern));
+    }
+  }
+
+  if (value.reviewer_identity !== null) {
+    const identity = schema.$defs.reviewer_identity;
+    assertSchemaKeys(value.reviewer_identity, identity, "reviewer_identity");
+    assert.ok(identity.properties.provider.enum.includes(value.reviewer_identity.provider));
+    assert.equal(value.reviewer_identity.signal, identity.properties.signal.const);
+    assert.match(value.reviewer_identity.session_id_digest, new RegExp(schema.$defs.sha256.pattern));
+  }
+}
 
 test("setup initializes project review guidelines without overwriting", () => {
   const repo = makeGitRepo();
@@ -89,6 +152,8 @@ test("setup reports legacy tier configuration as migration required without muta
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.ok, true);
   assert.equal(parsed.catalog.status, "migration_required");
+  assert.equal(parsed.operational_status, "ready");
+  assert.equal(parsed.execution_readiness.status, "ready");
   assert.equal(parsed.catalog.schema_version, "review-loop.reviewer-tier-config.v1");
   assert.equal(parsed.catalog.path, configPath);
   assert.match(parsed.catalog.digest, /^[a-f0-9]{64}$/);
@@ -96,7 +161,7 @@ test("setup reports legacy tier configuration as migration required without muta
   assert.equal(readFileSync(configPath, "utf8"), before);
 });
 
-test("setup reports a missing catalog as usable degraded state but never ready", () => {
+test("setup reports a missing bridge catalog as ready when a host reviewer is usable", () => {
   const repo = makeGitRepo();
   const env = testEnv(repo);
 
@@ -105,7 +170,9 @@ test("setup reports a missing catalog as usable degraded state but never ready",
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.ok, true);
-  assert.equal(parsed.operational_status, "degraded");
+  assert.equal(parsed.operational_status, "ready");
+  assert.equal(parsed.execution_readiness.status, "ready");
+  assert.equal(parsed.execution_readiness.catalog_required, false);
   assert.equal(parsed.catalog.status, "degraded");
   assert.deepEqual(parsed.catalog.reason_codes, ["catalog_missing"]);
   assert.equal(parsed.providers.status, "healthy");
@@ -123,10 +190,18 @@ test("setup and capabilities expose an unambiguous strict-readiness contract", (
   const incompleteSetup = JSON.parse(run(["setup", "--json"], { cwd: repo, env }).stdout);
   const incompleteCapabilities = JSON.parse(run(["capabilities", "--json"], { cwd: repo, env }).stdout);
   assert.equal(incompleteSetup.ok, true);
-  assert.equal(incompleteSetup.operational_status, "degraded");
+  assert.equal(incompleteSetup.operational_status, "ready");
+  assert.equal(incompleteSetup.execution_readiness.status, "ready");
   assert.equal(incompleteSetup.catalog.status, "degraded");
   assert.deepEqual(incompleteSetup.catalog.reason_codes, ["tier_missing:fast", "tier_missing:standard"]);
   assert.equal(incompleteCapabilities.tier_configuration.status, "configured");
+  assert.equal(incompleteCapabilities.execution_contract.schema_version, "review-loop.execution-contract.v1");
+  assert.equal(incompleteCapabilities.execution_contract.risk_translation, false);
+  assert.equal(incompleteCapabilities.execution_contract.optional_policy, true);
+  assert.equal(incompleteCapabilities.execution_contract.optional_model, true);
+  assert.equal(incompleteCapabilities.execution_contract.automatic_host_fallback, true);
+  assert.equal(incompleteCapabilities.execution_readiness.status, "ready");
+  assert.equal(incompleteCapabilities.execution_readiness.catalog_required, false);
   assert.equal(incompleteCapabilities.tiers.fast.configured, false);
   assert.equal(incompleteCapabilities.tiers.standard.configured, false);
   assert.equal(incompleteCapabilities.tiers.strong.alternate_profiles_configured, true);
@@ -421,7 +496,7 @@ test("setup separates successful capability identity readback from authenticatio
   assert.equal(parsed.providers.claude.cli_available, true);
   assert.equal(parsed.providers.claude.authenticated, false);
   assert.equal(parsed.providers.claude.status, "unavailable");
-  assert.equal(parsed.operational_status, "degraded");
+  assert.equal(parsed.operational_status, "ready");
 });
 
 test("setup writer fault injection is inert outside explicit test mode", () => {
@@ -547,14 +622,32 @@ test("setup separates a ready dual-provider catalog from degraded provider healt
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.ok, false);
-  assert.equal(parsed.operational_status, "degraded");
+  assert.equal(parsed.operational_status, "ready");
   assert.equal(parsed.catalog.status, "ready");
   assert.equal(parsed.providers.status, "degraded");
   assert.equal(parsed.providers.codex.status, "healthy");
   assert.equal(parsed.providers.claude.status, "unavailable");
 });
 
-test("setup does not treat a zero-exit non-auth response as authenticated", () => {
+test("setup readiness uses any healthy provider even when the bridge catalog does not reference it", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    strong: { profiles: [{ reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" }] },
+  }, "claude-only-reviewer-tiers.json", "review-loop.reviewer-tier-config.v2");
+  env.REVIEW_LOOP_CLAUDE_BIN = join(repo, "missing-claude");
+
+  const result = run(["setup", "--json"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.operational_status, "ready");
+  assert.equal(parsed.execution_readiness.status, "ready");
+  assert.deepEqual(parsed.execution_readiness.usable_providers, ["codex"]);
+  assert.equal(parsed.providers.codex.status, "not_required");
+});
+
+test("setup excludes a zero-exit non-auth provider while retaining another healthy provider", () => {
   const repo = makeGitRepo();
   const env = testEnv(repo);
   env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
@@ -569,7 +662,8 @@ test("setup does not treat a zero-exit non-auth response as authenticated", () =
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.ok, true);
-  assert.equal(parsed.operational_status, "unavailable");
+  assert.equal(parsed.operational_status, "ready");
+  assert.deepEqual(parsed.execution_readiness.usable_providers, ["claude"]);
   assert.equal(parsed.providers.codex.status, "unavailable");
   assert.equal(parsed.providers.codex.authenticated, false);
 });
@@ -586,7 +680,7 @@ test("setup reports an invalid catalog without rewriting or hiding the parse err
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.ok, true);
-  assert.equal(parsed.operational_status, "invalid");
+  assert.equal(parsed.operational_status, "ready");
   assert.equal(parsed.catalog.status, "invalid");
   assert.match(parsed.catalog.digest, /^[a-f0-9]{64}$/);
   assert.equal(parsed.catalog.digest_basis, "raw_bytes");
@@ -865,7 +959,7 @@ test("capabilities reads its adapter version from a packaged plugin manifest", (
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).adapter_version, "0.8.0");
+  assert.equal(JSON.parse(result.stdout).adapter_version, "0.9.0");
 });
 
 test("capabilities treats legacy tier configuration as migration-only", () => {
@@ -1757,6 +1851,35 @@ test("run labels explicit base policy promotions as severity_policy", () => {
   assert.equal(JSON.parse(result.stdout).result.blocking_findings[0].blocking_reason, "severity_policy");
 });
 
+test("run returns invalid_input for an explicitly malformed policy without invoking a reviewer", () => {
+  const repo = makeGitRepo();
+  const guidelines = join(repo, "malformed-review-guidelines.md");
+  const artifact = join(repo, "plan.md");
+  writeFileSync(guidelines, "# Review\n\n```json review-loop\n{ not-json }\n```\n");
+  writeFileSync(artifact, "Plan\n");
+
+  const result = run([
+    "run", "--scope", "none", "--artifact", artifact,
+    "--guidelines", guidelines, "--json",
+  ], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_FAKE_ERROR: "reviewer must not run",
+      REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback must not run",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.result.decision, "invalid_input");
+  assert.match(parsed.result.summary, /invalid review-loop policy block/i);
+  assert.equal(parsed.reviewer_mechanism.reason, "invalid_policy");
+  assert.equal(parsed.review_execution, undefined);
+  assert.doesNotMatch(JSON.stringify(parsed), /reviewer must not run|fallback must not run/);
+});
+
 test("run fails closed on reviewer mechanism failure by default", () => {
   const repo = makeGitRepo();
   const result = run(["run", "--scope", "none", "--json"], {
@@ -1773,6 +1896,8 @@ test("run fails closed on reviewer mechanism failure by default", () => {
   assert.equal(parsed.result.decision, "blocked");
   assert.match(parsed.result.summary, /Reviewer mechanism failed/);
   assert.match(parsed.result.summary, /Codex fallback review also failed/);
+  assert.equal(parsed.review_execution.outcome, "unavailable");
+  assert.equal(parsed.review_execution.attempts.length, 2);
 });
 
 test("run treats a missing reviewer decision as mechanism failure instead of approval", () => {
@@ -1797,7 +1922,7 @@ test("run treats a missing reviewer decision as mechanism failure instead of app
   assert.doesNotMatch(parsed.result.summary, /Substantive but missing/);
 });
 
-test("run rejects the observed placeholder summary and uses one host fallback", () => {
+test("run rejects placeholder output containing findings without answer-shopping", () => {
   for (const decision of ["approved", "changes_requested"]) {
     const repo = makeGitRepo();
     const result = run(["run", "--scope", "none", "--json"], {
@@ -1824,10 +1949,12 @@ test("run rejects the observed placeholder summary and uses one host fallback", 
     });
     assert.equal(result.status, 0, result.stderr);
     const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.result.decision, "approved");
-    assert.equal(parsed.result.summary, "fallback reviewed the target");
-    assert.equal(parsed.result.reviewer_mechanism, "codex-fallback-fake");
-    assert.doesNotMatch(JSON.stringify(parsed), /test message|do the thing|file\.md/i);
+    assert.equal(parsed.result.decision, "blocked");
+    assert.match(parsed.result.summary, /reviewer_output_integrity: placeholder_summary/);
+    assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+    assert.equal(parsed.review_execution.fallback_used, false);
+    assert.equal(parsed.review_execution.attempts.length, 1);
+    assert.doesNotMatch(JSON.stringify(parsed), /fallback reviewed the target/i);
   }
 });
 
@@ -1897,6 +2024,274 @@ exit 1
   assert.equal(parsed.result.reviewer_mechanism, "codex-fallback-fake");
 });
 
+test("run accepts an exact optional model and reports automatic host fallback provenance", () => {
+  const repo = makeGitRepo();
+  const result = run([
+    "run", "--scope", "none", "--reviewer", "claude",
+    "--model", "claude-opus-5", "--reasoning-effort", "high", "--json",
+  ], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_ERROR: "provider rate limit 429",
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("host fallback reviewed")),
+      REVIEW_LOOP_FAKE_CODEX_SESSION_ID: "fresh-codex-review-session",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "approved");
+  assert.equal(parsed.review_execution.schema_version, "review-loop.execution-result.v1");
+  assert.equal(parsed.review_execution.outcome, "decision");
+  assert.deepEqual(parsed.review_execution.requested_route, {
+    reviewer: "claude",
+    model: "claude-opus-5",
+    reasoning_effort: "high",
+  });
+  assert.deepEqual(parsed.review_execution.effective_route, {
+    reviewer: "codex",
+    model: null,
+    model_identity_evidence: "host_default_unreported",
+  });
+  assert.equal(parsed.review_execution.fallback_used, true);
+  assert.equal(parsed.review_execution.fallback_reason, "rate_limit");
+  assert.equal(parsed.review_execution.attempts.length, 2);
+  assert.equal(parsed.review_execution.attempts[0].status, "unavailable");
+  assert.equal(parsed.review_execution.attempts[0].failure_category, "rate_limit");
+  assert.match(parsed.review_execution.attempts[0].diagnostic_digest, /^[a-f0-9]{64}$/);
+  assert.equal(parsed.review_execution.attempts[1].status, "decision");
+  assert.equal(parsed.review_execution.reviewer_identity.provider, "openai");
+  assert.match(parsed.review_execution.reviewer_identity.session_id_digest, /^[a-f0-9]{64}$/);
+  assert.doesNotMatch(JSON.stringify(parsed), /fresh-codex-review-session/);
+  assertExecutionResultSchema(parsed.review_execution);
+});
+
+test("run never answer-shops when an exact Claude model drifts after substantive findings", () => {
+  const repo = makeGitRepo();
+  const fakeClaude = join(repo, "bin", "claude-exact-model-drift");
+  mkdirSync(join(repo, "bin"), { recursive: true });
+  writeFileSync(fakeClaude, `#!/usr/bin/env node
+if (process.argv[2] === "--version") { console.log("2.1.220 (Claude Code)"); process.exit(0); }
+console.log(JSON.stringify({
+  structured_output: {
+    decision: "changes_requested",
+    summary: "The requested-model review found a substantive blocker.",
+    findings: [{
+      id: "drifted-model-blocker",
+      severity: "high",
+      category: "correctness",
+      message: "Do not discard this finding.",
+      locations: ["src/example.js:1"],
+      required_action: "Preserve the finding as invalid review evidence.",
+      reviewer_disposition: "blocking"
+    }],
+    required_next_actions: ["Preserve the finding as invalid review evidence."]
+  },
+  result: "review completed",
+  session_id: "drifted-claude-session",
+  modelUsage: { "claude-opus-4-8": { outputTokens: 12 } }
+}));
+`, { mode: 0o755 });
+
+  const result = run([
+    "run", "--scope", "none", "--reviewer", "claude",
+    "--model", "claude-opus-5", "--reasoning-effort", "high", "--json",
+  ], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("answer-shopping fallback")),
+      REVIEW_LOOP_FAKE_CODEX_SESSION_ID: "fallback-session-that-must-not-run",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.equal(parsed.review_execution.fallback_used, false);
+  assert.equal(parsed.review_execution.attempts.length, 1);
+  assert.equal(parsed.review_execution.attempts[0].status, "invalid_review_evidence");
+  assert.doesNotMatch(JSON.stringify(parsed), /answer-shopping fallback/);
+});
+
+test("run falls back from a failed exact model to the same-provider host default", () => {
+  const repo = makeGitRepo();
+  const result = run([
+    "run", "--scope", "none", "--reviewer", "codex",
+    "--model", "gpt-5.6-sol-20260731", "--reasoning-effort", "high", "--json",
+  ], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_CODEX_ERROR: "requested model not found",
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("host default reviewed")),
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "approved");
+  assert.equal(parsed.review_execution.outcome, "decision");
+  assert.equal(parsed.review_execution.fallback_used, true);
+  assert.deepEqual(parsed.review_execution.attempts.map((attempt) => ({
+    role: attempt.role,
+    reviewer: attempt.reviewer,
+    model: attempt.model,
+  })), [
+    { role: "requested", reviewer: "codex", model: "gpt-5.6-sol-20260731" },
+    { role: "host_fallback", reviewer: "codex", model: null },
+  ]);
+});
+
+test("run completes a requested exact model without fallback when the route is healthy", () => {
+  const repo = makeGitRepo();
+  const result = run([
+    "run", "--scope", "none", "--reviewer", "claude",
+    "--model", "claude-opus-5", "--reasoning-effort", "high", "--json",
+  ], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("requested route reviewed")),
+      REVIEW_LOOP_FAKE_CLAUDE_SESSION_ID: "requested-review-session",
+      REVIEW_LOOP_FAKE_FALLBACK_ERROR: "fallback must not run",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.review_execution.outcome, "decision");
+  assert.equal(parsed.review_execution.fallback_used, false);
+  assert.equal(parsed.review_execution.attempts.length, 1);
+  assert.deepEqual(parsed.review_execution.effective_route, {
+    reviewer: "claude",
+    model: "claude-opus-5",
+    model_identity_evidence: "provider_reported",
+  });
+  assert.match(parsed.review_execution.reviewer_identity.session_id_digest, /^[a-f0-9]{64}$/);
+  assert.doesNotMatch(JSON.stringify(parsed), /requested-review-session|fallback must not run/);
+});
+
+test("run rejects ambiguous or mutable exact-model requests before reviewer execution", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+
+  const missingReviewer = run(["run", "--scope", "none", "--model", "claude-opus-5", "--json"], { cwd: repo, env });
+  assert.notEqual(missingReviewer.status, 0);
+  assert.match(missingReviewer.stderr, /--model requires --reviewer/);
+
+  const mutableAlias = run(["run", "--scope", "none", "--reviewer", "claude", "--model", "latest", "--json"], { cwd: repo, env });
+  assert.notEqual(mutableAlias.status, 0);
+  assert.match(mutableAlias.stderr, /exact model identifier/);
+});
+
+test("run does not answer-shop when malformed output contains recoverable findings", () => {
+  const repo = makeGitRepo();
+  const partial = '{"decision":"changes_requested","summary":"unsafe","findings":[{"id":"f1","severity":"high","message":"do not discard"}';
+  const result = run(["run", "--scope", "none", "--reviewer", "claude", "--model", "claude-opus-5", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: partial,
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback must not run")),
+      REVIEW_LOOP_FAKE_CODEX_SESSION_ID: "unused-fallback-session",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.equal(parsed.review_execution.fallback_used, false);
+  assert.equal(parsed.review_execution.attempts.length, 1);
+  assert.doesNotMatch(JSON.stringify(parsed), /fallback must not run|unused-fallback-session/);
+  assertExecutionResultSchema(parsed.review_execution);
+});
+
+test("run treats a malformed invalid_input decision as terminal review evidence", () => {
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--reviewer", "claude", "--model", "claude-opus-5", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+        decision: "invalid_input",
+        summary: "test",
+        findings: [],
+        required_next_actions: ["Correct the input."],
+      }),
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback must not run")),
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.equal(parsed.review_execution.fallback_used, false);
+  assert.doesNotMatch(JSON.stringify(parsed), /fallback must not run/);
+});
+
+test("run preserves invalid fallback findings as invalid_review_evidence even in allow mode", () => {
+  const repo = makeGitRepo();
+  const result = run([
+    "run", "--scope", "none", "--reviewer", "claude", "--model", "claude-opus-5",
+    "--on-reviewer-failure", "allow", "--json",
+  ], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_ERROR: "primary provider unavailable",
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify({
+        decision: "changes_requested",
+        summary: "test",
+        findings: [finding({ id: "fallback-finding", message: "Do not discard this fallback finding." })],
+        required_next_actions: ["Fix the fallback finding."],
+      }),
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.result.decision, "blocked");
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.equal(parsed.review_execution.fallback_used, true);
+  assert.deepEqual(parsed.review_execution.attempts.map((attempt) => attempt.status), ["unavailable", "invalid_review_evidence"]);
+  assert.doesNotMatch(parsed.result.summary, /allow was set/i);
+});
+
+test("run reports unavailable when host fallback lacks a fresh native session identity", () => {
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--reviewer", "claude", "--model", "claude-opus-5", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_ERROR: "primary provider unavailable",
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("identity missing")),
+      REVIEW_LOOP_FAKE_FALLBACK_SESSION_ID: "",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.review_execution.outcome, "unavailable");
+  assert.equal(parsed.review_execution.fallback_used, true);
+  assert.equal(parsed.review_execution.fallback_reason, "provider");
+  assert.equal(parsed.review_execution.reviewer_identity, null);
+  assert.match(parsed.review_execution.attempts[0].diagnostic_digest, /^[a-f0-9]{64}$/);
+  assert.equal(parsed.review_execution.attempts[1].failure_category, "identity");
+  assert.match(parsed.review_execution.attempts[1].diagnostic_digest, /^[a-f0-9]{64}$/);
+  assertExecutionResultSchema(parsed.review_execution);
+});
+
 test("run uses Claude fallback when Codex is unavailable under a Claude host", () => {
   const repo = makeGitRepo();
   const envFile = join(repo, "claude-fallback-env.json");
@@ -1913,7 +2308,7 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "claude fallback ok", findings: [], required_next_actions: [] }, result: "ok" }));
+  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "claude fallback ok", findings: [], required_next_actions: [] }, result: "ok", session_id: "fresh-claude-fallback-session" }));
 });
 `, { mode: 0o755 });
   const result = run(["run", "--scope", "none", "--json"], {
@@ -1951,6 +2346,9 @@ test("run does not fallback when no host fallback reviewer is available", () => 
   assert.equal(parsed.result.decision, "blocked");
   assert.match(parsed.result.summary, /primary codex unavailable/);
   assert.doesNotMatch(parsed.result.summary, /fallback should not run/);
+  assert.equal(parsed.review_execution.outcome, "unavailable");
+  assert.equal(parsed.review_execution.fallback_used, false);
+  assert.equal(parsed.review_execution.attempts.length, 1);
 });
 
 test("run can fail open explicitly on reviewer mechanism failure", () => {
@@ -1963,6 +2361,8 @@ test("run can fail open explicitly on reviewer mechanism failure", () => {
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.result.decision, "approved");
   assert.match(parsed.result.summary, /on-reviewer-failure=allow/);
+  assert.equal(parsed.review_execution.outcome, "unavailable");
+  assert.equal(parsed.review_execution.effective_route, null);
 });
 
 test("run explicit allow still prefers a healthy distinct-host fallback", () => {
@@ -2770,6 +3170,7 @@ process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
   const out = argv[argv.indexOf("--output-last-message") + 1];
   fs.writeFileSync(out, JSON.stringify({ decision: "approved", summary: "fallback ok", findings: [], required_next_actions: [] }));
+  process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "fresh-codex-fallback-session" }) + "\\n");
 });
 `, { mode: 0o755 });
   const env = {
@@ -2823,7 +3224,7 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "claude fallback ok", findings: [], required_next_actions: [] }, result: "ok" }));
+  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "claude fallback ok", findings: [], required_next_actions: [] }, result: "ok", session_id: "fresh-claude-fallback-session" }));
 });
 `, { mode: 0o755 });
   const env = {
@@ -2869,6 +3270,7 @@ process.stdin.resume();
 process.stdin.on("end", () => {
   const out = argv[argv.indexOf("--output-last-message") + 1];
   fs.writeFileSync(out, JSON.stringify({ decision: "approved", summary: "fallback ok", findings: [], required_next_actions: [] }));
+  process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "fresh-codex-fallback-session" }) + "\\n");
 });
 `, { mode: 0o755 });
   const env = {
@@ -3029,6 +3431,35 @@ test("gate does not invoke fallback for real Claude findings", () => {
   assert.match(parsed.reason, /review-loop changes_requested/);
   assert.match(parsed.reason, /Claude found a blocker/);
   assert.doesNotMatch(parsed.reason, /fallback should not run/);
+});
+
+test("gate does not answer-shop when malformed primary output contains findings", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed again\n");
+  const env = {
+    ...testEnv(repo),
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_HOST: "codex",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      decision: "changes_requested",
+      summary: "test",
+      findings: [finding({ id: "partial-primary", message: "Primary finding must remain terminal." })],
+      required_next_actions: ["Fix the primary finding."],
+    }),
+    REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback must not run")),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"partial-primary"}' });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.decision, "block");
+  assert.match(parsed.reason, /recoverable substantive review content/);
+  assert.doesNotMatch(JSON.stringify(parsed), /fallback must not run/);
 });
 
 test("gate uses persisted block_on and resets after clean review", () => {
@@ -3762,7 +4193,7 @@ function testEnv(repo) {
   // cannot leak into guideline resolution during tests.
   mkdirSync(join(repo, ".home"), { recursive: true });
   const fakeClaude = join(bin, "claude");
-  writeFileSync(fakeClaude, "#!/usr/bin/env sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.167 (Claude Code)'; exit 0; fi\nif [ \"$1\" = \"auth\" ] && [ \"$3\" = \"--json\" ]; then echo '{\"loggedIn\":true}'; exit 0; fi\nif [ \"$1\" = \"auth\" ]; then echo 'Login method: test'; exit 0; fi\necho '{\"structured_output\":{\"decision\":\"approved\",\"summary\":\"ok\",\"findings\":[],\"required_next_actions\":[]},\"result\":\"ok\"}'\n", { mode: 0o755 });
+  writeFileSync(fakeClaude, "#!/usr/bin/env sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.167 (Claude Code)'; exit 0; fi\nif [ \"$1\" = \"auth\" ] && [ \"$3\" = \"--json\" ]; then echo '{\"loggedIn\":true}'; exit 0; fi\nif [ \"$1\" = \"auth\" ]; then echo 'Login method: test'; exit 0; fi\necho '{\"structured_output\":{\"decision\":\"approved\",\"summary\":\"ok\",\"findings\":[],\"required_next_actions\":[]},\"result\":\"ok\",\"session_id\":\"fresh-test-claude-session\"}'\n", { mode: 0o755 });
   const fakeCodex = join(mkdtempSync(join(tmpdir(), "review-loop-codex-")), "codex");
   writeFileSync(fakeCodex, "#!/usr/bin/env sh\nif [ \"$1\" = \"--version\" ]; then echo 'OpenAI Codex vtest'; exit 0; fi\nif [ \"$1\" = \"login\" ] && [ \"$2\" = \"status\" ]; then echo 'Logged in'; exit 0; fi\nexit 1\n", { mode: 0o755 });
   // State must live outside the worktree (as it does in production): the
@@ -3775,6 +4206,7 @@ function testEnv(repo) {
     REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
     REVIEW_LOOP_CODEX_BIN: fakeCodex,
     REVIEW_LOOP_TEST_MODE: "1",
+    REVIEW_LOOP_FAKE_FALLBACK_SESSION_ID: "fresh-fallback-session",
     XDG_STATE_HOME: mkdtempSync(join(tmpdir(), "review-loop-state-")),
   };
 }
