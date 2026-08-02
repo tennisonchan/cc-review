@@ -130,7 +130,27 @@ review-loop-companion capabilities --json
 review-loop run --tier strong --context review-context.md --scope none --json
 ```
 
-Each tier may contain one or two ordered profiles. Two-profile tiers must use distinct providers. Capabilities expose the complete `profiles` array and keep `release_identity` and `isolation_profile` as projections of the first profile for existing consumers. Version 1 single-profile configuration remains readable and is exposed with `alternate_profiles_configured: false`.
+Each tier may contain one or two ordered profiles. Two-profile tiers must use distinct providers. Capabilities expose the complete `profiles` array and keep `release_identity` and `isolation_profile` as projections of the first profile for existing consumers. Version 1 is migration input only: setup reports `migration_required`, capabilities advertise no qualified tier routes, and tiered execution refuses to run until an operator explicitly applies a v2 catalog.
+
+`review-loop-setup --json` reports catalog state (`ready`, `degraded`, `migration_required`, or `invalid`) separately from referenced-provider CLI and authentication health. A valid single-provider v2 catalog remains usable but degraded; dual-provider coverage is a caller deployment policy, not a universal Review Loop restriction.
+
+Preview an operator-authored v2 catalog without changing active state:
+
+```bash
+review-loop-setup --desired-tier-config /trusted/reviewer-tiers-v2.json --json
+```
+
+Apply only after binding the write to the previewed active digest (or explicitly asserting that the active file is missing):
+
+```bash
+review-loop-setup \
+  --desired-tier-config /trusted/reviewer-tiers-v2.json \
+  --apply-tier-config \
+  --expected-tier-config-digest <previewed-sha256> \
+  --json
+```
+
+Apply performs backup, atomic replacement, and production capability readback. A stale expectation is rejected before mutation; a failed readback restores the prior catalog. Review Loop never invents model choices or silently converts v1 data.
 
 Each configured profile includes a release digest over the provider, model, reasoning effort, installed reviewer CLI version, companion/run-wrapper source and version, exact static read-only argv contract, prompt contract, reviewer schemas, deterministic finding policy, and complete operator tier configuration. A tiered normalized result returns that exact identity under `result.reviewer_mechanism.release_identity`. In authoritative transaction mode, the authorization's isolation-profile digest selects exactly one configured profile; review-loop never retries or falls back internally. Existing untiered runs remain `legacy_unqualified` and preserve their current host selection and fallback behavior.
 

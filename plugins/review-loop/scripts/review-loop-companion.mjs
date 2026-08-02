@@ -182,7 +182,7 @@ Run "<subcommand> --help" for subcommand options.`);
 
 const SUBCOMMAND_HELP = {
   capabilities: "capabilities [--json]",
-  setup: "setup [--init-guidelines] [--force] [--enable-review-gate] [--disable-review-gate] [--block-on info|low|medium|high] [--on-reviewer-failure block|allow] [--enable-gate-debug] [--disable-gate-debug] [--json]",
+  setup: "setup [--desired-tier-config <path>] [--apply-tier-config (--expected-tier-config-digest <sha256>|--expect-tier-config-missing)] [--init-guidelines] [--force] [--enable-review-gate] [--disable-review-gate] [--block-on info|low|medium|high] [--on-reviewer-failure block|allow] [--enable-gate-debug] [--disable-gate-debug] [--json]",
   run: "run [--background] [--counter] [--context <path>] [--artifact <path>] [--focus <text>] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--reviewer claude|codex] [--tier fast|standard|strong] [--authorization <path> --subject-digest <sha256>] [--continuation-envelope] [--on-reviewer-failure block|allow] [--json]",
   status: "status [job-id] [--all] [--json]",
   result: "result [job-id] [--json]",
@@ -208,6 +208,10 @@ function parseArgs(argv) {
     context: null,
     counter: false,
     continuationEnvelope: false,
+    desiredTierConfig: null,
+    applyTierConfig: false,
+    expectedTierConfigDigest: null,
+    expectTierConfigMissing: false,
     force: false,
     artifact: null,
     authorization: null,
@@ -245,6 +249,12 @@ function parseArgs(argv) {
         break;
       case "--continuation-envelope":
         args.continuationEnvelope = true;
+        break;
+      case "--apply-tier-config":
+        args.applyTierConfig = true;
+        break;
+      case "--expect-tier-config-missing":
+        args.expectTierConfigMissing = true;
         break;
       case "--json":
         args.json = true;
@@ -295,6 +305,14 @@ function parseArgs(argv) {
         if (arg === "--block-on") args.blockOn = value;
         break;
       }
+      case "--desired-tier-config":
+      case "--expected-tier-config-digest": {
+        const value = argv[++i];
+        if (!value) throw new Error(`${arg} requires a value`);
+        if (arg === "--desired-tier-config") args.desiredTierConfig = value;
+        if (arg === "--expected-tier-config-digest") args.expectedTierConfigDigest = value;
+        break;
+      }
       default:
         args.positional.push(arg);
         break;
@@ -330,6 +348,16 @@ function parseArgs(argv) {
     assertSha256(args.subjectDigest, "--subject-digest");
   }
   if (args.blockOn) assertSeverity(args.blockOn, "--block-on");
+  if (args.expectedTierConfigDigest) assertSha256(args.expectedTierConfigDigest, "--expected-tier-config-digest");
+  if (args.applyTierConfig && !args.desiredTierConfig) {
+    throw new Error("--apply-tier-config requires --desired-tier-config");
+  }
+  if ((args.expectedTierConfigDigest || args.expectTierConfigMissing) && !args.applyTierConfig) {
+    throw new Error("tier configuration expectations require --apply-tier-config");
+  }
+  if (args.expectedTierConfigDigest && args.expectTierConfigMissing) {
+    throw new Error("--expected-tier-config-digest and --expect-tier-config-missing cannot be used together");
+  }
   return args;
 }
 
@@ -345,13 +373,23 @@ function capabilitiesCommand(args) {
 
 async function setup(args) {
   const repo = resolveWorkspace();
+  let catalog = inspectTierCatalog();
   const checks = {
     node: checkCommand(process.execPath, ["--version"]),
+    codex: checkCommand(codexBin(), ["--version"]),
+    codexAuth: checkCommand(codexBin(), ["login", "status"]),
     claude: checkCommand(claudeBin(), ["--version"]),
     claudeAuthText: checkCommand(claudeBin(), ["auth", "status", "--text"]),
     claudeAuthJson: checkCommand(claudeBin(), ["auth", "status", "--json"]),
   };
+  let providers = inspectProviderHealth(catalog, checks);
   const actions = [];
+
+  if (args.desiredTierConfig) {
+    actions.push(reconcileTierCatalog(args));
+    catalog = inspectTierCatalog();
+    providers = inspectProviderHealth(catalog, checks);
+  }
 
   if (args.initGuidelines) {
     actions.push(initGuidelines(repo.root, args.force));
@@ -414,12 +452,26 @@ async function setup(args) {
   }
 
   const result = {
-    ok: checks.node.ok && checks.claude.ok,
+    ok: checks.node.ok
+      && providers.status !== "unavailable"
+      && !["migration_required", "invalid"].includes(catalog.status)
+      && !actions.some((action) => action.status === "rolled_back"),
+    operational_status: catalog.status === "migration_required" || catalog.status === "invalid"
+      ? catalog.status
+      : checks.node.ok && providers.status !== "unavailable"
+        && catalog.status === "ready" && providers.status === "healthy"
+        ? "ready"
+        : checks.node.ok && providers.status !== "unavailable"
+          ? "degraded"
+          : "unavailable",
     repo: repo.root,
+    catalog,
+    providers,
     checks,
     actions,
   };
   output(result, args.json, renderSetup);
+  if (actions.some((action) => action.status === "rolled_back")) process.exitCode = 1;
 }
 
 function initGuidelines(repoRoot, force) {
@@ -2348,6 +2400,9 @@ function resolveReviewerSelection(args = {}) {
     };
   }
   const config = loadTierConfig({ required: true });
+  if (config.value.schema_version === LEGACY_TIER_CONFIG_SCHEMA_VERSION) {
+    throw new Error(`reviewer tier configuration migration required: ${config.path}`);
+  }
   const tier = config.value.tiers[args.tier];
   if (!tier) {
     throw new Error(`semantic tier ${args.tier} is not configured in ${config.path}`);
@@ -2377,9 +2432,10 @@ function resolveReviewerSelection(args = {}) {
 
 function reviewerCapabilities() {
   const config = loadTierConfig({ required: false });
+  const migrationRequired = config?.value.schema_version === LEGACY_TIER_CONFIG_SCHEMA_VERSION;
   const tiers = {};
   for (const semanticTier of SEMANTIC_TIERS) {
-    const configured = config?.value.tiers[semanticTier];
+    const configured = migrationRequired ? null : config?.value.tiers[semanticTier];
     if (configured) {
       const profiles = tierProfiles(configured, config.value.schema_version).map((profile) => {
         const releaseIdentity = buildReleaseIdentity(semanticTier, profile, config);
@@ -2404,9 +2460,15 @@ function reviewerCapabilities() {
     schema_version: CAPABILITY_SCHEMA_VERSION,
     adapter_version: adapterVersion(),
     semantic_tiers: [...SEMANTIC_TIERS, "legacy_unqualified"],
-    tier_configuration: config
-      ? { status: "configured", digest: config.digest }
-      : { status: "missing" },
+    tier_configuration: migrationRequired
+      ? {
+          status: "migration_required",
+          schema_version: config.value.schema_version,
+          digest: config.digest,
+        }
+      : config
+        ? { status: "configured", schema_version: config.value.schema_version, digest: config.digest }
+        : { status: "missing" },
     tiers,
     legacy_unqualified: {
       available: true,
@@ -2419,8 +2481,225 @@ function reviewerCapabilities() {
   };
 }
 
+function inspectTierCatalog() {
+  const path = tierConfigPath();
+  if (!existsSync(path)) {
+    return {
+      status: "degraded",
+      path,
+      schema_version: null,
+      digest: null,
+      digest_basis: null,
+      reason_codes: ["catalog_missing"],
+    };
+  }
+  try {
+    const config = loadTierConfig({ required: true });
+    if (config.value.schema_version === LEGACY_TIER_CONFIG_SCHEMA_VERSION) {
+      return {
+        status: "migration_required",
+        path: config.path,
+        schema_version: config.value.schema_version,
+        digest: config.digest,
+        digest_basis: "catalog",
+        tiers: catalogTierDetails(config.value),
+        reason_codes: ["legacy_schema"],
+      };
+    }
+    const missingTiers = SEMANTIC_TIERS.filter((tier) => !config.value.tiers[tier]);
+    const singleProfileTiers = SEMANTIC_TIERS.filter((tier) => {
+      const entry = config.value.tiers[tier];
+      return entry && tierProfiles(entry, config.value.schema_version).length < 2;
+    });
+    const reasonCodes = [
+      ...missingTiers.map((tier) => `tier_missing:${tier}`),
+      ...singleProfileTiers.map((tier) => `alternate_profile_missing:${tier}`),
+    ];
+    return {
+      status: reasonCodes.length ? "degraded" : "ready",
+      path: config.path,
+      schema_version: config.value.schema_version,
+      digest: config.digest,
+      digest_basis: "catalog",
+      configured_tiers: SEMANTIC_TIERS.filter((tier) => Boolean(config.value.tiers[tier])),
+      tiers: catalogTierDetails(config.value),
+      reason_codes: reasonCodes,
+    };
+  } catch (error) {
+    let rawDigest = null;
+    try {
+      rawDigest = sha256(readFileSync(path));
+    } catch {}
+    return {
+      status: "invalid",
+      path,
+      schema_version: null,
+      digest: rawDigest,
+      digest_basis: rawDigest ? "raw_bytes" : "unavailable",
+      reason_codes: ["invalid_configuration"],
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function catalogTierDetails(value) {
+  return Object.fromEntries(Object.entries(value.tiers).map(([tier, entry]) => {
+    const profiles = tierProfiles(entry, value.schema_version);
+    return [tier, {
+      profile_count: profiles.length,
+      reviewers: profiles.map((profile) => profile.reviewer),
+      providers: profiles.map((profile) => profile.reviewer === "codex" ? "openai" : "anthropic"),
+      models: profiles.map((profile) => profile.model),
+      reasoning_efforts: profiles.map((profile) => profile.reasoning_effort),
+    }];
+  }));
+}
+
+function inspectProviderHealth(catalog, checks) {
+  const referenced = new Set(Object.values(catalog.tiers || {}).flatMap((tier) => tier.reviewers || []));
+  if (!referenced.size) {
+    referenced.add("codex");
+    referenced.add("claude");
+  }
+  const codexHealthy = checks.codex.ok && checks.codexAuth.ok;
+  const claudeHealthy = checks.claude.ok && (checks.claudeAuthText.ok || checks.claudeAuthJson.ok);
+  const details = {
+    codex: {
+      referenced: referenced.has("codex"),
+      status: referenced.has("codex") ? codexHealthy ? "healthy" : "unavailable" : "not_required",
+      cli_available: checks.codex.ok,
+      authenticated: checks.codexAuth.ok,
+    },
+    claude: {
+      referenced: referenced.has("claude"),
+      status: referenced.has("claude") ? claudeHealthy ? "healthy" : "unavailable" : "not_required",
+      cli_available: checks.claude.ok,
+      authenticated: checks.claudeAuthText.ok || checks.claudeAuthJson.ok,
+    },
+  };
+  const required = Object.values(details).filter((provider) => provider.referenced);
+  const healthyCount = required.filter((provider) => provider.status === "healthy").length;
+  return {
+    status: healthyCount === required.length ? "healthy" : healthyCount > 0 ? "degraded" : "unavailable",
+    ...details,
+  };
+}
+
+function reconcileTierCatalog(args) {
+  const desiredPath = resolve(args.desiredTierConfig);
+  let desiredValue;
+  try {
+    desiredValue = readJson(desiredPath);
+    validateTierConfig(desiredValue, desiredPath);
+  } catch (error) {
+    throw new Error(`invalid desired reviewer tier configuration at ${desiredPath}: ${error.message}`);
+  }
+  if (desiredValue.schema_version !== TIER_CONFIG_SCHEMA_VERSION) {
+    throw new Error(`desired reviewer tier configuration must use ${TIER_CONFIG_SCHEMA_VERSION}`);
+  }
+  const targetPath = tierConfigPath();
+  const currentBytes = existsSync(targetPath) ? readFileSync(targetPath, "utf8") : null;
+  let current = null;
+  if (currentBytes !== null) {
+    try {
+      current = { ...loadTierConfig({ required: true }), invalid: false, digestBasis: "catalog" };
+    } catch {
+      current = {
+        path: targetPath,
+        value: null,
+        digest: sha256(currentBytes),
+        invalid: true,
+        digestBasis: "raw_bytes",
+      };
+    }
+  }
+  const desiredDigest = domainDigest(desiredValue.schema_version, desiredValue);
+  const change = !current ? "create" : !current.invalid && current.digest === desiredDigest ? "noop" : "update";
+  const preview = {
+    action: "reconcile-tier-config",
+    status: "preview",
+    change,
+    target_path: targetPath,
+    desired_path: desiredPath,
+    current_status: !current ? "missing" : current.invalid ? "invalid" : "valid",
+    current_digest: current?.digest || null,
+    current_digest_basis: current?.digestBasis || null,
+    desired_digest: desiredDigest,
+  };
+  if (!args.applyTierConfig) return preview;
+  if (current) {
+    if (!args.expectedTierConfigDigest) {
+      throw new Error("--expected-tier-config-digest is required when the active reviewer tier configuration exists");
+    }
+    if (args.expectedTierConfigDigest !== current.digest) {
+      throw new Error(`stale reviewer tier configuration: expected ${args.expectedTierConfigDigest}, found ${current.digest}`);
+    }
+  } else if (!args.expectTierConfigMissing) {
+    throw new Error("--expect-tier-config-missing is required when the active reviewer tier configuration does not exist");
+  }
+  if (change === "noop") {
+    const capabilities = reviewerCapabilities();
+    if (capabilities.tier_configuration.digest !== desiredDigest) {
+      throw new Error("reviewer tier configuration no-op readback digest mismatch");
+    }
+    return {
+      ...preview,
+      status: "verified_noop",
+      capability_readback_digest: capabilities.capability_digest,
+    };
+  }
+
+  const previousBytes = currentBytes;
+  const backupPath = current ? `${targetPath}.backup-${current.digest.slice(0, 12)}` : null;
+  if (backupPath && existsSync(backupPath)) {
+    if (readFileSync(backupPath, "utf8") !== previousBytes) {
+      throw new Error(`reviewer tier configuration backup conflicts with active catalog: ${backupPath}`);
+    }
+  }
+  if (backupPath && !existsSync(backupPath)) {
+    mkdirSync(dirname(backupPath), { recursive: true });
+    copyFileSync(targetPath, backupPath);
+  }
+
+  try {
+    writeJson(targetPath, desiredValue);
+    const capabilities = reviewerCapabilities();
+    if (capabilities.tier_configuration.status !== "configured"
+      || capabilities.tier_configuration.digest !== desiredDigest) {
+      throw new Error("reviewer tier configuration capability readback digest mismatch");
+    }
+    return {
+      ...preview,
+      status: "applied",
+      backup_path: backupPath,
+      backup_digest: current?.digest || null,
+      backup_digest_basis: current?.digestBasis || null,
+      capability_readback_digest: capabilities.capability_digest,
+    };
+  } catch (error) {
+    try {
+      if (previousBytes === null) {
+        rmSync(targetPath, { force: true });
+      } else {
+        writeTextAtomic(targetPath, previousBytes);
+      }
+    } catch (rollbackError) {
+      throw new Error(`reviewer tier configuration apply failed (${error.message}); rollback failed: ${rollbackError.message}`);
+    }
+    return {
+      ...preview,
+      status: "rolled_back",
+      backup_path: backupPath,
+      backup_digest: current?.digest || null,
+      backup_digest_basis: current?.digestBasis || null,
+      reason_code: "capability_readback_failed",
+      error: redact(error instanceof Error ? error.message : String(error)),
+    };
+  }
+}
+
 function loadTierConfig({ required }) {
-  const path = process.env.REVIEW_LOOP_TIER_CONFIG || join(stateRoot(), "reviewer-tiers.json");
+  const path = tierConfigPath();
   if (!existsSync(path)) {
     if (required) {
       throw new Error(`reviewer tier configuration is missing: ${path}`);
@@ -2439,6 +2718,10 @@ function loadTierConfig({ required }) {
     value,
     digest: domainDigest(value.schema_version, value),
   };
+}
+
+function tierConfigPath() {
+  return process.env.REVIEW_LOOP_TIER_CONFIG || join(stateRoot(), "reviewer-tiers.json");
 }
 
 function validateTierConfig(value, path) {
@@ -2848,7 +3131,12 @@ function isProcessTreeAlive(pid) {
 function renderSetup(value) {
   const lines = [];
   lines.push(`Node: ${value.checks.node.ok ? value.checks.node.stdout.trim() : "missing"}`);
+  lines.push(`Codex: ${value.checks.codex.ok ? value.checks.codex.stdout.trim() : "missing"}`);
   lines.push(`Claude: ${value.checks.claude.ok ? value.checks.claude.stdout.trim() : "missing"}`);
+  lines.push(`Catalog: ${value.catalog.status} (${value.catalog.path})`);
+  if (value.catalog.reason_codes?.length) lines.push(`Catalog reasons: ${value.catalog.reason_codes.join(", ")}`);
+  lines.push(`Provider health: ${value.providers.status}`);
+  if (value.providers.codex.status === "unavailable") lines.push("Codex authentication: unavailable. Run: codex login");
   if (!value.checks.claude.ok) lines.push("Run: install Claude Code and authenticate with claude auth login");
   if (value.checks.claude.ok && !value.checks.claudeAuthText.ok && !value.checks.claudeAuthJson.ok) {
     lines.push("Claude authentication: not authenticated. Run: claude auth login");
@@ -2856,6 +3144,10 @@ function renderSetup(value) {
     lines.push("Claude authentication: available");
   }
   for (const action of value.actions) {
+    if (action.action === "reconcile-tier-config") {
+      lines.push(`Tier catalog ${action.status}: ${action.change}; current=${action.current_digest || "missing"}; desired=${action.desired_digest}`);
+      if (action.backup_path) lines.push(`Tier catalog backup: ${action.backup_path}`);
+    }
     if (action.action === "init-guidelines") lines.push(`Guidelines ${action.status}: ${action.path}`);
     if (action.action === "enable-review-gate") {
       if (action.status === "enabled") {
@@ -3049,11 +3341,15 @@ function readJson(path) {
 }
 
 function writeJson(path, value) {
+  writeTextAtomic(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function writeTextAtomic(path, content) {
   mkdirSync(dirname(path), { recursive: true });
   // Write-then-rename so concurrent readers (status/result/cancel) never see
   // a torn file, e.g. when a kill lands mid-write.
   const tmp = `${path}.tmp-${process.pid}`;
-  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
+  writeFileSync(tmp, content);
   renameSync(tmp, path);
 }
 

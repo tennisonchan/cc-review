@@ -73,6 +73,306 @@ test("init-guidelines omits the profile section for an empty repo", () => {
   assert.match(content, /```json review-loop/);
 });
 
+test("setup reports legacy tier configuration as migration required without mutating it", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+  const configPath = writeTierConfig(repo, {
+    fast: { reviewer: "codex", model: "gpt-5.6-luna-20260701", reasoning_effort: "low" },
+    strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+  });
+  env.REVIEW_LOOP_TIER_CONFIG = configPath;
+  const before = readFileSync(configPath, "utf8");
+
+  const result = run(["setup", "--json"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.catalog.status, "migration_required");
+  assert.equal(parsed.catalog.schema_version, "review-loop.reviewer-tier-config.v1");
+  assert.equal(parsed.catalog.path, configPath);
+  assert.match(parsed.catalog.digest, /^[a-f0-9]{64}$/);
+  assert.deepEqual(parsed.catalog.reason_codes, ["legacy_schema"]);
+  assert.equal(readFileSync(configPath, "utf8"), before);
+});
+
+test("setup previews an operator-supplied v2 catalog without mutating active configuration", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+  const activePath = writeTierConfig(repo, {
+    strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+  }, "active-reviewer-tiers.json");
+  const desiredPath = writeTierConfig(repo, completeDualProviderTiers(), "desired-reviewer-tiers.json", "review-loop.reviewer-tier-config.v2");
+  env.REVIEW_LOOP_TIER_CONFIG = activePath;
+  const before = readFileSync(activePath, "utf8");
+
+  const result = run(["setup", "--desired-tier-config", desiredPath, "--json"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  const action = parsed.actions.find((item) => item.action === "reconcile-tier-config");
+  assert.equal(action.status, "preview");
+  assert.equal(action.change, "update");
+  assert.equal(action.target_path, activePath);
+  assert.match(action.current_digest, /^[a-f0-9]{64}$/);
+  assert.match(action.desired_digest, /^[a-f0-9]{64}$/);
+  assert.notEqual(action.current_digest, action.desired_digest);
+  assert.equal(parsed.catalog.status, "migration_required");
+  assert.equal(readFileSync(activePath, "utf8"), before);
+  assert.equal(existsSync(`${activePath}.backup-${action.current_digest.slice(0, 12)}`), false);
+});
+
+test("setup apply rejects a stale catalog digest before writing or backing up", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+  const activePath = writeTierConfig(repo, {
+    strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+  }, "active-reviewer-tiers.json");
+  const desiredPath = writeTierConfig(repo, completeDualProviderTiers(), "desired-reviewer-tiers.json", "review-loop.reviewer-tier-config.v2");
+  env.REVIEW_LOOP_TIER_CONFIG = activePath;
+  const before = readFileSync(activePath, "utf8");
+
+  const result = run([
+    "setup",
+    "--desired-tier-config", desiredPath,
+    "--apply-tier-config",
+    "--expected-tier-config-digest", "0".repeat(64),
+    "--json",
+  ], { cwd: repo, env });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /stale reviewer tier configuration/i);
+  assert.equal(readFileSync(activePath, "utf8"), before);
+  assert.deepEqual(readdirSync(join(repo, ".home")).filter((name) => name.includes(".backup-")), []);
+});
+
+test("setup applies v2 catalog with backup atomic write and capability readback", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+  const activePath = writeTierConfig(repo, {
+    strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+  }, "active-reviewer-tiers.json");
+  const desiredPath = writeTierConfig(repo, completeDualProviderTiers(), "desired-reviewer-tiers.json", "review-loop.reviewer-tier-config.v2");
+  env.REVIEW_LOOP_TIER_CONFIG = activePath;
+  const before = readFileSync(activePath, "utf8");
+  const preview = run(["setup", "--desired-tier-config", desiredPath, "--json"], { cwd: repo, env });
+  assert.equal(preview.status, 0, preview.stderr);
+  const expectedDigest = JSON.parse(preview.stdout).actions.find((item) => item.action === "reconcile-tier-config").current_digest;
+
+  const applied = run([
+    "setup",
+    "--desired-tier-config", desiredPath,
+    "--apply-tier-config",
+    "--expected-tier-config-digest", expectedDigest,
+    "--json",
+  ], { cwd: repo, env });
+
+  assert.equal(applied.status, 0, applied.stderr);
+  const parsed = JSON.parse(applied.stdout);
+  const action = parsed.actions.find((item) => item.action === "reconcile-tier-config");
+  assert.equal(action.status, "applied");
+  assert.equal(action.change, "update");
+  assert.equal(action.backup_path, `${activePath}.backup-${expectedDigest.slice(0, 12)}`);
+  assert.equal(readFileSync(action.backup_path, "utf8"), before);
+  assert.match(action.capability_readback_digest, /^[a-f0-9]{64}$/);
+  assert.equal(parsed.catalog.status, "ready");
+  assert.equal(parsed.catalog.digest, action.desired_digest);
+  assert.deepEqual(JSON.parse(readFileSync(activePath, "utf8")), JSON.parse(readFileSync(desiredPath, "utf8")));
+
+  const capabilities = run(["capabilities", "--json"], { cwd: repo, env });
+  assert.equal(capabilities.status, 0, capabilities.stderr);
+  const capabilityPayload = JSON.parse(capabilities.stdout);
+  assert.equal(capabilityPayload.tier_configuration.digest, action.desired_digest);
+  assert.deepEqual(capabilityPayload.tiers.fast.profiles.map((profile) => profile.release_identity.provider), ["openai", "anthropic"]);
+  assert.deepEqual(capabilityPayload.tiers.standard.profiles.map((profile) => profile.release_identity.provider), ["openai", "anthropic"]);
+  assert.deepEqual(capabilityPayload.tiers.strong.profiles.map((profile) => profile.release_identity.provider), ["anthropic", "openai"]);
+});
+
+test("setup restores the prior catalog when capability readback fails", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+  const healthyCodex = env.REVIEW_LOOP_CODEX_BIN;
+  const activePath = writeTierConfig(repo, {
+    strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+  }, "active-reviewer-tiers.json");
+  const desiredPath = writeTierConfig(repo, completeDualProviderTiers(), "desired-reviewer-tiers.json", "review-loop.reviewer-tier-config.v2");
+  env.REVIEW_LOOP_TIER_CONFIG = activePath;
+  const before = readFileSync(activePath, "utf8");
+  const preview = run(["setup", "--desired-tier-config", desiredPath, "--json"], { cwd: repo, env });
+  assert.equal(preview.status, 0, preview.stderr);
+  const expectedDigest = JSON.parse(preview.stdout).actions.find((item) => item.action === "reconcile-tier-config").current_digest;
+  env.REVIEW_LOOP_CODEX_BIN = join(repo, "missing-codex");
+
+  const applied = run([
+    "setup",
+    "--desired-tier-config", desiredPath,
+    "--apply-tier-config",
+    "--expected-tier-config-digest", expectedDigest,
+    "--json",
+  ], { cwd: repo, env });
+
+  assert.notEqual(applied.status, 0);
+  const failedPayload = JSON.parse(applied.stdout);
+  const failedAction = failedPayload.actions.find((item) => item.action === "reconcile-tier-config");
+  assert.equal(failedPayload.ok, false);
+  assert.equal(failedAction.status, "rolled_back");
+  assert.equal(failedAction.reason_code, "capability_readback_failed");
+  assert.match(failedAction.error, /codex reviewer CLI version probe failed/i);
+  assert.equal(readFileSync(activePath, "utf8"), before);
+  const backupPath = `${activePath}.backup-${expectedDigest.slice(0, 12)}`;
+  assert.equal(readFileSync(backupPath, "utf8"), before);
+
+  env.REVIEW_LOOP_CODEX_BIN = healthyCodex;
+  const retried = run([
+    "setup",
+    "--desired-tier-config", desiredPath,
+    "--apply-tier-config",
+    "--expected-tier-config-digest", expectedDigest,
+    "--json",
+  ], { cwd: repo, env });
+  assert.equal(retried.status, 0, retried.stderr);
+  assert.equal(JSON.parse(retried.stdout).actions.find((item) => item.action === "reconcile-tier-config").status, "applied");
+  assert.equal(readFileSync(backupPath, "utf8"), before);
+});
+
+test("setup keeps a healthy single-provider v2 catalog usable but explicitly degraded", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+    fast: { profiles: [{ reviewer: "codex", model: "gpt-5.6-luna-20260701", reasoning_effort: "low" }] },
+    standard: { profiles: [{ reviewer: "codex", model: "gpt-5.6-20260731", reasoning_effort: "medium" }] },
+    strong: { profiles: [{ reviewer: "codex", model: "gpt-5.6-sol-20260731", reasoning_effort: "xhigh" }] },
+  }, "codex-only-reviewer-tiers.json", "review-loop.reviewer-tier-config.v2");
+  env.REVIEW_LOOP_CLAUDE_BIN = join(repo, "missing-claude");
+
+  const result = run(["setup", "--json"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.operational_status, "degraded");
+  assert.equal(parsed.catalog.status, "degraded");
+  assert.deepEqual(parsed.catalog.tiers.fast.providers, ["openai"]);
+  assert.deepEqual(parsed.catalog.tiers.strong.models, ["gpt-5.6-sol-20260731"]);
+  assert.equal(parsed.providers.status, "healthy");
+  assert.equal(parsed.providers.codex.status, "healthy");
+  assert.equal(parsed.providers.claude.status, "not_required");
+});
+
+test("setup separates a ready dual-provider catalog from degraded provider health", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, completeDualProviderTiers(), "reviewer-tiers-v2.json", "review-loop.reviewer-tier-config.v2");
+  env.REVIEW_LOOP_CLAUDE_BIN = join(repo, "missing-claude");
+
+  const result = run(["setup", "--json"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.operational_status, "degraded");
+  assert.equal(parsed.catalog.status, "ready");
+  assert.equal(parsed.providers.status, "degraded");
+  assert.equal(parsed.providers.codex.status, "healthy");
+  assert.equal(parsed.providers.claude.status, "unavailable");
+});
+
+test("setup reports an invalid catalog without rewriting or hiding the parse error", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+  const configPath = join(repo, ".home", "invalid-reviewer-tiers.json");
+  writeFileSync(configPath, "{not-json\n");
+  env.REVIEW_LOOP_TIER_CONFIG = configPath;
+
+  const result = run(["setup", "--json"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.operational_status, "invalid");
+  assert.equal(parsed.catalog.status, "invalid");
+  assert.match(parsed.catalog.digest, /^[a-f0-9]{64}$/);
+  assert.equal(parsed.catalog.digest_basis, "raw_bytes");
+  assert.deepEqual(parsed.catalog.reason_codes, ["invalid_configuration"]);
+  assert.match(parsed.catalog.error, /invalid reviewer tier configuration/i);
+  assert.equal(readFileSync(configPath, "utf8"), "{not-json\n");
+});
+
+test("setup can explicitly replace an invalid active catalog while preserving its exact backup", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+  const activePath = join(repo, ".home", "invalid-reviewer-tiers.json");
+  const invalidBytes = "{not-json\n";
+  writeFileSync(activePath, invalidBytes);
+  const desiredPath = writeTierConfig(repo, completeDualProviderTiers(), "desired-reviewer-tiers.json", "review-loop.reviewer-tier-config.v2");
+  env.REVIEW_LOOP_TIER_CONFIG = activePath;
+
+  const preview = run(["setup", "--desired-tier-config", desiredPath, "--json"], { cwd: repo, env });
+  assert.equal(preview.status, 0, preview.stderr);
+  const previewAction = JSON.parse(preview.stdout).actions.find((item) => item.action === "reconcile-tier-config");
+  assert.equal(previewAction.status, "preview");
+  assert.equal(previewAction.current_status, "invalid");
+  assert.equal(previewAction.current_digest_basis, "raw_bytes");
+  assert.match(previewAction.current_digest, /^[a-f0-9]{64}$/);
+
+  const applied = run([
+    "setup", "--desired-tier-config", desiredPath, "--apply-tier-config",
+    "--expected-tier-config-digest", previewAction.current_digest, "--json",
+  ], { cwd: repo, env });
+  assert.equal(applied.status, 0, applied.stderr);
+  const action = JSON.parse(applied.stdout).actions.find((item) => item.action === "reconcile-tier-config");
+  assert.equal(action.status, "applied");
+  assert.equal(readFileSync(action.backup_path, "utf8"), invalidBytes);
+  assert.equal(JSON.parse(readFileSync(activePath, "utf8")).schema_version, "review-loop.reviewer-tier-config.v2");
+});
+
+test("setup creates a missing catalog only with an explicit missing-state expectation", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+  const activePath = join(repo, ".home", "missing-reviewer-tiers.json");
+  const desiredPath = writeTierConfig(repo, completeDualProviderTiers(), "desired-reviewer-tiers.json", "review-loop.reviewer-tier-config.v2");
+  env.REVIEW_LOOP_TIER_CONFIG = activePath;
+
+  const rejected = run(["setup", "--desired-tier-config", desiredPath, "--apply-tier-config", "--json"], { cwd: repo, env });
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /--expect-tier-config-missing is required/);
+  assert.equal(existsSync(activePath), false);
+
+  const applied = run([
+    "setup", "--desired-tier-config", desiredPath, "--apply-tier-config", "--expect-tier-config-missing", "--json",
+  ], { cwd: repo, env });
+  assert.equal(applied.status, 0, applied.stderr);
+  const parsed = JSON.parse(applied.stdout);
+  const action = parsed.actions.find((item) => item.action === "reconcile-tier-config");
+  assert.equal(action.status, "applied");
+  assert.equal(action.change, "create");
+  assert.equal(action.backup_path, null);
+  assert.equal(parsed.catalog.status, "ready");
+});
+
+test("setup verifies an already-applied desired catalog without rewriting or backing it up", () => {
+  const repo = makeGitRepo();
+  const env = testEnv(repo);
+  const activePath = writeTierConfig(repo, completeDualProviderTiers(), "active-reviewer-tiers.json", "review-loop.reviewer-tier-config.v2");
+  const desiredPath = writeTierConfig(repo, completeDualProviderTiers(), "desired-reviewer-tiers.json", "review-loop.reviewer-tier-config.v2");
+  env.REVIEW_LOOP_TIER_CONFIG = activePath;
+  const before = readFileSync(activePath, "utf8");
+  const preview = run(["setup", "--desired-tier-config", desiredPath, "--json"], { cwd: repo, env });
+  assert.equal(preview.status, 0, preview.stderr);
+  const digest = JSON.parse(preview.stdout).actions.find((item) => item.action === "reconcile-tier-config").current_digest;
+
+  const applied = run([
+    "setup", "--desired-tier-config", desiredPath, "--apply-tier-config", "--expected-tier-config-digest", digest, "--json",
+  ], { cwd: repo, env });
+
+  assert.equal(applied.status, 0, applied.stderr);
+  const action = JSON.parse(applied.stdout).actions.find((item) => item.action === "reconcile-tier-config");
+  assert.equal(action.status, "verified_noop");
+  assert.equal(action.change, "noop");
+  assert.equal(readFileSync(activePath, "utf8"), before);
+  assert.deepEqual(readdirSync(join(repo, ".home")).filter((name) => name.includes(".backup-")), []);
+});
+
 test("run uses normalized structured output and renders blocking findings", () => {
   const repo = makeGitRepo();
   writeFileSync(join(repo, "file.txt"), "changed\n");
@@ -268,10 +568,10 @@ test("capabilities reads its adapter version from a packaged plugin manifest", (
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).adapter_version, "0.7.0");
+  assert.equal(JSON.parse(result.stdout).adapter_version, "0.8.0");
 });
 
-test("capabilities resolves configured tiers to deterministic exact release identities", () => {
+test("capabilities treats legacy tier configuration as migration-only", () => {
   const repo = makeGitRepo();
   const env = testEnv(repo);
   env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
@@ -284,21 +584,15 @@ test("capabilities resolves configured tiers to deterministic exact release iden
   assert.equal(second.status, 0, second.stderr);
   const parsed = JSON.parse(first.stdout);
   assert.deepEqual(parsed, JSON.parse(second.stdout));
-  assert.equal(parsed.tier_configuration.status, "configured");
-  assert.equal(parsed.tiers.fast.release_identity.semantic_tier, "fast");
-  assert.equal(parsed.tiers.fast.release_identity.provider, "openai");
-  assert.equal(parsed.tiers.fast.release_identity.model_identity_evidence, "explicit_argv");
-  assert.match(parsed.tiers.fast.release_identity.reviewer_cli_version, /Codex/i);
-  assert.equal(parsed.tiers.strong.release_identity.provider, "anthropic");
-  assert.equal(parsed.tiers.strong.release_identity.model_identity_evidence, "provider_reported");
-  assert.match(parsed.tiers.strong.release_identity.reviewer_cli_version, /Claude Code/i);
+  assert.equal(parsed.tier_configuration.status, "migration_required");
+  assert.equal(parsed.tier_configuration.schema_version, "review-loop.reviewer-tier-config.v1");
+  assert.equal(parsed.tiers.fast.configured, false);
+  assert.equal(parsed.tiers.strong.configured, false);
   assert.equal(parsed.tiers.standard.configured, false);
-  for (const field of [
-    "release_digest", "adapter_digest", "read_only_contract_digest", "prompt_contract_digest",
-    "reviewer_output_schema_digest", "finding_policy_digest", "operator_tier_configuration_digest",
-  ]) {
-    assert.match(parsed.tiers.fast.release_identity[field], /^[a-f0-9]{64}$/);
-  }
+
+  const tieredRun = run(["run", "--tier", "fast", "--scope", "none", "--json"], { cwd: repo, env });
+  assert.notEqual(tieredRun.status, 0);
+  assert.match(tieredRun.stderr, /migration required/i);
 });
 
 test("capabilities exposes ordered provider-diverse profiles while preserving the primary projection", () => {
@@ -378,10 +672,10 @@ test("multi-profile tier validation rejects duplicate providers and more than tw
   assert.match(excessive.stderr, /between 1 and 2 profiles/);
 });
 
-test("legacy single-profile tiers expose one profile without claiming alternate coverage", () => {
+test("v2 single-profile tiers expose one profile without claiming alternate coverage", () => {
   const repo = makeGitRepo();
   const env = testEnv(repo);
-  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+  env.REVIEW_LOOP_TIER_CONFIG = writeRuntimeTierConfig(repo, {
     strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
   });
   const result = run(["capabilities", "--json"], { cwd: repo, env });
@@ -412,7 +706,7 @@ console.log(JSON.stringify({ structured_output: { decision: "approved", summary:
     ...testEnv(repo),
     REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
   };
-  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+  env.REVIEW_LOOP_TIER_CONFIG = writeRuntimeTierConfig(repo, {
     strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
   });
   const result = run(["run", "--scope", "auto", "--tier", "strong", "--continuation-envelope", "--json"], { cwd: repo, env });
@@ -464,7 +758,7 @@ const out = argv[argv.indexOf("--output-last-message") + 1];
 fs.writeFileSync(out, JSON.stringify({ decision: "approved", summary: "ok", findings: [], required_next_actions: [] }));
 `, { mode: 0o755 });
   const env = { ...testEnv(repo), REVIEW_LOOP_CODEX_BIN: fakeCodex };
-  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+  env.REVIEW_LOOP_TIER_CONFIG = writeRuntimeTierConfig(repo, {
     fast: { reviewer: "codex", model: "gpt-5.6-luna-20260701", reasoning_effort: "medium" },
   });
   const result = run(["run", "--scope", "auto", "--tier", "fast", "--json"], { cwd: repo, env });
@@ -511,7 +805,7 @@ test("authoritative transaction invokes exactly once and emits derived isolation
   mkdirSync(join(repo, ".review-loop"), { recursive: true });
   writeFileSync(join(repo, ".review-loop", "review-guidelines.md"), "PROJECT INSTRUCTION MUST NOT LOAD\n");
   const env = testEnv(repo);
-  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+  env.REVIEW_LOOP_TIER_CONFIG = writeRuntimeTierConfig(repo, {
     strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
   });
   env.REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT = JSON.stringify(blockingOutput([
@@ -619,7 +913,7 @@ test("authoritative transaction rejects invalid bindings before reviewer launch"
   runGit(["commit", "-m", "init"], repo);
   const packet = writeAuthoritativePacket(repo, "immutable execution packet");
   const env = testEnv(repo);
-  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+  env.REVIEW_LOOP_TIER_CONFIG = writeRuntimeTierConfig(repo, {
     strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
   });
   env.REVIEW_LOOP_FAKE_ERROR = "reviewer must not launch";
@@ -696,7 +990,7 @@ fs.writeFileSync(out, JSON.stringify({ decision: "approved", summary: "codex dec
 console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-native-session-1" }));
 `, { mode: 0o755 });
   const env = { ...testEnv(repo), REVIEW_LOOP_CODEX_BIN: fakeCodex };
-  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+  env.REVIEW_LOOP_TIER_CONFIG = writeRuntimeTierConfig(repo, {
     fast: { reviewer: "codex", model: "gpt-5.6-luna-20260701", reasoning_effort: "medium" },
   });
   const authorization = writeAuthorization(repo, env, {
@@ -728,7 +1022,7 @@ test("authoritative transaction distinguishes unavailable and unparseable withou
   runGit(["commit", "-m", "init"], repo);
   const packet = writeAuthoritativePacket(repo, "outcome classification packet");
   const baseEnv = testEnv(repo);
-  baseEnv.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+  baseEnv.REVIEW_LOOP_TIER_CONFIG = writeRuntimeTierConfig(repo, {
     strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
   });
   const authorization = writeAuthorization(repo, baseEnv, {
@@ -817,7 +1111,7 @@ console.log(JSON.stringify({ result: "returned content without structured_output
     ...env,
     REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
   };
-  claudeEnv.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+  claudeEnv.REVIEW_LOOP_TIER_CONFIG = writeRuntimeTierConfig(repo, {
     strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
   }, "claude-envelope-tiers.json");
   const claudeAuthorization = writeAuthorization(repo, claudeEnv, {
@@ -852,7 +1146,7 @@ console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-session" 
     ...env,
     REVIEW_LOOP_CODEX_BIN: fakeCodex,
   };
-  codexEnv.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+  codexEnv.REVIEW_LOOP_TIER_CONFIG = writeRuntimeTierConfig(repo, {
     fast: { reviewer: "codex", model: "gpt-5.6-luna-20260701", reasoning_effort: "medium" },
   }, "codex-envelope-tiers.json");
   const codexAuthorization = writeAuthorization(repo, codexEnv, {
@@ -878,7 +1172,7 @@ console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-session" 
 test("tiered Claude capabilities reject alternate provider backends", () => {
   const repo = makeGitRepo();
   const baseEnv = testEnv(repo);
-  baseEnv.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+  baseEnv.REVIEW_LOOP_TIER_CONFIG = writeRuntimeTierConfig(repo, {
     strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
   });
   for (const flag of ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"]) {
@@ -901,7 +1195,7 @@ test("tiered review fails closed on missing, mutable, or unavailable configured 
   assert.match(missing.stderr, /reviewer tier configuration is missing/);
 
   const mutableEnv = { ...baseEnv };
-  mutableEnv.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+  mutableEnv.REVIEW_LOOP_TIER_CONFIG = writeRuntimeTierConfig(repo, {
     strong: { reviewer: "claude", model: "opus", reasoning_effort: "high" },
   }, "mutable-tiers.json");
   const mutable = run(["capabilities", "--json"], { cwd: repo, env: mutableEnv });
@@ -914,7 +1208,7 @@ test("tiered review fails closed on missing, mutable, or unavailable configured 
     REVIEW_LOOP_CLAUDE_BIN: join(repo, "missing-claude"),
     REVIEW_LOOP_FAKE_CODEX_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("must not fallback")),
   };
-  failedEnv.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+  failedEnv.REVIEW_LOOP_TIER_CONFIG = writeRuntimeTierConfig(repo, {
     strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
   }, "failed-tiers.json");
   const failed = run(["run", "--scope", "auto", "--tier", "strong", "--json"], { cwd: repo, env: failedEnv });
@@ -934,7 +1228,7 @@ test("strong initial review can emit a strict continuation envelope and other in
   runGit(["commit", "-m", "init"], repo);
   writeFileSync(join(repo, "file.txt"), "changed\n");
   const env = testEnv(repo);
-  env.REVIEW_LOOP_TIER_CONFIG = writeTierConfig(repo, {
+  env.REVIEW_LOOP_TIER_CONFIG = writeRuntimeTierConfig(repo, {
     strong: { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
     fast: { reviewer: "codex", model: "gpt-5.6-luna-20260701", reasoning_effort: "medium" },
   });
@@ -3153,7 +3447,7 @@ function testEnv(repo) {
   const fakeClaude = join(bin, "claude");
   writeFileSync(fakeClaude, "#!/usr/bin/env sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.167 (Claude Code)'; exit 0; fi\nif [ \"$1\" = \"auth\" ]; then echo 'ok'; exit 0; fi\necho '{\"structured_output\":{\"decision\":\"approved\",\"summary\":\"ok\",\"findings\":[],\"required_next_actions\":[]},\"result\":\"ok\"}'\n", { mode: 0o755 });
   const fakeCodex = join(mkdtempSync(join(tmpdir(), "review-loop-codex-")), "codex");
-  writeFileSync(fakeCodex, "#!/usr/bin/env sh\nif [ \"$1\" = \"--version\" ]; then echo 'OpenAI Codex vtest'; exit 0; fi\nexit 1\n", { mode: 0o755 });
+  writeFileSync(fakeCodex, "#!/usr/bin/env sh\nif [ \"$1\" = \"--version\" ]; then echo 'OpenAI Codex vtest'; exit 0; fi\nif [ \"$1\" = \"login\" ] && [ \"$2\" = \"status\" ]; then echo 'Logged in'; exit 0; fi\nexit 1\n", { mode: 0o755 });
   // State must live outside the worktree (as it does in production): the
   // gate's own state files are otherwise untracked files in the next review
   // target, perturbing it between runs.
@@ -3174,6 +3468,36 @@ function writeTierConfig(repo, tiers, name = "reviewer-tiers.json", schemaVersio
     tiers,
   }));
   return path;
+}
+
+function writeRuntimeTierConfig(repo, tiers, name = "reviewer-tiers-v2.json") {
+  return writeTierConfig(repo, Object.fromEntries(Object.entries(tiers).map(([tier, profile]) => [
+    tier,
+    { profiles: [profile] },
+  ])), name, "review-loop.reviewer-tier-config.v2");
+}
+
+function completeDualProviderTiers() {
+  return {
+    fast: {
+      profiles: [
+        { reviewer: "codex", model: "gpt-5.6-luna-20260701", reasoning_effort: "low" },
+        { reviewer: "claude", model: "claude-haiku-4-5-20251001", reasoning_effort: "low" },
+      ],
+    },
+    standard: {
+      profiles: [
+        { reviewer: "codex", model: "gpt-5.6-20260731", reasoning_effort: "medium" },
+        { reviewer: "claude", model: "claude-sonnet-4-5-20250929", reasoning_effort: "medium" },
+      ],
+    },
+    strong: {
+      profiles: [
+        { reviewer: "claude", model: "claude-opus-4-1-20250805", reasoning_effort: "high" },
+        { reviewer: "codex", model: "gpt-5.6-sol-20260731", reasoning_effort: "xhigh" },
+      ],
+    },
+  };
 }
 
 function writeAuthorization(repo, env, fields, name = "authorization.json") {

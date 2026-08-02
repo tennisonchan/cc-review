@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.8.0
+
+- Make v1 reviewer-tier catalogs migration-only instead of projecting them as qualified runtime routes.
+- Add machine-readable catalog and provider readiness, including both reviewer CLIs and authentication, while keeping valid single-provider v2 catalogs usable but degraded.
+- Add explicit operator-authored v2 reconciliation with preview, optimistic digest binding, backup, atomic write, production capability readback, and rollback.
+- Refuse silent model selection, implicit migration, stale writes, and misleading setup success for legacy or invalid catalogs.
+
 ## 0.7.0
 
 - Add ordered, provider-diverse reviewer profiles to each semantic tier.
