@@ -14,35 +14,23 @@
     "read_only"
   ],
   "properties": {
-    "schema_version": {
-      "type": "string",
-      "const": "2"
-    },
+    "schema_version": { "const": "3" },
     "decision": {
       "type": "string",
       "enum": ["approved", "changes_requested", "invalid_input", "blocked"]
     },
-    "summary": {
-      "type": "string",
-      "minLength": 1
-    },
+    "summary": { "type": "string", "minLength": 1 },
     "blocking_findings": {
       "type": "array",
-      "items": {
-        "$ref": "#/$defs/finding"
-      }
+      "items": { "$ref": "#/$defs/finding" }
     },
     "advisory_findings": {
       "type": "array",
-      "items": {
-        "$ref": "#/$defs/finding"
-      }
+      "items": { "$ref": "#/$defs/finding" }
     },
     "required_next_actions": {
       "type": "array",
-      "items": {
-        "type": "string"
-      }
+      "items": { "type": "string" }
     },
     "reviewed_inputs": {
       "type": "array",
@@ -51,203 +39,40 @@
         "additionalProperties": true,
         "required": ["kind", "display_path", "size", "hash", "format"],
         "properties": {
-          "kind": {
-            "type": "string"
-          },
-          "path": {
-            "type": "string"
-          },
-          "display_path": {
-            "type": "string"
-          },
-          "scope": {
-            "type": "string"
-          },
-          "base": {
-            "type": ["string", "null"]
-          },
-          "size": {
-            "type": "number"
-          },
-          "hash": {
-            "type": "string"
-          },
-          "format": {
-            "type": "string"
-          }
+          "kind": { "type": "string" },
+          "path": { "type": "string" },
+          "display_path": { "type": "string" },
+          "scope": { "type": "string" },
+          "base": { "type": ["string", "null"] },
+          "size": { "type": "number" },
+          "hash": { "type": "string" },
+          "format": { "type": "string" }
         }
       }
     },
-    "reviewer_mechanism": {
-      "oneOf": [
-        {
-          "type": "string",
-          "minLength": 1
-        },
-        {
-          "$ref": "#/$defs/reviewer_mechanism"
-        }
-      ]
-    },
-    "read_only": {
-      "type": "boolean",
-      "const": true
-    },
-    "continuation_envelope": {
-      "$ref": "#/$defs/continuation_envelope"
-    }
+    "reviewer_mechanism": { "type": "string", "minLength": 1 },
+    "read_only": { "const": true }
   },
   "$defs": {
-    "severity": {
-      "type": "string",
-      "enum": ["info", "low", "medium", "high"]
-    },
     "finding": {
       "type": "object",
       "additionalProperties": false,
       "required": ["id", "severity", "category", "message", "locations", "required_action", "reviewer_disposition"],
       "properties": {
-        "id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "severity": {
-          "$ref": "#/$defs/severity"
-        },
-        "category": {
-          "type": "string",
-          "minLength": 1
-        },
-        "message": {
-          "type": "string",
-          "minLength": 1
-        },
+        "id": { "type": "string", "minLength": 1 },
+        "severity": { "enum": ["info", "low", "medium", "high"] },
+        "category": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
         "locations": {
           "type": "array",
-          "items": {
-            "type": "string"
-          }
+          "items": { "type": "string" }
         },
-        "required_action": {
-          "type": "string",
-          "minLength": 1
-        },
-        "reviewer_disposition": {
-          "type": "string",
-          "enum": ["blocking", "advisory"]
-        },
+        "required_action": { "type": "string", "minLength": 1 },
+        "reviewer_disposition": { "enum": ["blocking", "advisory"] },
         "blocking_reason": {
-          "type": "string",
           "enum": ["reviewer", "category_policy", "severity_policy", "fallback_threshold"]
         }
       }
-    },
-    "reviewer_mechanism": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["schema_version", "mechanism", "status", "release_identity"],
-      "properties": {
-        "schema_version": {
-          "const": "review-loop.reviewer-mechanism.v1"
-        },
-        "mechanism": {
-          "type": "string",
-          "minLength": 1
-        },
-        "status": {
-          "type": "string",
-          "enum": ["completed", "failed"]
-        },
-        "release_identity": {
-          "$ref": "#/$defs/release_identity"
-        }
-      }
-    },
-    "release_identity": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "schema_version",
-        "semantic_tier",
-        "reviewer",
-        "provider",
-        "model",
-        "reasoning_effort",
-        "model_identity_evidence",
-        "adapter_version",
-        "reviewer_cli_version",
-        "adapter_digest",
-        "read_only_contract",
-        "read_only_contract_digest",
-        "prompt_contract_digest",
-        "reviewer_output_schema_digest",
-        "finding_policy_digest",
-        "operator_tier_configuration_digest",
-        "release_digest"
-      ],
-      "properties": {
-        "schema_version": { "const": "review-loop.reviewer-release-identity.v1" },
-        "semantic_tier": { "enum": ["fast", "standard", "strong"] },
-        "reviewer": { "enum": ["claude", "codex"] },
-        "provider": { "enum": ["anthropic", "openai"] },
-        "model": { "type": "string", "minLength": 1 },
-        "reasoning_effort": { "enum": ["low", "medium", "high", "xhigh", "max"] },
-        "model_identity_evidence": { "enum": ["provider_reported", "explicit_argv"] },
-        "adapter_version": { "type": "string", "minLength": 1 },
-        "reviewer_cli_version": { "type": "string", "minLength": 1 },
-        "adapter_digest": { "$ref": "#/$defs/sha256" },
-        "read_only_contract": { "$ref": "#/$defs/read_only_contract" },
-        "read_only_contract_digest": { "$ref": "#/$defs/sha256" },
-        "prompt_contract_digest": { "$ref": "#/$defs/sha256" },
-        "reviewer_output_schema_digest": { "$ref": "#/$defs/sha256" },
-        "finding_policy_digest": { "$ref": "#/$defs/sha256" },
-        "operator_tier_configuration_digest": { "$ref": "#/$defs/sha256" },
-        "release_digest": { "$ref": "#/$defs/sha256" }
-      }
-    },
-    "read_only_contract": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["reviewer", "static_argv", "workspace_argv_template", "terminal_reviewer"],
-      "properties": {
-        "reviewer": { "enum": ["claude", "codex"] },
-        "static_argv": {
-          "type": "array",
-          "items": { "type": "string", "minLength": 1 }
-        },
-        "workspace_argv_template": {
-          "type": ["array", "null"],
-          "items": { "type": "string", "minLength": 1 }
-        },
-        "terminal_reviewer": { "const": true }
-      }
-    },
-    "continuation_envelope": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "allowed_paths",
-        "allowed_subject_elements",
-        "expected_closure_claim",
-        "required_checks",
-        "forbidden_effects"
-      ],
-      "properties": {
-        "allowed_paths": { "$ref": "#/$defs/non_empty_strings" },
-        "allowed_subject_elements": { "$ref": "#/$defs/non_empty_strings" },
-        "expected_closure_claim": { "type": "string", "minLength": 1 },
-        "required_checks": { "$ref": "#/$defs/non_empty_strings" },
-        "forbidden_effects": { "$ref": "#/$defs/non_empty_strings" }
-      }
-    },
-    "non_empty_strings": {
-      "type": "array",
-      "minItems": 1,
-      "items": { "type": "string", "minLength": 1 }
-    },
-    "sha256": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{64}$"
     }
   }
 }

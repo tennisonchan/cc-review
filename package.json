@@ -1,6 +1,6 @@
 {
   "name": "review-loop",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Multi-agent review loop engine for read-only independent reviews and review gates.",
   "type": "module",
   "private": false,

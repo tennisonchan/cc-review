@@ -43,18 +43,6 @@ before producing substantive content, Review Loop automatically attempts one
 fresh host-model reviewer without asking the operator. A substantive decision
 or recoverable finding is terminal and never triggers another reviewer.
 
-Legacy Agent Kernel may provide `--authorization <path> --subject-digest <sha256>`
-with a qualified `--tier`, one immutable `--artifact` packet, and explicit
-`--scope none`; the subject digest must equal the packet SHA-256. In that mode,
-do not add caller/project reviewer instructions such as `--focus`, `--counter`,
-`--guidelines`, or positional text, and do not add `--background`,
-`--continuation-envelope`, or `--on-reviewer-failure allow`. Review Loop
-validates the envelope, executes exactly once without cache or internal fallback, and
-emits `decision`, `unavailable`, or `unparseable` transaction evidence. Kernel,
-not this skill, owns consumed-token rejection, retries, recovery, independence
-admission, and the gate decision. This tiered path is a temporary rollout bridge;
-new Kernel integrations consume the action-neutral `review_execution` contract.
-
 3. Treat the reviewer as read-only. Do not ask the opposite-agent reviewer to patch, edit, commit, delegate, invoke `review-loop`, or continue into implementation.
 
    Completion criterion: every blocking finding is fixed by Codex and re-reviewed, or handed off as unresolved; every advisory finding is considered. A prose rejection does not clear a deterministic gate block.

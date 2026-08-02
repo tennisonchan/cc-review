@@ -1,6 +1,6 @@
 ---
-description: Report review-loop catalog and provider readiness, reconcile trusted configuration, initialize guidelines, and configure the default Claude Code review gate
-argument-hint: '[--json] [--desired-tier-config <path>] [--apply-tier-config (--expected-tier-config-digest <sha256>|--expect-tier-config-missing)] [--init-guidelines] [--force] [--enable-review-gate] [--disable-review-gate] [--block-on info|low|medium|high]'
+description: Report review-loop provider readiness, initialize guidelines, and configure the default Claude Code review gate
+argument-hint: '[--json] [--init-guidelines] [--force] [--enable-review-gate] [--disable-review-gate] [--block-on info|low|medium|high]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
