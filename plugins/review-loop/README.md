@@ -69,7 +69,7 @@ Mutable model aliases such as `latest`, `opus`, and `sonnet` are rejected. Revie
 
 ## Setup readiness
 
-`review-loop-setup --json` reports the exact `review_protocol_version`, then checks Node, the Codex and Claude CLIs, and authentication. Review Loop is usable when at least one provider is healthy. It does not own caller model policy.
+`review-loop-setup --json` reports the exact `review_protocol_version`, which is the normalized-result `schema_version`. Consumers should treat any inequality as protocol-incompatible. Setup then checks Node, the Codex and Claude CLIs, and authentication. Review Loop is usable when at least one provider is healthy. It does not own caller model policy.
 
 ## Install
 
