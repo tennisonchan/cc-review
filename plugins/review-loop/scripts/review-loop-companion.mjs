@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REVIEWER_OUTPUT_SCHEMA_PATH = join(ROOT, "schemas", "reviewer-output.schema.json");
+const NORMALIZED_RESULT_SCHEMA_PATH = join(ROOT, "schemas", "normalized-result.schema.json");
 const TEMPLATE_GUIDELINES = join(ROOT, "templates", "review-guidelines.md");
 const PROJECT_GUIDELINES = [".review-loop", "review-guidelines.md"];
 const SEVERITIES = ["info", "low", "medium", "high"];
@@ -22,6 +23,11 @@ const GATE_FINGERPRINT_BLOCK_LIMIT = 3;
 const GATE_TOTAL_BLOCK_LIMIT = 5;
 const GATE_CHAIN_GAP_MS = 10 * 60 * 1000;
 const REVIEW_CACHE_INTEGRITY_VERSION = 1;
+const REVIEW_PROTOCOL_VERSION = (() => {
+  const value = JSON.parse(readFileSync(NORMALIZED_RESULT_SCHEMA_PATH, "utf8"))?.properties?.schema_version?.const;
+  if (typeof value !== "string" || !value) throw new Error("normalized result schema_version const is required");
+  return value;
+})();
 const DEFAULT_MAX_DIFF_CHARS = 200 * 1000;
 const DEFAULT_CLAUDE_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_FALLBACK_TIMEOUT_MS = 10 * 60 * 1000;
@@ -376,6 +382,7 @@ async function setup(args) {
     reason_codes: checks.node.ok && usableProviders.length > 0 ? [] : ["no_usable_host_reviewer"],
   };
   const result = {
+    review_protocol_version: REVIEW_PROTOCOL_VERSION,
     operational_status: executionReadiness.status,
     execution_readiness: executionReadiness,
     repo: repo.root,
@@ -2103,7 +2110,7 @@ function normalizeReviewOutput(reviewerOutput, { policy, blockOn, reviewedInputs
     ...(reviewerOutput.required_next_actions || []),
   ].filter(Boolean);
   return {
-    schema_version: "3",
+    schema_version: REVIEW_PROTOCOL_VERSION,
     decision: blocking.length ? "changes_requested" : "approved",
     summary: reviewerOutput.summary,
     blocking_findings: blocking,
@@ -2142,7 +2149,7 @@ function blockingReason(finding, policy, blockOn) {
 function syntheticNormalizedFailure(decision, summary, reviewedInputs = [], requiredNextActions = [], reviewerMechanism = "review-loop") {
   const normalizedDecision = decision === "invalid_input" ? "invalid_input" : "blocked";
   return {
-    schema_version: "3",
+    schema_version: REVIEW_PROTOCOL_VERSION,
     decision: normalizedDecision,
     summary,
     blocking_findings: [],
@@ -2156,7 +2163,9 @@ function syntheticNormalizedFailure(decision, summary, reviewedInputs = [], requ
 
 function validateNormalizedResult(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("normalized result must be an object");
-  if (value.schema_version !== "3") throw new Error("normalized result schema_version must be 3");
+  if (value.schema_version !== REVIEW_PROTOCOL_VERSION) {
+    throw new Error(`normalized result schema_version must be ${REVIEW_PROTOCOL_VERSION}`);
+  }
   if (!GENERIC_DECISIONS.includes(value.decision)) throw new Error(`normalized result decision must be one of: ${GENERIC_DECISIONS.join(", ")}`);
   if (!Array.isArray(value.blocking_findings)) throw new Error("normalized result blocking_findings must be an array");
   if (!Array.isArray(value.advisory_findings)) throw new Error("normalized result advisory_findings must be an array");

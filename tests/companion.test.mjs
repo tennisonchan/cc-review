@@ -11,6 +11,10 @@ const executionResultSchema = JSON.parse(readFileSync(
   new URL("../plugins/review-loop/schemas/execution-result.v1.schema.json", import.meta.url),
   "utf8",
 ));
+const normalizedResultSchema = JSON.parse(readFileSync(
+  new URL("../plugins/review-loop/schemas/normalized-result.schema.json", import.meta.url),
+  "utf8",
+));
 
 function assertSchemaKeys(value, schema, label) {
   for (const key of schema.required || []) assert.ok(Object.hasOwn(value, key), `${label}.${key} is required`);
@@ -87,6 +91,41 @@ test("setup initializes project review guidelines without overwriting", () => {
   assert.equal(readFileSync(action.path, "utf8"), "custom\n");
   const secondParsed = JSON.parse(second.stdout);
   assert.equal(secondParsed.actions.find((item) => item.action === "init-guidelines").status, "skipped");
+});
+
+test("setup and both host manifests expose the exact review protocol", () => {
+  const expectedProtocol = normalizedResultSchema.properties.schema_version.const;
+  const repo = makeGitRepo();
+  const result = run(["setup", "--json"], { cwd: repo, env: testEnv(repo) });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).review_protocol_version, expectedProtocol);
+
+  for (const host of [".codex-plugin", ".claude-plugin"]) {
+    const manifest = JSON.parse(readFileSync(
+      new URL(`../plugins/review-loop/${host}/plugin.json`, import.meta.url),
+      "utf8",
+    ));
+    assert.equal(manifest.review_protocol_version, expectedProtocol);
+  }
+});
+
+test("setup derives the advertised protocol from the normalized-result contract", () => {
+  const copyRoot = mkdtempSync(join(tmpdir(), "review-loop-protocol-source-"));
+  const copiedPlugin = join(copyRoot, "review-loop");
+  cpSync(new URL("../plugins/review-loop/", import.meta.url).pathname, copiedPlugin, { recursive: true });
+  const schemaPath = join(copiedPlugin, "schemas", "normalized-result.schema.json");
+  const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
+  schema.properties.schema_version.const = "4";
+  writeFileSync(schemaPath, `${JSON.stringify(schema, null, 2)}\n`);
+
+  const repo = makeGitRepo();
+  const result = spawnSync(process.execPath, [join(copiedPlugin, "scripts", "review-loop-companion.mjs"), "setup", "--json"], {
+    cwd: repo,
+    env: testEnv(repo),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).review_protocol_version, "4");
 });
 
 test("init-guidelines creates neutral guidance when Claude guidance exists", () => {
