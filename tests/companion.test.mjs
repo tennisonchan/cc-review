@@ -89,6 +89,21 @@ test("setup initializes project review guidelines without overwriting", () => {
   assert.equal(secondParsed.actions.find((item) => item.action === "init-guidelines").status, "skipped");
 });
 
+test("setup and both host manifests expose the exact review protocol", () => {
+  const repo = makeGitRepo();
+  const result = run(["setup", "--json"], { cwd: repo, env: testEnv(repo) });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).review_protocol_version, "3");
+
+  for (const host of [".codex-plugin", ".claude-plugin"]) {
+    const manifest = JSON.parse(readFileSync(
+      new URL(`../plugins/review-loop/${host}/plugin.json`, import.meta.url),
+      "utf8",
+    ));
+    assert.equal(manifest.review_protocol_version, "3");
+  }
+});
+
 test("init-guidelines creates neutral guidance when Claude guidance exists", () => {
   const repo = makeGitRepo();
   mkdirSync(join(repo, ".claude", "rules"), { recursive: true });

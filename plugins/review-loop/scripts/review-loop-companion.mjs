@@ -22,6 +22,7 @@ const GATE_FINGERPRINT_BLOCK_LIMIT = 3;
 const GATE_TOTAL_BLOCK_LIMIT = 5;
 const GATE_CHAIN_GAP_MS = 10 * 60 * 1000;
 const REVIEW_CACHE_INTEGRITY_VERSION = 1;
+const REVIEW_PROTOCOL_VERSION = "3";
 const DEFAULT_MAX_DIFF_CHARS = 200 * 1000;
 const DEFAULT_CLAUDE_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_FALLBACK_TIMEOUT_MS = 10 * 60 * 1000;
@@ -376,6 +377,7 @@ async function setup(args) {
     reason_codes: checks.node.ok && usableProviders.length > 0 ? [] : ["no_usable_host_reviewer"],
   };
   const result = {
+    review_protocol_version: REVIEW_PROTOCOL_VERSION,
     operational_status: executionReadiness.status,
     execution_readiness: executionReadiness,
     repo: repo.root,

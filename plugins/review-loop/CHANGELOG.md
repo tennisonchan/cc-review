@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Expose the exact review protocol version in both host manifests and setup JSON so managed installers can reject incompatible pairs before activation.
+
 ## 0.10.0
 
 - Remove the semantic-tier catalog, capability discovery, reconciliation, authorization transaction, release identity, isolation profile, and continuation-envelope bridge surfaces.
