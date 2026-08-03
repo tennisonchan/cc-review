@@ -1,6 +1,6 @@
 ---
 description: Run a read-only review-loop review with optional policy and exact model inputs
-argument-hint: '[--background] [--base <ref>] [--scope none|auto|working-tree|branch] [--context <path>] [--artifact <path>] [--focus <text>] [--counter] [--guidelines <path>] [--reviewer claude|codex --model <exact-id> --reasoning-effort <level>] [--tier fast|standard|strong] [--continuation-envelope] [--json]'
+argument-hint: '[--background] [--base <ref>] [--scope none|auto|working-tree|branch] [--context <path>] [--artifact <path>] [--focus <text>] [--counter] [--guidelines <path>] [--reviewer claude|codex --model <exact-id> --reasoning-effort <level>] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

@@ -1,6 +1,6 @@
 {
   "name": "review-loop",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Run read-only multi-agent review loops from Codex before finalization.",
   "author": {
     "name": "Tennison Chan"

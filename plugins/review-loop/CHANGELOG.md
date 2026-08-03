@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.10.0
+
+- Remove the semantic-tier catalog, capability discovery, reconciliation, authorization transaction, release identity, isolation profile, and continuation-envelope bridge surfaces.
+- Publish normalized result v3 with a string reviewer mechanism and no routing identity or workflow action.
+- Keep optional exact reviewer/model selection and one automatic fresh host fallback inside Review Loop.
+- Fix direct companion execution so help and setup initialize after all command metadata is declared.
+
 ## 0.9.0
 
 - Add optional exact reviewer/model input and action-neutral execution provenance.
