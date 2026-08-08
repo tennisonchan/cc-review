@@ -1171,6 +1171,56 @@ test("v4 rejects reviewer acknowledgements that do not match the exact packet", 
   assert.match(parsed.result.summary, /acknowledged_packet_digest does not match/);
 });
 
+test("v4 accepts caller-bound exact packet and material identities only for the matching artifact", () => {
+  const repo = makeGitRepo();
+  const packet = join(repo, "packet.json");
+  const bytes = '{"gate":"design"}\n';
+  writeFileSync(packet, bytes);
+  const packetDigest = createHash("sha256").update(bytes).digest("hex");
+  const materialDigests = ["c".repeat(64), "d".repeat(64)];
+  const result = run([
+    "run", "--artifact", packet, "--scope", "none",
+    "--expected-packet-digest", packetDigest,
+    "--expected-material-digests", JSON.stringify(materialDigests),
+    "--json",
+  ], {
+    cwd: repo,
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.acknowledged_packet_digest, packetDigest);
+  assert.deepEqual(parsed.result.acknowledged_material_digests, materialDigests);
+
+  const mismatch = run([
+    "run", "--artifact", packet, "--scope", "none",
+    "--expected-packet-digest", "e".repeat(64),
+    "--expected-material-digests", "[]", "--json",
+  ], { cwd: repo, env: testEnv(repo) });
+  assert.notEqual(mismatch.status, 0);
+  assert.match(mismatch.stderr, /one exact matching artifact and scope none/);
+});
+
+test("v4 exact transaction binding options are paired and structurally validated", () => {
+  const repo = makeGitRepo();
+  const packet = join(repo, "packet.json");
+  writeFileSync(packet, "{}\n");
+  const missingPair = run([
+    "run", "--artifact", packet, "--scope", "none",
+    "--expected-packet-digest", "a".repeat(64), "--json",
+  ], { cwd: repo, env: testEnv(repo) });
+  assert.notEqual(missingPair.status, 0);
+  assert.match(missingPair.stderr, /must be supplied together/);
+
+  const invalidMaterials = run([
+    "run", "--artifact", packet, "--scope", "none",
+    "--expected-packet-digest", "a".repeat(64),
+    "--expected-material-digests", '["not-a-digest"]', "--json",
+  ], { cwd: repo, env: testEnv(repo) });
+  assert.notEqual(invalidMaterials.status, 0);
+  assert.match(invalidMaterials.stderr, /JSON array of SHA-256 digests/);
+});
+
 test("v4 requires every structural reviewer-result field without a test-mode bypass", () => {
   for (const field of [
     "review_status",

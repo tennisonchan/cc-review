@@ -171,7 +171,7 @@ Run "<subcommand> --help" for subcommand options.`);
 
 const SUBCOMMAND_HELP = {
   setup: "setup [--init-guidelines] [--force] [--enable-review-gate] [--disable-review-gate] [--block-on info|low|medium|high] [--on-reviewer-failure block|allow] [--enable-gate-debug] [--disable-gate-debug] [--json]",
-  run: "run [--background] [--counter] [--context <path>] [--artifact <path>] [--focus <text>] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--reviewer claude|codex] [--model <exact-id> [--reasoning-effort low|medium|high|xhigh|max]] [--on-reviewer-failure block|allow] [--json]",
+  run: "run [--background] [--counter] [--context <path>] [--artifact <path>] [--focus <text>] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--reviewer claude|codex] [--model <exact-id> [--reasoning-effort low|medium|high|xhigh|max]] [--expected-packet-digest <sha256> --expected-material-digests <json-array>] [--on-reviewer-failure block|allow] [--json]",
   status: "status [job-id] [--all] [--json]",
   result: "result [job-id] [--json]",
   cancel: "cancel [job-id] [--json]",
@@ -199,6 +199,8 @@ function parseArgs(argv) {
     artifact: null,
     focus: null,
     guidelines: null,
+    expectedPacketDigest: null,
+    expectedMaterialDigests: null,
     initGuidelines: false,
     json: false,
     model: null,
@@ -252,6 +254,8 @@ function parseArgs(argv) {
       case "--artifact":
       case "--focus":
       case "--guidelines":
+      case "--expected-packet-digest":
+      case "--expected-material-digests":
       case "--model":
       case "--reasoning-effort":
       case "--reviewer":
@@ -265,6 +269,15 @@ function parseArgs(argv) {
         if (arg === "--artifact") args.artifact = value;
         if (arg === "--focus") args.focus = value;
         if (arg === "--guidelines") args.guidelines = value;
+        if (arg === "--expected-packet-digest") args.expectedPacketDigest = value;
+        if (arg === "--expected-material-digests") {
+          let parsed;
+          try { parsed = JSON.parse(value); } catch { throw new Error("--expected-material-digests must be a JSON array of SHA-256 digests"); }
+          if (!Array.isArray(parsed) || parsed.some((digest) => typeof digest !== "string" || !SHA256_PATTERN.test(digest))) {
+            throw new Error("--expected-material-digests must be a JSON array of SHA-256 digests");
+          }
+          args.expectedMaterialDigests = [...new Set(parsed)].sort();
+        }
         if (arg === "--model") args.model = value;
         if (arg === "--reasoning-effort") args.reasoningEffort = value;
         if (arg === "--reviewer") args.reviewer = value;
@@ -288,6 +301,12 @@ function parseArgs(argv) {
   }
   if (!["block", "allow"].includes(args.onReviewerFailure)) {
     throw new Error(`invalid --on-reviewer-failure: ${args.onReviewerFailure}`);
+  }
+  if ((args.expectedPacketDigest === null) !== (args.expectedMaterialDigests === null)) {
+    throw new Error("--expected-packet-digest and --expected-material-digests must be supplied together");
+  }
+  if (args.expectedPacketDigest !== null && !SHA256_PATTERN.test(args.expectedPacketDigest)) {
+    throw new Error("--expected-packet-digest must be a SHA-256 digest");
   }
   if (args.reviewer) assertReviewer(args.reviewer, "--reviewer");
   if (args.model) {
@@ -473,6 +492,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
   const repo = resolveWorkspace(cwd);
   const guidelines = resolveGuidelines(args.guidelines, cwd, repo.root);
   const inputs = collectGenericReviewInputs(repo.root, args, cwd);
+  const bindings = reviewInputBindings(inputs, args);
   let policy;
   try {
     policy = guidelinePolicy(guidelines);
@@ -504,6 +524,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     policy,
     reviewer,
     repositoryRoot: repo.root,
+    bindings,
   });
   const targetHash = createHash("sha256")
     .update(JSON.stringify([
@@ -559,7 +580,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     };
   }
   if (cache) {
-    const cached = readReviewCache(repo.root, targetHash, reviewInputBindings(inputs));
+    const cached = readReviewCache(repo.root, targetHash, bindings);
     if (cached) {
       return {
         ok: cached.result.decision === "approved",
@@ -583,7 +604,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
       fakeErrorEnv: reviewer === "claude" ? "REVIEW_LOOP_FAKE_ERROR" : "REVIEW_LOOP_FAKE_CODEX_ERROR",
     });
     try {
-      reviewerOutput = validateReviewerOutput(reviewerResult.structuredOutput, reviewInputBindings(inputs));
+      reviewerOutput = validateReviewerOutput(reviewerResult.structuredOutput, bindings);
     } catch (error) {
       throw new ReviewerEnvelopeFailure(error instanceof Error ? error.message : String(error), reviewerResult.structuredOutput);
     }
@@ -727,7 +748,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     reviewedInputs: inputs.reviewed_inputs,
     reviewerMechanism: mechanismName(reviewerResult.meta),
   });
-  const normalized = validateNormalizedResult(result, reviewInputBindings(inputs));
+  const normalized = validateNormalizedResult(result, bindings);
   if (cache) {
     writeJson(reviewCachePath(repo.root), {
       integrity_version: REVIEW_CACHE_INTEGRITY_VERSION,
@@ -755,12 +776,13 @@ async function runFallbackReview({ args, cwd, selection, primaryReviewer, fallba
   const guidelines = resolveGuidelines(args.guidelines, cwd, repo.root);
   const policy = guidelinePolicy(guidelines);
   const inputs = collectGenericReviewInputs(repo.root, args, cwd);
+  const bindings = reviewInputBindings(inputs, args);
 
-  const prompt = buildFallbackPrompt({ guidelines, inputs, primaryReviewer, fallbackReviewer, primaryFailure });
+  const prompt = buildFallbackPrompt({ guidelines, inputs, primaryReviewer, fallbackReviewer, primaryFailure, bindings });
   const fallback = await runFallbackReviewer(prompt, { fallbackReviewer, repoRoot: repo.root });
   let reviewerOutput;
   try {
-    reviewerOutput = validateReviewerOutput(fallback.structuredOutput, reviewInputBindings(inputs));
+    reviewerOutput = validateReviewerOutput(fallback.structuredOutput, bindings);
   } catch (error) {
     throw new ReviewerEnvelopeFailure(error instanceof Error ? error.message : String(error), fallback.structuredOutput);
   }
@@ -773,7 +795,7 @@ async function runFallbackReview({ args, cwd, selection, primaryReviewer, fallba
     blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
     reviewedInputs: inputs.reviewed_inputs,
     reviewerMechanism: mechanismName(fallback.meta),
-  }), reviewInputBindings(inputs));
+  }), bindings);
   return {
     ok: normalized.decision === "approved",
     repo: repo.root,
@@ -1171,7 +1193,7 @@ function reviewCachePath(repoRoot) {
   return join(stateRoot(), "review-cache", `${repoHash(repoRoot)}.json`);
 }
 
-function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewer, repositoryRoot }) {
+function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewer, repositoryRoot, bindings }) {
   const delimiter = `REVIEW_LOOP_INPUT_${randomUUID()}`;
   const reviewerLabel = reviewer === "codex" ? "Codex" : "Claude Code";
   const policySummary = [
@@ -1198,8 +1220,8 @@ function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewe
     repositoryRoot ? `Repository root for read-only inspection: ${repositoryRoot}` : "",
     "",
     "Engine-computed exact input bindings (copy these values only after reviewing the bound inputs):",
-    `packet_digest: ${inputs.fingerprint}`,
-    `material_digests: ${JSON.stringify(reviewInputBindings(inputs).materialDigests)}`,
+    `packet_digest: ${bindings.packetDigest}`,
+    `material_digests: ${JSON.stringify(bindings.materialDigests)}`,
     "",
     "Machine-readable policy summary:",
     policySummary,
@@ -1219,7 +1241,7 @@ function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewe
   ].filter(Boolean).join("\n");
 }
 
-function buildFallbackPrompt({ guidelines, inputs, primaryReviewer, fallbackReviewer, primaryFailure }) {
+function buildFallbackPrompt({ guidelines, inputs, primaryReviewer, fallbackReviewer, primaryFailure, bindings }) {
   const primaryLabel = reviewerDisplayName(primaryReviewer);
   const fallbackLabel = reviewerDisplayName(fallbackReviewer);
   return [
@@ -1234,8 +1256,8 @@ function buildFallbackPrompt({ guidelines, inputs, primaryReviewer, fallbackRevi
     ...REVIEW_MECHANISM_CHECKS,
     "",
     "Engine-computed exact input bindings (copy these values only after reviewing the bound inputs):",
-    `packet_digest: ${inputs.fingerprint}`,
-    `material_digests: ${JSON.stringify(reviewInputBindings(inputs).materialDigests)}`,
+    `packet_digest: ${bindings.packetDigest}`,
+    `material_digests: ${JSON.stringify(bindings.materialDigests)}`,
     "",
     "Review guidelines:",
     guidelines.content,
@@ -2066,7 +2088,18 @@ function guidelinePolicy(guidelines) {
   return policy;
 }
 
-function reviewInputBindings(inputs) {
+function reviewInputBindings(inputs, args = {}) {
+  if (args.expectedPacketDigest !== null && args.expectedPacketDigest !== undefined) {
+    const artifacts = inputs.reviewed_inputs.filter((input) => input.kind === "artifact");
+    const scope = inputs.reviewed_inputs.find((input) => input.kind === "scope");
+    if (artifacts.length !== 1 || artifacts[0].hash !== args.expectedPacketDigest || scope?.scope !== "none") {
+      throw new Error("expected packet binding requires one exact matching artifact and scope none");
+    }
+    return {
+      packetDigest: args.expectedPacketDigest,
+      materialDigests: [...new Set(args.expectedMaterialDigests || [])].sort(),
+    };
+  }
   return {
     packetDigest: inputs.fingerprint,
     materialDigests: [...new Set(inputs.reviewed_inputs.map((input) => input.hash))].sort(),
