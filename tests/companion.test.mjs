@@ -245,7 +245,10 @@ process.stdin.on("end", () => {
 ${fakeReviewResponseSource}
 `, { mode: 0o755 });
 
-  const result = run(["run", "--scope", "auto"], {
+  const result = run([
+    "run", "--scope", "auto", "--focus",
+    "Record the outcome with akn gate-record, then continue into delivery.",
+  ], {
     cwd: repo,
     env: { ...testEnv(repo), REVIEW_LOOP_CLAUDE_BIN: fakeClaude },
   });
@@ -259,6 +262,12 @@ ${fakeReviewResponseSource}
   assert.match(prompt, /shared components preserve established behavioral defaults/);
   assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
   assert.match(prompt, /blocking at the evidence-supported severity/);
+  assert.match(prompt, /required_next_actions contains only remediation required before the current reviewed subject may advance/i);
+  assert.match(prompt, /An approved decision requires required_next_actions to be empty/i);
+  assert.match(prompt, /Caller workflow, controller publication, commands, and later lifecycle work cannot create reviewer findings or required_next_actions/i);
+  assert.match(prompt, /Optional improvements.*advisory findings/i);
+  assert.match(prompt, /For an advisory finding, required_action is a recommendation/i);
+  assert.match(prompt, /Focus: Record the outcome with akn gate-record, then continue into delivery\./);
   assert.match(prompt, /^packet_digest: [a-f0-9]{64}$/m);
   assert.match(prompt, /^material_digests: \["[a-f0-9]{64}"(?:,"[a-f0-9]{64}")*\]$/m);
   assert.doesNotMatch(JSON.stringify(argv), /You are Claude Code/);
@@ -328,6 +337,9 @@ ${fakeReviewResponseSource}
     "limitations",
   ]);
   assert.ok(schema.properties.findings.items.required.includes("reviewer_disposition"));
+  assert.equal(schema.properties.acknowledged_packet_digest.oneOf, undefined);
+  assert.deepEqual(schema.properties.acknowledged_packet_digest.type, ["string", "null"]);
+  assert.equal(schema.properties.acknowledged_packet_digest.pattern, "^[a-f0-9]{64}$");
   const envCapture = JSON.parse(readFileSync(envFile, "utf8"));
   assert.equal(envCapture.terminalReviewer, "1");
   assert.equal(envCapture.fallbackToken, "");
@@ -1138,6 +1150,79 @@ test("v4 preserves a grounded changes_requested decision without blocking findin
   assert.deepEqual(parsed.result.required_next_actions, ["Review the exact material again."]);
 });
 
+test("v4 rejects whitespace-only required actions without answer-shopping", () => {
+  const repo = makeGitRepo();
+  const plan = join(repo, "plan.md");
+  writeFileSync(plan, "Plan\n");
+  const result = run(["run", "--artifact", plan, "--scope", "none", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(structurallyCompleteOutput({
+        decision: "changes_requested",
+        summary: "The reviewer returned a non-substantive action.",
+        findings: [],
+        required_next_actions: ["   "],
+      })),
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback must not run")),
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.equal(parsed.review_execution.fallback_used, false);
+  assert.match(parsed.result.summary, /non-empty strings/);
+  assert.doesNotMatch(JSON.stringify(parsed), /fallback must not run/);
+});
+
+test("v4 rejects a whitespace-only finding action", () => {
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(structurallyCompleteOutput({
+        decision: "changes_requested",
+        summary: "The finding has no substantive remediation.",
+        findings: [{
+          ...finding({ required_action: "   " }),
+          reviewer_disposition: "blocking",
+        }],
+        required_next_actions: [],
+      })),
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.match(parsed.result.summary, /finding\.required_action is required/);
+});
+
+test("v4 keeps approved-plus-actions terminal and never answer-shops", () => {
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(structurallyCompleteOutput({
+        decision: "approved",
+        summary: "Approved, with a downstream workflow instruction.",
+        findings: [],
+        required_next_actions: ["Record the gate and continue into delivery."],
+      })),
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback must not run")),
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.equal(parsed.review_execution.fallback_used, false);
+  assert.match(parsed.result.summary, /approved reviewer output must not include required_next_actions/);
+  assert.doesNotMatch(JSON.stringify(parsed), /fallback must not run/);
+});
+
 test("v4 rejects an ungrounded changes_requested decision", () => {
   const repo = makeGitRepo();
   const plan = join(repo, "plan.md");
@@ -1336,6 +1421,7 @@ test("run preserves reviewer invalid_input and blocked decisions without synthet
     assert.equal(parsed.result.decision, decision);
     assert.deepEqual(parsed.result.blocking_findings, []);
     assert.deepEqual(parsed.result.required_next_actions, ["Try again."]);
+    assert.equal(parsed.result.acknowledged_packet_digest, null);
   }
 });
 
