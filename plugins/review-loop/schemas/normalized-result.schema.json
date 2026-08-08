@@ -4,6 +4,11 @@
   "additionalProperties": false,
   "required": [
     "schema_version",
+    "review_status",
+    "subject_reviewable",
+    "substantive_merit_evaluated",
+    "acknowledged_packet_digest",
+    "acknowledged_material_digests",
     "decision",
     "summary",
     "blocking_findings",
@@ -11,10 +16,27 @@
     "required_next_actions",
     "reviewed_inputs",
     "reviewer_mechanism",
+    "limitations",
     "read_only"
   ],
   "properties": {
-    "schema_version": { "const": "3" },
+    "schema_version": { "const": "4" },
+    "review_status": {
+      "enum": ["performed", "partial", "not_performed"]
+    },
+    "subject_reviewable": { "type": "boolean" },
+    "substantive_merit_evaluated": { "type": "boolean" },
+    "acknowledged_packet_digest": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256" },
+        { "type": "null" }
+      ]
+    },
+    "acknowledged_material_digests": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/sha256" },
+      "uniqueItems": true
+    },
     "decision": {
       "type": "string",
       "enum": ["approved", "changes_requested", "invalid_input", "blocked"]
@@ -51,9 +73,17 @@
       }
     },
     "reviewer_mechanism": { "type": "string", "minLength": 1 },
+    "limitations": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
     "read_only": { "const": true }
   },
   "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
     "finding": {
       "type": "object",
       "additionalProperties": false,

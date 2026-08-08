@@ -13,9 +13,13 @@ const TEMPLATE_GUIDELINES = join(ROOT, "templates", "review-guidelines.md");
 const PROJECT_GUIDELINES = [".review-loop", "review-guidelines.md"];
 const SEVERITIES = ["info", "low", "medium", "high"];
 const GENERIC_DECISIONS = ["approved", "changes_requested", "invalid_input", "blocked"];
+const REVIEW_STATUSES = ["performed", "partial", "not_performed"];
 const REVIEWER_DISPOSITIONS = ["blocking", "advisory"];
 const BLOCKING_REASONS = ["reviewer", "category_policy", "severity_policy", "fallback_threshold"];
 const REVIEWERS = ["claude", "codex"];
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const FAKE_PACKET_DIGEST = "__REVIEW_LOOP_PACKET_DIGEST__";
+const FAKE_MATERIAL_DIGESTS = "__REVIEW_LOOP_MATERIAL_DIGESTS__";
 const HOSTS = ["codex", "claude"];
 const REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const DEFAULT_BLOCK_ON = "high";
@@ -76,6 +80,12 @@ class ReviewerEnvelopeFailure extends Error {
     this.contentDigest = domainDigest("review-loop.reviewer-envelope.v1", content);
     this.hasSubstantiveContent = hasRecoverableSubstantiveContent(content);
   }
+}
+
+function isTerminalInvalidReviewEvidence(error) {
+  return error instanceof ReviewerEnvelopeFailure
+    && (error.hasSubstantiveContent
+      || /approved reviewer output|acknowledged_(?:packet_digest|material_digests) do(?:es)? not match|changes_requested reviewer output requires/.test(error.message));
 }
 
 class ReviewerIdentityFailure extends Error {
@@ -167,7 +177,7 @@ Run "<subcommand> --help" for subcommand options.`);
 
 const SUBCOMMAND_HELP = {
   setup: "setup [--init-guidelines] [--force] [--enable-review-gate] [--disable-review-gate] [--block-on info|low|medium|high] [--on-reviewer-failure block|allow] [--enable-gate-debug] [--disable-gate-debug] [--json]",
-  run: "run [--background] [--counter] [--context <path>] [--artifact <path>] [--focus <text>] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--reviewer claude|codex] [--model <exact-id> [--reasoning-effort low|medium|high|xhigh|max]] [--on-reviewer-failure block|allow] [--json]",
+  run: "run [--background] [--counter] [--context <path>] [--artifact <path>] [--focus <text>] [--base <ref>] [--scope none|auto|working-tree|branch] [--guidelines <path>] [--reviewer claude|codex] [--model <exact-id> [--reasoning-effort low|medium|high|xhigh|max]] [--expected-packet-digest <sha256> --expected-material-digests <json-array>] [--on-reviewer-failure block|allow] [--json]",
   status: "status [job-id] [--all] [--json]",
   result: "result [job-id] [--json]",
   cancel: "cancel [job-id] [--json]",
@@ -195,6 +205,8 @@ function parseArgs(argv) {
     artifact: null,
     focus: null,
     guidelines: null,
+    expectedPacketDigest: null,
+    expectedMaterialDigests: null,
     initGuidelines: false,
     json: false,
     model: null,
@@ -248,6 +260,8 @@ function parseArgs(argv) {
       case "--artifact":
       case "--focus":
       case "--guidelines":
+      case "--expected-packet-digest":
+      case "--expected-material-digests":
       case "--model":
       case "--reasoning-effort":
       case "--reviewer":
@@ -261,6 +275,15 @@ function parseArgs(argv) {
         if (arg === "--artifact") args.artifact = value;
         if (arg === "--focus") args.focus = value;
         if (arg === "--guidelines") args.guidelines = value;
+        if (arg === "--expected-packet-digest") args.expectedPacketDigest = value;
+        if (arg === "--expected-material-digests") {
+          let parsed;
+          try { parsed = JSON.parse(value); } catch { throw new Error("--expected-material-digests must be a JSON array of SHA-256 digests"); }
+          if (!Array.isArray(parsed) || parsed.some((digest) => typeof digest !== "string" || !SHA256_PATTERN.test(digest))) {
+            throw new Error("--expected-material-digests must be a JSON array of SHA-256 digests");
+          }
+          args.expectedMaterialDigests = [...new Set(parsed)].sort();
+        }
         if (arg === "--model") args.model = value;
         if (arg === "--reasoning-effort") args.reasoningEffort = value;
         if (arg === "--reviewer") args.reviewer = value;
@@ -284,6 +307,12 @@ function parseArgs(argv) {
   }
   if (!["block", "allow"].includes(args.onReviewerFailure)) {
     throw new Error(`invalid --on-reviewer-failure: ${args.onReviewerFailure}`);
+  }
+  if ((args.expectedPacketDigest === null) !== (args.expectedMaterialDigests === null)) {
+    throw new Error("--expected-packet-digest and --expected-material-digests must be supplied together");
+  }
+  if (args.expectedPacketDigest !== null && !SHA256_PATTERN.test(args.expectedPacketDigest)) {
+    throw new Error("--expected-packet-digest must be a SHA-256 digest");
   }
   if (args.reviewer) assertReviewer(args.reviewer, "--reviewer");
   if (args.model) {
@@ -469,6 +498,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
   const repo = resolveWorkspace(cwd);
   const guidelines = resolveGuidelines(args.guidelines, cwd, repo.root);
   const inputs = collectGenericReviewInputs(repo.root, args, cwd);
+  const bindings = reviewInputBindings(inputs, args);
   let policy;
   try {
     policy = guidelinePolicy(guidelines);
@@ -500,6 +530,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     policy,
     reviewer,
     repositoryRoot: repo.root,
+    bindings,
   });
   const targetHash = createHash("sha256")
     .update(JSON.stringify([
@@ -522,22 +553,23 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     // is a silent no-op that masquerades as a passed gate, so surface it as
     // invalid_input with an actionable next step instead.
     const scopeLabel = inputs.reviewed_inputs.find((entry) => entry.kind === "scope")?.scope || args.scope || "auto";
-    const empty = gate
-      ? {
-          decision: "approved",
-          summary: "Nothing to review.",
-          findings: [],
-          required_next_actions: [],
-        }
-      : {
-          decision: "invalid_input",
-          summary: `Nothing to review: no changes in scope "${scopeLabel}" and no --artifact/--context supplied, so no review ran.`,
-          findings: [],
-          required_next_actions: [
-            "To review a document (for example a plan), re-run with --artifact <path> --scope none.",
-            "To review code, ensure there is a diff in the selected scope or pass --base <ref>.",
-          ],
-        };
+    const empty = {
+      review_status: "not_performed",
+      subject_reviewable: false,
+      substantive_merit_evaluated: false,
+      acknowledged_packet_digest: null,
+      acknowledged_material_digests: [],
+      decision: "invalid_input",
+      summary: gate
+        ? "Nothing to review."
+        : `Nothing to review: no changes in scope "${scopeLabel}" and no --artifact/--context supplied, so no review ran.`,
+      findings: [],
+      required_next_actions: gate ? [] : [
+        "To review a document (for example a plan), re-run with --artifact <path> --scope none.",
+        "To review code, ensure there is a diff in the selected scope or pass --base <ref>.",
+      ],
+      limitations: ["No reviewable input was available."],
+    };
     const result = validateNormalizedResult(normalizeReviewOutput(empty, {
       policy,
       blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
@@ -554,7 +586,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     };
   }
   if (cache) {
-    const cached = readReviewCache(repo.root, targetHash);
+    const cached = readReviewCache(repo.root, targetHash, bindings);
     if (cached) {
       return {
         ok: cached.result.decision === "approved",
@@ -578,14 +610,14 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
       fakeErrorEnv: reviewer === "claude" ? "REVIEW_LOOP_FAKE_ERROR" : "REVIEW_LOOP_FAKE_CODEX_ERROR",
     });
     try {
-      reviewerOutput = validateReviewerOutput(reviewerResult.structuredOutput);
+      reviewerOutput = validateReviewerOutput(reviewerResult.structuredOutput, bindings);
     } catch (error) {
       throw new ReviewerEnvelopeFailure(error instanceof Error ? error.message : String(error), reviewerResult.structuredOutput);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const primaryFailure = classifyTransportFailure(error);
-    if (error instanceof ReviewerEnvelopeFailure && error.hasSubstantiveContent) {
+    if (isTerminalInvalidReviewEvidence(error)) {
       return genericMechanismFailureResult({
         repo,
         guidelines,
@@ -620,7 +652,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
         fallbackFailureDiagnostic = fallbackError instanceof ReviewerIdentityFailure
           ? failureDiagnostic("identity", fallbackError)
           : classifyTransportFailure(fallbackError);
-        if (fallbackError instanceof ReviewerEnvelopeFailure && fallbackError.hasSubstantiveContent) {
+        if (isTerminalInvalidReviewEvidence(fallbackError)) {
           return genericMechanismFailureResult({
             repo,
             guidelines,
@@ -640,7 +672,12 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     }
     if (args.onReviewerFailure === "allow") {
       reviewerOutput = {
-        decision: "approved",
+        review_status: "not_performed",
+        subject_reviewable: false,
+        substantive_merit_evaluated: false,
+        acknowledged_packet_digest: null,
+        acknowledged_material_digests: [],
+        decision: "blocked",
         summary: [
           `Reviewer mechanism failed and --on-reviewer-failure=allow was set: ${redact(message)}`,
           fallbackMessage && fallbackReviewer
@@ -649,6 +686,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
         ].filter(Boolean).join(". "),
         findings: [],
         required_next_actions: [],
+        limitations: ["Reviewer mechanism was unavailable."],
       };
       reviewerResult = {
         resultText: "",
@@ -716,7 +754,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     reviewedInputs: inputs.reviewed_inputs,
     reviewerMechanism: mechanismName(reviewerResult.meta),
   });
-  const normalized = validateNormalizedResult(result);
+  const normalized = validateNormalizedResult(result, bindings);
   if (cache) {
     writeJson(reviewCachePath(repo.root), {
       integrity_version: REVIEW_CACHE_INTEGRITY_VERSION,
@@ -744,12 +782,13 @@ async function runFallbackReview({ args, cwd, selection, primaryReviewer, fallba
   const guidelines = resolveGuidelines(args.guidelines, cwd, repo.root);
   const policy = guidelinePolicy(guidelines);
   const inputs = collectGenericReviewInputs(repo.root, args, cwd);
+  const bindings = reviewInputBindings(inputs, args);
 
-  const prompt = buildFallbackPrompt({ guidelines, inputs, primaryReviewer, fallbackReviewer, primaryFailure });
+  const prompt = buildFallbackPrompt({ guidelines, inputs, primaryReviewer, fallbackReviewer, primaryFailure, bindings });
   const fallback = await runFallbackReviewer(prompt, { fallbackReviewer, repoRoot: repo.root });
   let reviewerOutput;
   try {
-    reviewerOutput = validateReviewerOutput(fallback.structuredOutput);
+    reviewerOutput = validateReviewerOutput(fallback.structuredOutput, bindings);
   } catch (error) {
     throw new ReviewerEnvelopeFailure(error instanceof Error ? error.message : String(error), fallback.structuredOutput);
   }
@@ -762,7 +801,7 @@ async function runFallbackReview({ args, cwd, selection, primaryReviewer, fallba
     blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
     reviewedInputs: inputs.reviewed_inputs,
     reviewerMechanism: mechanismName(fallback.meta),
-  }));
+  }), bindings);
   return {
     ok: normalized.decision === "approved",
     repo: repo.root,
@@ -1042,7 +1081,7 @@ function runCodexReviewerPrimitive(prompt, options) {
   if (process.env[options.fakeOutputEnv]) {
     let structuredOutput;
     try {
-      structuredOutput = JSON.parse(process.env[options.fakeOutputEnv]);
+      structuredOutput = hydrateFakeReviewBindings(JSON.parse(process.env[options.fakeOutputEnv]), prompt);
     } catch (error) {
       throw new ReviewerEnvelopeFailure(
         `${options.failureLabel} structured output was not JSON: ${error.message}`,
@@ -1133,7 +1172,7 @@ function codexSessionId(stdout) {
   return null;
 }
 
-function readReviewCache(repoRoot, targetHash) {
+function readReviewCache(repoRoot, targetHash, bindings = null) {
   const path = reviewCachePath(repoRoot);
   if (!existsSync(path)) return null;
   let cached;
@@ -1148,7 +1187,7 @@ function readReviewCache(repoRoot, targetHash) {
   const createdAt = Date.parse(cached.created_at || "");
   if (!Number.isFinite(createdAt) || Date.now() - createdAt > ttl) return null;
   try {
-    validateNormalizedResult(cached.result);
+    validateNormalizedResult(cached.result, bindings);
   } catch {
     return null;
   }
@@ -1160,7 +1199,7 @@ function reviewCachePath(repoRoot) {
   return join(stateRoot(), "review-cache", `${repoHash(repoRoot)}.json`);
 }
 
-function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewer, repositoryRoot }) {
+function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewer, repositoryRoot, bindings }) {
   const delimiter = `REVIEW_LOOP_INPUT_${randomUUID()}`;
   const reviewerLabel = reviewer === "codex" ? "Codex" : "Claude Code";
   const policySummary = [
@@ -1178,11 +1217,17 @@ function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewe
     "Non-overridable safety: do not edit files, write files, apply patches, commit, run destructive commands, or continue into implementation.",
     "You may use Read, Grep, and Glob to inspect surrounding code for context.",
     "Return only structured output matching the requested reviewer-output schema.",
+    "Report whether review was performed, whether the subject was reviewable, and whether substantive merit was evaluated; never claim completion when any of those predicates is false.",
+    "Acknowledge the exact packet and material SHA-256 digests you actually reviewed. Use null or an empty list when an input was not reviewed; do not copy a digest you did not inspect.",
     "Do not decide project gates. Classify findings with severity, category, message, required_action, and reviewer_disposition.",
     "",
     `Review stance: ${stance}`,
     focus ? `Focus: ${focus}` : "",
     repositoryRoot ? `Repository root for read-only inspection: ${repositoryRoot}` : "",
+    "",
+    "Engine-computed exact input bindings (copy these values only after reviewing the bound inputs):",
+    `packet_digest: ${bindings.packetDigest}`,
+    `material_digests: ${JSON.stringify(bindings.materialDigests)}`,
     "",
     "Machine-readable policy summary:",
     policySummary,
@@ -1202,7 +1247,7 @@ function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewe
   ].filter(Boolean).join("\n");
 }
 
-function buildFallbackPrompt({ guidelines, inputs, primaryReviewer, fallbackReviewer, primaryFailure }) {
+function buildFallbackPrompt({ guidelines, inputs, primaryReviewer, fallbackReviewer, primaryFailure, bindings }) {
   const primaryLabel = reviewerDisplayName(primaryReviewer);
   const fallbackLabel = reviewerDisplayName(fallbackReviewer);
   return [
@@ -1215,6 +1260,10 @@ function buildFallbackPrompt({ guidelines, inputs, primaryReviewer, fallbackRevi
     "",
     "Required mechanism checks:",
     ...REVIEW_MECHANISM_CHECKS,
+    "",
+    "Engine-computed exact input bindings (copy these values only after reviewing the bound inputs):",
+    `packet_digest: ${bindings.packetDigest}`,
+    `material_digests: ${JSON.stringify(bindings.materialDigests)}`,
     "",
     "Review guidelines:",
     guidelines.content,
@@ -1241,7 +1290,7 @@ async function runClaudeReviewer(prompt, options = {}) {
   if (process.env[fakeOutputEnv]) {
     let structuredOutput;
     try {
-      structuredOutput = JSON.parse(process.env[fakeOutputEnv]);
+      structuredOutput = hydrateFakeReviewBindings(JSON.parse(process.env[fakeOutputEnv]), prompt);
     } catch (error) {
       throw new ReviewerEnvelopeFailure(
         `claude structured output was not JSON: ${error.message}`,
@@ -1921,6 +1970,13 @@ async function gateCommand(args) {
     }
   }
 
+  if (reviewResult.reviewer_mechanism?.reason === "empty-target") {
+    delete state.tasks[fallbackTaskKey];
+    writeGateState(repo.root, state);
+    outputHookAllow();
+    return;
+  }
+
   let blocking;
   try {
     blocking = reviewResult.result.blocking_findings;
@@ -1937,14 +1993,7 @@ async function gateCommand(args) {
   const targetSummary = gateTargetSummary(reviewResult.result);
   if (fallbackTaskKey !== taskKey) delete state.tasks[fallbackTaskKey];
 
-  if (["invalid_input", "blocked"].includes(reviewResult.result.decision)) {
-    delete state.tasks[taskKey];
-    writeGateState(repo.root, state);
-    outputHookBlock(reviewResult.result.summary);
-    return;
-  }
-
-  if (!blocking.length) {
+  if (reviewResult.result.decision === "approved" && !blocking.length) {
     delete state.tasks[taskKey];
     writeGateState(repo.root, state);
     outputHookAllow(fallbackDisclosure || undefined);
@@ -1953,16 +2002,30 @@ async function gateCommand(args) {
 
   // Reset the same-fingerprint count when Claude reports a different finding
   // set; the total ceiling bounds churn when findings change on every run.
-  const fingerprint = blocking.map((finding) => finding.id).sort().join("|");
+  const refusalFingerprintParts = blocking.length
+    ? blocking.map((finding) => finding.id).sort()
+    : [
+      reviewResult.result.decision,
+      ...reviewResult.result.advisory_findings.map((finding) => finding.id).sort(),
+      ...reviewResult.result.required_next_actions,
+    ];
+  const fingerprint = refusalFingerprintParts.join("|");
   taskState.block_count = taskState.fingerprint === fingerprint ? Number(taskState.block_count || 0) + 1 : 1;
   taskState.fingerprint = fingerprint;
   taskState.total_blocks = Number(taskState.total_blocks || 0) + 1;
   taskState.last_blocked_at = new Date().toISOString();
   taskState.updated_at = taskState.last_blocked_at;
-  taskState.last_findings = blocking.map((finding) => finding.id);
+  taskState.last_findings = (blocking.length ? blocking : reviewResult.result.advisory_findings).map((finding) => finding.id);
 
-  const findingLines = blocking.map((finding) => `[${finding.severity}] ${finding.locations[0] || ""}: ${finding.message}`);
-  const reason = [targetSummary ? `Reviewed target: ${targetSummary}` : "", ...findingLines].filter(Boolean).join("\n");
+  const findingLines = (blocking.length ? blocking : reviewResult.result.advisory_findings)
+    .map((finding) => `[${finding.severity}] ${finding.locations[0] || ""}: ${finding.message}`);
+  const reason = [
+    targetSummary ? `Reviewed target: ${targetSummary}` : "",
+    !blocking.length ? reviewResult.result.summary : "",
+    ...findingLines,
+    ...reviewResult.result.required_next_actions.map((action) => `Required action: ${action}`),
+    ...reviewResult.result.limitations.map((limitation) => `Limitation: ${limitation}`),
+  ].filter(Boolean).join("\n");
   const cap = taskState.block_count > GATE_FINGERPRINT_BLOCK_LIMIT
     ? "review-loop reached the three-block convergence cap."
     : taskState.total_blocks > GATE_TOTAL_BLOCK_LIMIT
@@ -1973,7 +2036,7 @@ async function gateCommand(args) {
     // stop under the same coarse key is a new task and stays gated.
     delete state.tasks[taskKey];
     writeGateState(repo.root, state);
-    outputHookAllow(`Cap-forced finalization: ${cap} The automatic gate is allowing this stop as report-only after exhausting its bounded retry budget.\nUnresolved blocking findings:\n${reason}`);
+    outputHookAllow(`Cap-forced finalization: ${cap} The automatic gate is allowing this stop as report-only after exhausting its bounded retry budget.\nUnresolved review refusal:\n${reason}`);
     return;
   }
   state.tasks[taskKey] = taskState;
@@ -2036,7 +2099,44 @@ function guidelinePolicy(guidelines) {
   return policy;
 }
 
-function validateReviewerOutput(value) {
+function reviewInputBindings(inputs, args = {}) {
+  if (args.expectedPacketDigest !== null && args.expectedPacketDigest !== undefined) {
+    const artifacts = inputs.reviewed_inputs.filter((input) => input.kind === "artifact");
+    const scope = inputs.reviewed_inputs.find((input) => input.kind === "scope");
+    if (inputs.reviewed_inputs.length !== 2
+      || artifacts.length !== 1
+      || artifacts[0].hash !== args.expectedPacketDigest
+      || scope?.scope !== "none") {
+      throw new Error("expected packet binding requires exactly one matching artifact, no additional review inputs, and scope none");
+    }
+    return {
+      packetDigest: args.expectedPacketDigest,
+      materialDigests: [...new Set(args.expectedMaterialDigests || [])].sort(),
+    };
+  }
+  return {
+    packetDigest: inputs.fingerprint,
+    materialDigests: [...new Set(inputs.reviewed_inputs.map((input) => input.hash))].sort(),
+  };
+}
+
+function hydrateFakeReviewBindings(value, prompt) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const packetDigest = prompt.match(/^packet_digest: ([a-f0-9]{64})$/m)?.[1];
+  const materialMatch = prompt.match(/^material_digests: (\[[^\n]*\])$/m)?.[1];
+  const materialDigests = materialMatch ? JSON.parse(materialMatch) : [];
+  const hydrated = { ...value };
+  if (value.acknowledged_packet_digest === FAKE_PACKET_DIGEST) {
+    hydrated.acknowledged_packet_digest = packetDigest;
+  }
+  if (Array.isArray(value.acknowledged_material_digests)
+    && value.acknowledged_material_digests.includes(FAKE_MATERIAL_DIGESTS)) {
+    hydrated.acknowledged_material_digests = materialDigests;
+  }
+  return hydrated;
+}
+
+function validateReviewerOutput(value, expectedBindings = null) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("reviewer output must be an object");
   }
@@ -2059,11 +2159,69 @@ function validateReviewerOutput(value) {
   if (value.required_next_actions !== undefined && !Array.isArray(value.required_next_actions)) {
     throw new Error("reviewer output required_next_actions must be an array");
   }
+  for (const field of [
+    "review_status",
+    "subject_reviewable",
+    "substantive_merit_evaluated",
+    "acknowledged_packet_digest",
+    "acknowledged_material_digests",
+    "limitations",
+  ]) {
+    if (!Object.hasOwn(value, field)) throw new Error(`reviewer output ${field} is required`);
+  }
+  const reviewStatus = value.review_status;
+  const subjectReviewable = value.subject_reviewable;
+  const substantiveMeritEvaluated = value.substantive_merit_evaluated;
+  const acknowledgedPacketDigest = value.acknowledged_packet_digest;
+  const acknowledgedMaterialDigests = value.acknowledged_material_digests;
+  const limitations = value.limitations;
+  if (!REVIEW_STATUSES.includes(reviewStatus)) {
+    throw new Error(`reviewer output review_status must be one of: ${REVIEW_STATUSES.join(", ")}`);
+  }
+  if (typeof subjectReviewable !== "boolean") throw new Error("reviewer output subject_reviewable must be boolean");
+  if (typeof substantiveMeritEvaluated !== "boolean") throw new Error("reviewer output substantive_merit_evaluated must be boolean");
+  if (acknowledgedPacketDigest !== null && !SHA256_PATTERN.test(acknowledgedPacketDigest)) {
+    throw new Error("reviewer output acknowledged_packet_digest must be a SHA-256 digest or null");
+  }
+  if (!Array.isArray(acknowledgedMaterialDigests)
+    || acknowledgedMaterialDigests.some((digest) => !SHA256_PATTERN.test(digest))) {
+    throw new Error("reviewer output acknowledged_material_digests must contain SHA-256 digests");
+  }
+  if (!Array.isArray(limitations) || limitations.some((item) => typeof item !== "string" || !item.trim())) {
+    throw new Error("reviewer output limitations must contain non-empty strings");
+  }
+  const requiredNextActions = value.required_next_actions || [];
+  if (value.decision === "approved" && requiredNextActions.length) {
+    throw new Error("approved reviewer output must not include required_next_actions");
+  }
+  if (value.decision === "approved") {
+    if (reviewStatus !== "performed") throw new Error("approved reviewer output requires performed review_status");
+    if (!subjectReviewable) throw new Error("approved reviewer output requires a reviewable subject");
+    if (!substantiveMeritEvaluated) throw new Error("approved reviewer output requires substantive merit evaluation");
+    if (acknowledgedPacketDigest === null) throw new Error("approved reviewer output requires acknowledged_packet_digest");
+  }
+  if (value.decision === "changes_requested" && value.findings.length === 0 && requiredNextActions.length === 0) {
+    throw new Error("changes_requested reviewer output requires a finding or required_next_action");
+  }
+  validateReviewEvidenceBindings({
+    reviewStatus,
+    subjectReviewable,
+    substantiveMeritEvaluated,
+    acknowledgedPacketDigest,
+    acknowledgedMaterialDigests,
+    limitations,
+  }, expectedBindings, "reviewer output");
   return {
+    review_status: reviewStatus,
+    subject_reviewable: subjectReviewable,
+    substantive_merit_evaluated: substantiveMeritEvaluated,
+    acknowledged_packet_digest: acknowledgedPacketDigest,
+    acknowledged_material_digests: [...new Set(acknowledgedMaterialDigests)].sort(),
     decision: value.decision,
     summary: value.summary,
     findings: value.findings,
-    required_next_actions: value.required_next_actions || [],
+    required_next_actions: requiredNextActions,
+    limitations,
   };
 }
 
@@ -2088,7 +2246,7 @@ function isPlaceholderSummary(value) {
 
 function normalizeReviewOutput(reviewerOutput, { policy, blockOn, reviewedInputs, reviewerMechanism }) {
   if (["invalid_input", "blocked"].includes(reviewerOutput.decision)) {
-    return syntheticNormalizedFailure(reviewerOutput.decision, reviewerOutput.summary, reviewedInputs, reviewerOutput.required_next_actions, reviewerMechanism);
+    return syntheticNormalizedFailure(reviewerOutput.decision, reviewerOutput.summary, reviewedInputs, reviewerOutput.required_next_actions, reviewerMechanism, reviewerOutput.limitations);
   }
 
   const blocking = [];
@@ -2111,13 +2269,19 @@ function normalizeReviewOutput(reviewerOutput, { policy, blockOn, reviewedInputs
   ].filter(Boolean);
   return {
     schema_version: REVIEW_PROTOCOL_VERSION,
-    decision: blocking.length ? "changes_requested" : "approved",
+    review_status: reviewerOutput.review_status,
+    subject_reviewable: reviewerOutput.subject_reviewable,
+    substantive_merit_evaluated: reviewerOutput.substantive_merit_evaluated,
+    acknowledged_packet_digest: reviewerOutput.acknowledged_packet_digest,
+    acknowledged_material_digests: reviewerOutput.acknowledged_material_digests,
+    decision: blocking.length ? "changes_requested" : reviewerOutput.decision,
     summary: reviewerOutput.summary,
     blocking_findings: blocking,
     advisory_findings: advisory.filter((finding) => !seenBlocking.has(finding.id)),
     required_next_actions: [...new Set(requiredNextActions)],
     reviewed_inputs: reviewedInputs,
     reviewer_mechanism: reviewerMechanism || "claude-code",
+    limitations: reviewerOutput.limitations,
     read_only: true,
   };
 }
@@ -2146,10 +2310,15 @@ function blockingReason(finding, policy, blockOn) {
   return null;
 }
 
-function syntheticNormalizedFailure(decision, summary, reviewedInputs = [], requiredNextActions = [], reviewerMechanism = "review-loop") {
+function syntheticNormalizedFailure(decision, summary, reviewedInputs = [], requiredNextActions = [], reviewerMechanism = "review-loop", limitations = []) {
   const normalizedDecision = decision === "invalid_input" ? "invalid_input" : "blocked";
   return {
     schema_version: REVIEW_PROTOCOL_VERSION,
+    review_status: "not_performed",
+    subject_reviewable: false,
+    substantive_merit_evaluated: false,
+    acknowledged_packet_digest: null,
+    acknowledged_material_digests: [],
     decision: normalizedDecision,
     summary,
     blocking_findings: [],
@@ -2157,16 +2326,27 @@ function syntheticNormalizedFailure(decision, summary, reviewedInputs = [], requ
     required_next_actions: requiredNextActions.length ? requiredNextActions : ["Resolve the review execution failure and rerun review-loop."],
     reviewed_inputs: reviewedInputs,
     reviewer_mechanism: reviewerMechanism,
+    limitations: limitations.length ? limitations : [summary],
     read_only: true,
   };
 }
 
-function validateNormalizedResult(value) {
+function validateNormalizedResult(value, expectedBindings = null) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("normalized result must be an object");
   if (value.schema_version !== REVIEW_PROTOCOL_VERSION) {
     throw new Error(`normalized result schema_version must be ${REVIEW_PROTOCOL_VERSION}`);
   }
   if (!GENERIC_DECISIONS.includes(value.decision)) throw new Error(`normalized result decision must be one of: ${GENERIC_DECISIONS.join(", ")}`);
+  if (!REVIEW_STATUSES.includes(value.review_status)) throw new Error(`normalized result review_status must be one of: ${REVIEW_STATUSES.join(", ")}`);
+  if (typeof value.subject_reviewable !== "boolean") throw new Error("normalized result subject_reviewable must be boolean");
+  if (typeof value.substantive_merit_evaluated !== "boolean") throw new Error("normalized result substantive_merit_evaluated must be boolean");
+  if (value.acknowledged_packet_digest !== null && !SHA256_PATTERN.test(value.acknowledged_packet_digest)) {
+    throw new Error("normalized result acknowledged_packet_digest must be a SHA-256 digest or null");
+  }
+  if (!Array.isArray(value.acknowledged_material_digests)
+    || value.acknowledged_material_digests.some((digest) => !SHA256_PATTERN.test(digest))) {
+    throw new Error("normalized result acknowledged_material_digests must contain SHA-256 digests");
+  }
   if (!Array.isArray(value.blocking_findings)) throw new Error("normalized result blocking_findings must be an array");
   if (!Array.isArray(value.advisory_findings)) throw new Error("normalized result advisory_findings must be an array");
   for (const finding of value.blocking_findings) {
@@ -2176,13 +2356,32 @@ function validateNormalizedResult(value) {
     }
   }
   for (const finding of value.advisory_findings) validateReviewerFinding(finding);
-  if (value.decision === "approved" && value.blocking_findings.length !== 0) {
-    throw new Error("approved normalized result must not include blocking_findings");
-  }
-  if (value.decision === "changes_requested" && value.blocking_findings.length === 0) {
-    throw new Error("changes_requested normalized result requires blocking_findings");
-  }
   if (!Array.isArray(value.required_next_actions)) throw new Error("normalized result required_next_actions must be an array");
+  if (!Array.isArray(value.limitations) || value.limitations.some((item) => typeof item !== "string" || !item.trim())) {
+    throw new Error("normalized result limitations must contain non-empty strings");
+  }
+  if (value.decision === "changes_requested"
+    && value.blocking_findings.length === 0
+    && value.advisory_findings.length === 0
+    && value.required_next_actions.length === 0) {
+    throw new Error("changes_requested normalized result requires a finding or required_next_action");
+  }
+  if (value.decision === "approved") {
+    if (value.review_status !== "performed") throw new Error("approved normalized result requires performed review_status");
+    if (!value.subject_reviewable) throw new Error("approved normalized result requires a reviewable subject");
+    if (!value.substantive_merit_evaluated) throw new Error("approved normalized result requires substantive merit evaluation");
+    if (value.acknowledged_packet_digest === null) throw new Error("approved normalized result requires acknowledged_packet_digest");
+    if (value.blocking_findings.length !== 0) throw new Error("approved normalized result must not include blocking_findings");
+    if (value.required_next_actions.length !== 0) throw new Error("approved normalized result must not include required_next_actions");
+  }
+  validateReviewEvidenceBindings({
+    reviewStatus: value.review_status,
+    subjectReviewable: value.subject_reviewable,
+    substantiveMeritEvaluated: value.substantive_merit_evaluated,
+    acknowledgedPacketDigest: value.acknowledged_packet_digest,
+    acknowledgedMaterialDigests: value.acknowledged_material_digests,
+    limitations: value.limitations,
+  }, expectedBindings, "normalized result");
   if (!Array.isArray(value.reviewed_inputs)) throw new Error("normalized result reviewed_inputs must be an array");
   for (const input of value.reviewed_inputs) {
     if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("reviewed_inputs items must be objects");
@@ -2197,6 +2396,35 @@ function validateNormalizedResult(value) {
   }
   if (value.read_only !== true) throw new Error("normalized result read_only must be true");
   return value;
+}
+
+function validateReviewEvidenceBindings(evidence, expectedBindings, label) {
+  if (evidence.substantiveMeritEvaluated && !evidence.subjectReviewable) {
+    throw new Error(`${label} cannot evaluate substantive merit for an unreviewable subject`);
+  }
+  if (evidence.reviewStatus === "not_performed") {
+    if (evidence.subjectReviewable || evidence.substantiveMeritEvaluated) {
+      throw new Error(`${label} not_performed requires false review predicates`);
+    }
+    if (evidence.acknowledgedPacketDigest !== null || evidence.acknowledgedMaterialDigests.length !== 0) {
+      throw new Error(`${label} not_performed must not acknowledge packet or material digests`);
+    }
+  }
+  if (evidence.reviewStatus !== "performed" && evidence.limitations.length === 0) {
+    throw new Error(`${label} ${evidence.reviewStatus} requires at least one limitation`);
+  }
+  if (!expectedBindings || evidence.reviewStatus === "not_performed") return;
+  if (evidence.acknowledgedPacketDigest !== expectedBindings.packetDigest) {
+    throw new Error(`${label} acknowledged_packet_digest does not match the reviewed packet`);
+  }
+  const acknowledged = [...new Set(evidence.acknowledgedMaterialDigests)].sort();
+  const expected = [...new Set(expectedBindings.materialDigests)].sort();
+  if (evidence.reviewStatus === "performed" && JSON.stringify(acknowledged) !== JSON.stringify(expected)) {
+    throw new Error(`${label} acknowledged_material_digests do not match the reviewed materials`);
+  }
+  if (evidence.reviewStatus === "partial" && acknowledged.some((digest) => !expected.includes(digest))) {
+    throw new Error(`${label} acknowledged_material_digests include material outside the reviewed packet`);
+  }
 }
 
 function maxFindingSeverity(findings) {

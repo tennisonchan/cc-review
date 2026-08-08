@@ -240,8 +240,9 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }, result: "ok" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok" }));
 });
+${fakeReviewResponseSource}
 `, { mode: 0o755 });
 
   const result = run(["run", "--scope", "auto"], {
@@ -258,6 +259,8 @@ process.stdin.on("end", () => {
   assert.match(prompt, /shared components preserve established behavioral defaults/);
   assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
   assert.match(prompt, /blocking at the evidence-supported severity/);
+  assert.match(prompt, /^packet_digest: [a-f0-9]{64}$/m);
+  assert.match(prompt, /^material_digests: \["[a-f0-9]{64}"(?:,"[a-f0-9]{64}")*\]$/m);
   assert.doesNotMatch(JSON.stringify(argv), /You are Claude Code/);
   // claude --json-schema silently drops structured output when the schema
   // carries a $schema meta key; the companion must strip it.
@@ -292,8 +295,9 @@ process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
   const out = argv[argv.indexOf("--output-last-message") + 1];
-  fs.writeFileSync(out, JSON.stringify({ decision: "approved", summary: "codex ok", findings: [], required_next_actions: [] }));
+  fs.writeFileSync(out, JSON.stringify(reviewResponse(input, { decision: "approved", summary: "codex ok", findings: [], required_next_actions: [] })));
 });
+${fakeReviewResponseSource}
 `, { mode: 0o755 });
 
   const result = run(["run", "--scope", "auto", "--reviewer", "codex", "--json"], {
@@ -311,7 +315,18 @@ process.stdin.on("end", () => {
   assert.ok(argv.includes("--output-last-message"));
   const schemaPath = argv[argv.indexOf("--output-schema") + 1];
   const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
-  assert.deepEqual(schema.required, ["decision", "summary", "findings", "required_next_actions"]);
+  assert.deepEqual(schema.required, [
+    "review_status",
+    "subject_reviewable",
+    "substantive_merit_evaluated",
+    "acknowledged_packet_digest",
+    "acknowledged_material_digests",
+    "decision",
+    "summary",
+    "findings",
+    "required_next_actions",
+    "limitations",
+  ]);
   assert.ok(schema.properties.findings.items.required.includes("reviewer_disposition"));
   const envCapture = JSON.parse(readFileSync(envFile, "utf8"));
   assert.equal(envCapture.terminalReviewer, "1");
@@ -385,7 +400,7 @@ test("run normalizes policy-promoted advisory findings into blocking findings", 
 `);
   const context = join(repo, "review-context.md");
   writeFileSync(context, "Problem: test policy promotion\n");
-  const reviewerOutput = {
+  const reviewerOutput = structurallyCompleteOutput({
     decision: "approved",
     summary: "Security issue is advisory from the reviewer but blocks by policy.",
     findings: [{
@@ -398,7 +413,7 @@ test("run normalizes policy-promoted advisory findings into blocking findings", 
       reviewer_disposition: "advisory",
     }],
     required_next_actions: [],
-  };
+  });
 
   const result = run(["run", "--context", context, "--json"], {
     cwd: repo,
@@ -484,8 +499,9 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }, result: "ok" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok" }));
 });
+${fakeReviewResponseSource}
 `, { mode: 0o755 });
 
   const result = run(["run", "--context", context, "--json"], {
@@ -508,7 +524,7 @@ test("run uses fallback threshold for high advisory findings", () => {
   const repo = makeGitRepo();
   const guidelines = join(repo, "guidelines.md");
   writeFileSync(guidelines, "# Human-only guidelines\n");
-  const reviewerOutput = {
+  const reviewerOutput = structurallyCompleteOutput({
     decision: "approved",
     summary: "High risk should block by fallback threshold.",
     findings: [{
@@ -520,7 +536,7 @@ test("run uses fallback threshold for high advisory findings", () => {
       required_action: "Add rollback behavior.",
       reviewer_disposition: "advisory",
     }],
-  };
+  });
   const plan = join(repo, "plan.md");
   writeFileSync(plan, "Plan\n");
   const result = run(["run", "--artifact", plan, "--guidelines", guidelines, "--json"], {
@@ -546,7 +562,7 @@ test("run labels explicit base policy promotions as severity_policy", () => {
   writeFileSync(plan, "Plan\n");
   const result = run(["run", "--artifact", plan, "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(structurallyCompleteOutput({
       decision: "approved",
       summary: "High issue blocks by explicit policy.",
       findings: [{
@@ -558,7 +574,7 @@ test("run labels explicit base policy promotions as severity_policy", () => {
         required_action: "Fix the high issue.",
         reviewer_disposition: "advisory",
       }],
-    }) },
+    })) },
   });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).result.blocking_findings[0].blocking_reason, "severity_policy");
@@ -703,12 +719,12 @@ test("run preserves concise clean reviews and findings-authoritative normalizati
   const repo = makeGitRepo();
   const result = run(["run", "--scope", "none", "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(structurallyCompleteOutput({
       decision: "approved",
       summary: "Reviewed the target and found a blocker.",
       findings: [{ ...finding({ required_action: "Fix it." }), reviewer_disposition: "blocking" }],
       required_next_actions: [],
-    }) },
+    })) },
   });
   assert.equal(JSON.parse(result.stdout).result.decision, "changes_requested");
 });
@@ -787,8 +803,10 @@ test("run never answer-shops when an exact Claude model drifts after substantive
   mkdirSync(join(repo, "bin"), { recursive: true });
   writeFileSync(fakeClaude, `#!/usr/bin/env node
 if (process.argv[2] === "--version") { console.log("2.1.220 (Claude Code)"); process.exit(0); }
-console.log(JSON.stringify({
-  structured_output: {
+let input = "";
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => console.log(JSON.stringify({
+  structured_output: reviewResponse(input, {
     decision: "changes_requested",
     summary: "The requested-model review found a substantive blocker.",
     findings: [{
@@ -801,11 +819,12 @@ console.log(JSON.stringify({
       reviewer_disposition: "blocking"
     }],
     required_next_actions: ["Preserve the finding as invalid review evidence."]
-  },
+  }),
   result: "review completed",
   session_id: "drifted-claude-session",
   modelUsage: { "claude-opus-4-8": { outputTokens: 12 } }
-}));
+})));
+${fakeReviewResponseSource}
 `, { mode: 0o755 });
 
   const result = run([
@@ -824,7 +843,7 @@ console.log(JSON.stringify({
 
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence", JSON.stringify(parsed));
   assert.equal(parsed.review_execution.fallback_used, false);
   assert.equal(parsed.review_execution.attempts.length, 1);
   assert.equal(parsed.review_execution.attempts[0].status, "invalid_review_evidence");
@@ -1021,8 +1040,9 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "claude fallback ok", findings: [], required_next_actions: [] }, result: "ok", session_id: "fresh-claude-fallback-session" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "claude fallback ok", findings: [], required_next_actions: [] }), result: "ok", session_id: "fresh-claude-fallback-session" }));
 });
+${fakeReviewResponseSource}
 `, { mode: 0o755 });
   const result = run(["run", "--scope", "none", "--json"], {
     cwd: repo,
@@ -1072,10 +1092,204 @@ test("run can fail open explicitly on reviewer mechanism failure", () => {
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.result.decision, "approved");
+  assert.equal(parsed.result.decision, "blocked");
+  assert.equal(parsed.result.review_status, "not_performed");
   assert.match(parsed.result.summary, /on-reviewer-failure=allow/);
   assert.equal(parsed.review_execution.outcome, "unavailable");
   assert.equal(parsed.review_execution.effective_route, null);
+});
+
+test("v4 rejects approval when substantive merit was not evaluated", () => {
+  const repo = makeGitRepo();
+  const plan = join(repo, "plan.md");
+  writeFileSync(plan, "Plan\n");
+  const incomplete = approvedOutput("The packet was not substantively evaluated.");
+  incomplete.substantive_merit_evaluated = false;
+  const result = run(["run", "--artifact", plan, "--scope", "none", "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(incomplete) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "blocked");
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.match(parsed.result.summary, /approved reviewer output requires substantive merit evaluation/);
+});
+
+test("v4 preserves a grounded changes_requested decision without blocking findings", () => {
+  const repo = makeGitRepo();
+  const plan = join(repo, "plan.md");
+  writeFileSync(plan, "Plan\n");
+  const refusal = structurallyCompleteOutput({
+    decision: "changes_requested",
+    summary: "The exact material needs another review pass.",
+    findings: [],
+    required_next_actions: ["Review the exact material again."],
+  });
+  const result = run(["run", "--artifact", plan, "--scope", "none", "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(refusal) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "changes_requested");
+  assert.equal(parsed.result.blocking_findings.length, 0);
+  assert.equal(parsed.result.review_status, "performed");
+  assert.deepEqual(parsed.result.required_next_actions, ["Review the exact material again."]);
+});
+
+test("v4 rejects an ungrounded changes_requested decision", () => {
+  const repo = makeGitRepo();
+  const plan = join(repo, "plan.md");
+  writeFileSync(plan, "Plan\n");
+  const refusal = structurallyCompleteOutput({
+    decision: "changes_requested",
+    summary: "No grounded reason was supplied.",
+    findings: [],
+    required_next_actions: [],
+  });
+  const result = run(["run", "--artifact", plan, "--scope", "none", "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(refusal) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "blocked");
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.match(parsed.result.summary, /requires a finding or required_next_action/);
+});
+
+test("v4 rejects reviewer acknowledgements that do not match the exact packet", () => {
+  const repo = makeGitRepo();
+  const plan = join(repo, "plan.md");
+  writeFileSync(plan, "Plan\n");
+  const mismatch = approvedOutput();
+  mismatch.acknowledged_packet_digest = "b".repeat(64);
+  const result = run(["run", "--artifact", plan, "--scope", "none", "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(mismatch) },
+  });
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "blocked");
+  assert.match(parsed.result.summary, /acknowledged_packet_digest does not match/);
+});
+
+test("v4 accepts caller-bound exact packet and material identities only for the matching artifact", () => {
+  const repo = makeGitRepo();
+  const packet = join(repo, "packet.json");
+  const bytes = '{"gate":"design"}\n';
+  writeFileSync(packet, bytes);
+  const packetDigest = createHash("sha256").update(bytes).digest("hex");
+  const materialDigests = ["c".repeat(64), "d".repeat(64)];
+  const result = run([
+    "run", "--artifact", packet, "--scope", "none",
+    "--expected-packet-digest", packetDigest,
+    "--expected-material-digests", JSON.stringify(materialDigests),
+    "--json",
+  ], {
+    cwd: repo,
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.acknowledged_packet_digest, packetDigest);
+  assert.deepEqual(parsed.result.acknowledged_material_digests, materialDigests);
+
+  const mismatch = run([
+    "run", "--artifact", packet, "--scope", "none",
+    "--expected-packet-digest", "e".repeat(64),
+    "--expected-material-digests", "[]", "--json",
+  ], { cwd: repo, env: testEnv(repo) });
+  assert.notEqual(mismatch.status, 0);
+  assert.match(mismatch.stderr, /exactly one matching artifact/);
+
+  const context = join(repo, "context.md");
+  writeFileSync(context, "Additional unbound context\n");
+  const unboundContext = run([
+    "run", "--artifact", packet, "--context", context, "--scope", "none",
+    "--expected-packet-digest", packetDigest,
+    "--expected-material-digests", JSON.stringify(materialDigests), "--json",
+  ], { cwd: repo, env: testEnv(repo) });
+  assert.notEqual(unboundContext.status, 0);
+  assert.match(unboundContext.stderr, /no additional review inputs/);
+});
+
+test("v4 exact transaction binding options are paired and structurally validated", () => {
+  const repo = makeGitRepo();
+  const packet = join(repo, "packet.json");
+  writeFileSync(packet, "{}\n");
+  const missingPair = run([
+    "run", "--artifact", packet, "--scope", "none",
+    "--expected-packet-digest", "a".repeat(64), "--json",
+  ], { cwd: repo, env: testEnv(repo) });
+  assert.notEqual(missingPair.status, 0);
+  assert.match(missingPair.stderr, /must be supplied together/);
+
+  const invalidMaterials = run([
+    "run", "--artifact", packet, "--scope", "none",
+    "--expected-packet-digest", "a".repeat(64),
+    "--expected-material-digests", '["not-a-digest"]', "--json",
+  ], { cwd: repo, env: testEnv(repo) });
+  assert.notEqual(invalidMaterials.status, 0);
+  assert.match(invalidMaterials.stderr, /JSON array of SHA-256 digests/);
+});
+
+test("v4 requires every structural reviewer-result field without a test-mode bypass", () => {
+  for (const field of [
+    "review_status",
+    "subject_reviewable",
+    "substantive_merit_evaluated",
+    "acknowledged_packet_digest",
+    "acknowledged_material_digests",
+    "limitations",
+  ]) {
+    const repo = makeGitRepo();
+    const plan = join(repo, "plan.md");
+    writeFileSync(plan, "Plan\n");
+    const incomplete = approvedOutput();
+    delete incomplete[field];
+    const result = run(["run", "--artifact", plan, "--scope", "none", "--json"], {
+      cwd: repo,
+      env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(incomplete) },
+    });
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.result.decision, "blocked", field);
+    assert.match(parsed.result.summary, new RegExp(`${field} is required`), field);
+  }
+});
+
+test("gate blocks a grounded non-approved result even without blocking findings", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo, "file.txt"), "initial\n");
+  runGit(["add", "file.txt"], repo);
+  runGit(["commit", "-m", "init"], repo);
+  writeFileSync(join(repo, "file.txt"), "changed\n");
+  const env = {
+    ...testEnv(repo),
+    REVIEW_LOOP_FORCE_MAIN_AGENT_HOOK: "1",
+    REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(structurallyCompleteOutput({
+      decision: "changes_requested",
+      summary: "A required action remains.",
+      findings: [],
+      required_next_actions: ["Complete the required action."],
+    })),
+  };
+  const setup = run(["setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  const result = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"grounded-refusal"}' });
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.decision, "block");
+  assert.match(parsed.reason, /Complete the required action/);
+  for (let i = 0; i < 2; i += 1) {
+    const repeated = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"grounded-refusal"}' });
+    assert.equal(JSON.parse(repeated.stdout).decision, "block", `repeat ${i + 2}`);
+  }
+  const capped = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"grounded-refusal"}' });
+  const cappedParsed = JSON.parse(capped.stdout);
+  assert.equal(cappedParsed.decision, undefined);
+  assert.match(cappedParsed.systemMessage, /Cap-forced finalization/);
+  assert.match(cappedParsed.systemMessage, /three-block convergence cap/);
+  assert.match(cappedParsed.systemMessage, /Complete the required action/);
 });
 
 test("run explicit allow still prefers a healthy distinct-host fallback", () => {
@@ -1110,12 +1324,12 @@ test("run preserves reviewer invalid_input and blocked decisions without synthet
   for (const decision of ["invalid_input", "blocked"]) {
     const result = run(["run", "--scope", "none", "--json"], {
       cwd: repo,
-      env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+      env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(notPerformedOutput({
         decision,
         summary: `${decision} from reviewer`,
         findings: [],
         required_next_actions: ["Try again."],
-      }) },
+      })) },
     });
     assert.equal(result.status, 0, result.stderr);
     const parsed = JSON.parse(result.stdout);
@@ -1184,8 +1398,9 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }, result: "ok" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok" }));
 });
+${fakeReviewResponseSource}
 `, { mode: 0o755 });
 
   const result = run(["run", "--scope", "auto"], {
@@ -1245,8 +1460,9 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }, result: "ok" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok" }));
 });
+${fakeReviewResponseSource}
 `, { mode: 0o755 });
 
   const result = run(["run", "--scope", "auto"], {
@@ -1882,9 +2098,10 @@ process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
   const out = argv[argv.indexOf("--output-last-message") + 1];
-  fs.writeFileSync(out, JSON.stringify({ decision: "approved", summary: "fallback ok", findings: [], required_next_actions: [] }));
+  fs.writeFileSync(out, JSON.stringify(reviewResponse(input, { decision: "approved", summary: "fallback ok", findings: [], required_next_actions: [] })));
   process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "fresh-codex-fallback-session" }) + "\\n");
 });
+${fakeReviewResponseSource}
 `, { mode: 0o755 });
   const env = {
     ...testEnv(repo),
@@ -1937,8 +2154,9 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "claude fallback ok", findings: [], required_next_actions: [] }, result: "ok", session_id: "fresh-claude-fallback-session" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "claude fallback ok", findings: [], required_next_actions: [] }), result: "ok", session_id: "fresh-claude-fallback-session" }));
 });
+${fakeReviewResponseSource}
 `, { mode: 0o755 });
   const env = {
     ...testEnv(repo),
@@ -1979,12 +2197,14 @@ test("gate prunes expired fallback sentinels before creating a new one", () => {
   writeFileSync(fakeCodex, `#!/usr/bin/env node
 const fs = require("fs");
 const argv = process.argv.slice(2);
-process.stdin.resume();
+let input = "";
+process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   const out = argv[argv.indexOf("--output-last-message") + 1];
-  fs.writeFileSync(out, JSON.stringify({ decision: "approved", summary: "fallback ok", findings: [], required_next_actions: [] }));
+  fs.writeFileSync(out, JSON.stringify(reviewResponse(input, { decision: "approved", summary: "fallback ok", findings: [], required_next_actions: [] })));
   process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "fresh-codex-fallback-session" }) + "\\n");
 });
+${fakeReviewResponseSource}
 `, { mode: 0o755 });
   const env = {
     ...testEnv(repo),
@@ -2246,11 +2466,33 @@ test("guidelines policy drives category-aware blocking", () => {
 
   // An explicit category exemption overrides severity and reviewer disposition.
   writeFileSync(join(repo, "file.txt"), "style change\n");
-  const styleEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
-    finding({ id: "style1", severity: "high", category: "style", locations: ["file.txt:1"], message: "Ugly.", required_action: "Prettify." }),
-  ])) };
+  const styleEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(structurallyCompleteOutput({
+    decision: "approved",
+    summary: "Style issue is explicitly exempt from blocking policy.",
+    findings: [{
+      ...finding({ id: "style1", severity: "high", category: "style", locations: ["file.txt:1"], message: "Ugly.", required_action: "Prettify." }),
+      reviewer_disposition: "blocking",
+    }],
+    required_next_actions: [],
+  })) };
   const styleAllow = run(["gate", "--json"], { cwd: repo, env: styleEnv, input: '{"turn_id":"style"}' });
   assert.deepEqual(JSON.parse(styleAllow.stdout), {});
+
+  // Category exemptions classify findings but cannot rewrite an explicit
+  // non-approved reviewer decision into approval.
+  writeFileSync(join(repo, "file.txt"), "style changes requested\n");
+  const styleRefusalEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(structurallyCompleteOutput({
+    decision: "changes_requested",
+    summary: "The reviewer explicitly requested a style correction.",
+    findings: [{
+      ...finding({ id: "style2", severity: "high", category: "style", locations: ["file.txt:1"], message: "Still ugly.", required_action: "Prettify." }),
+      reviewer_disposition: "blocking",
+    }],
+    required_next_actions: [],
+  })) };
+  const styleRefusal = run(["gate", "--json"], { cwd: repo, env: styleRefusalEnv, input: '{"turn_id":"style-refusal"}' });
+  assert.equal(JSON.parse(styleRefusal.stdout).decision, "block");
+  assert.match(JSON.parse(styleRefusal.stdout).reason, /Still ugly/);
 
   // Categories absent from the policy map use the base threshold.
   writeFileSync(join(repo, "file.txt"), "medium change\n");
@@ -2573,8 +2815,9 @@ process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
   fs.writeFileSync(${JSON.stringify(envFile)}, JSON.stringify({ backgroundArgs: process.env.REVIEW_LOOP_BACKGROUND_ARGS || "" }));
-  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }, result: "reviewer raw text" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "reviewer raw text" }));
 });
+${fakeReviewResponseSource}
 `, { mode: 0o755 });
   const env = {
     ...testEnv(repo),
@@ -2598,7 +2841,7 @@ process.stdin.on("end", () => {
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stdout, /secret-value/);
   const completed = JSON.parse(result.stdout);
-  assert.equal(completed.result.result.schema_version, "3");
+  assert.equal(completed.result.result.schema_version, "4");
   assert.equal(completed.result.result.decision, "approved");
   assert.equal(completed.result.raw, "[redacted]");
   const prompt = readFileSync(stdinFile, "utf8");
@@ -2774,7 +3017,7 @@ test("bin wrappers dispatch to their subcommand", () => {
   writeFileSync(join(repo, "file.txt"), "changed again\n");
   const review = spawnSync(process.execPath, [reviewBin, "--json"], {
     cwd: repo,
-    env: { ...env, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "ok", findings: [], required_next_actions: [] }) },
+    env: { ...env, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()) },
     encoding: "utf8",
   });
   assert.equal(review.status, 0, review.stderr);
@@ -2784,7 +3027,7 @@ test("bin wrappers dispatch to their subcommand", () => {
   writeFileSync(context, "Problem: wrapper run passthrough\n");
   const explicitRun = spawnSync(process.execPath, [reviewBin, "run", "--context", context, "--json"], {
     cwd: repo,
-    env: { ...env, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({ decision: "approved", summary: "ok", findings: [], required_next_actions: [] }) },
+    env: { ...env, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput()) },
     encoding: "utf8",
   });
   assert.equal(explicitRun.status, 0, explicitRun.stderr);
@@ -2798,8 +3041,9 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }, result: "ok" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok" }));
 });
+${fakeReviewResponseSource}
 `, { mode: 0o755 });
   const counter = spawnSync(process.execPath, [reviewBin, "run", "--scope", "auto", "--counter", "--json", "challenge", "this"], {
     cwd: repo,
@@ -2906,7 +3150,15 @@ function testEnv(repo) {
   // cannot leak into guideline resolution during tests.
   mkdirSync(join(repo, ".home"), { recursive: true });
   const fakeClaude = join(bin, "claude");
-  writeFileSync(fakeClaude, "#!/usr/bin/env sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.167 (Claude Code)'; exit 0; fi\nif [ \"$1\" = \"auth\" ] && [ \"$3\" = \"--json\" ]; then echo '{\"loggedIn\":true}'; exit 0; fi\nif [ \"$1\" = \"auth\" ]; then echo 'Login method: test'; exit 0; fi\necho '{\"structured_output\":{\"decision\":\"approved\",\"summary\":\"ok\",\"findings\":[],\"required_next_actions\":[]},\"result\":\"ok\",\"session_id\":\"fresh-test-claude-session\"}'\n", { mode: 0o755 });
+  writeFileSync(fakeClaude, `#!/usr/bin/env node
+if (process.argv[2] === "--version") { console.log("2.1.167 (Claude Code)"); process.exit(0); }
+if (process.argv[2] === "auth" && process.argv[4] === "--json") { console.log('{"loggedIn":true}'); process.exit(0); }
+if (process.argv[2] === "auth") { console.log("Login method: test"); process.exit(0); }
+let input = "";
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok", session_id: "fresh-test-claude-session" })));
+${fakeReviewResponseSource}
+`, { mode: 0o755 });
   const fakeCodex = join(mkdtempSync(join(tmpdir(), "review-loop-codex-")), "codex");
   writeFileSync(fakeCodex, "#!/usr/bin/env sh\nif [ \"$1\" = \"--version\" ]; then echo 'OpenAI Codex vtest'; exit 0; fi\nif [ \"$1\" = \"login\" ] && [ \"$2\" = \"status\" ]; then echo 'Logged in'; exit 0; fi\nexit 1\n", { mode: 0o755 });
   // State must live outside the worktree (as it does in production): the
@@ -2918,23 +3170,62 @@ function testEnv(repo) {
     HOME: join(repo, ".home"),
     REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
     REVIEW_LOOP_CODEX_BIN: fakeCodex,
-    REVIEW_LOOP_TEST_MODE: "1",
     REVIEW_LOOP_FAKE_FALLBACK_SESSION_ID: "fresh-fallback-session",
     XDG_STATE_HOME: mkdtempSync(join(tmpdir(), "review-loop-state-")),
   };
 }
 
 function approvedOutput(summary = "ok") {
-  return { decision: "approved", summary, findings: [], required_next_actions: [] };
+  return structurallyCompleteOutput({ decision: "approved", summary, findings: [], required_next_actions: [] });
 }
 
 function blockingOutput(findings, summary = "blocking findings") {
-  return { decision: "changes_requested", summary, findings: findings.map((item) => ({ ...item, reviewer_disposition: "blocking" })), required_next_actions: [] };
+  return structurallyCompleteOutput({ decision: "changes_requested", summary, findings: findings.map((item) => ({ ...item, reviewer_disposition: "blocking" })), required_next_actions: [] });
 }
 
 function advisoryOutput(findings, summary = "advisory findings") {
-  return { decision: "approved", summary, findings: findings.map((item) => ({ ...item, reviewer_disposition: "advisory" })), required_next_actions: [] };
+  return structurallyCompleteOutput({ decision: "approved", summary, findings: findings.map((item) => ({ ...item, reviewer_disposition: "advisory" })), required_next_actions: [] });
 }
+
+function structurallyCompleteOutput(output) {
+  return {
+    review_status: "performed",
+    subject_reviewable: true,
+    substantive_merit_evaluated: true,
+    acknowledged_packet_digest: "__REVIEW_LOOP_PACKET_DIGEST__",
+    acknowledged_material_digests: ["__REVIEW_LOOP_MATERIAL_DIGESTS__"],
+    limitations: [],
+    ...output,
+  };
+}
+
+function notPerformedOutput(output) {
+  return {
+    review_status: "not_performed",
+    subject_reviewable: false,
+    substantive_merit_evaluated: false,
+    acknowledged_packet_digest: null,
+    acknowledged_material_digests: [],
+    limitations: ["The review was not performed."],
+    ...output,
+  };
+}
+
+const fakeReviewResponseSource = String.raw`
+function reviewResponse(input, output) {
+  const packetDigest = input.match(/^packet_digest: ([a-f0-9]{64})$/m)?.[1] || null;
+  const materialDigests = JSON.parse(input.match(/^material_digests: (\[[^\n]*\])$/m)?.[1] || "[]");
+  return {
+    review_status: "performed",
+    subject_reviewable: true,
+    substantive_merit_evaluated: true,
+    acknowledged_packet_digest: packetDigest,
+    acknowledged_material_digests: materialDigests,
+    limitations: [],
+    ...output,
+  };
+}
+`;
 
 function finding(overrides = {}) {
   return {

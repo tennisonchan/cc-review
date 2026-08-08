@@ -2,7 +2,13 @@
 
 ## Unreleased
 
-- Expose the normalized-result protocol version in both host manifests and setup JSON so managed installers can reject any unequal protocol pair before activation.
+## 0.11.0
+
+- Publish normalized-result protocol v4 with explicit review completion, reviewability, substantive-merit, packet acknowledgement, material acknowledgement, and limitation fields.
+- Bind performed reviews to the exact packet and complete reviewed-material digest set, and reject missing, stale, contradictory, or ungrounded reviewer evidence.
+- Expose the protocol version in both host manifests and setup JSON so managed installers can reject unequal producer/consumer pairs before activation.
+- Make the Stop gate reject every non-approved result, including grounded changes requests with no policy-promoted blocking finding.
+- Preserve reviewer-decision polarity ahead of category exemptions: an explicit non-approved decision remains blocking even when its findings are policy-exempt.
 
 ## 0.10.0
 
