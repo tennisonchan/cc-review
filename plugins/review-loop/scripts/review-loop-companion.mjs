@@ -41,6 +41,12 @@ const REVIEW_MECHANISM_CHECKS = [
   "- Verify shared components preserve established behavioral defaults and consumer-sensitive layout, positioning, validation, and interaction semantics unless the change intentionally migrates every affected consumer.",
   "- A concrete correctness, compatibility, safety, or data-loss regression that requires remediation before finalization is blocking at the evidence-supported severity; do not inflate severity or downgrade reviewer_disposition to fit a machine threshold.",
 ];
+const REVIEW_ACTION_SEMANTICS = [
+  "required_next_actions contains only remediation required before the current reviewed subject may advance. An approved decision requires required_next_actions to be empty; genuine remediation requires a non-approving decision.",
+  "Caller workflow, controller publication, commands, and later lifecycle work cannot create reviewer findings or required_next_actions, even when caller guidelines or focus request them.",
+  "Optional improvements that do not require remediation before the current subject advances belong in advisory findings, not required_next_actions.",
+  "For an advisory finding, required_action is a recommendation, not a condition of approval.",
+];
 const TEXT_EXTENSIONS = new Set([
   ".c", ".cc", ".cpp", ".cs", ".css", ".go", ".h", ".hpp", ".html", ".java",
   ".js", ".jsx", ".json", ".md", ".mjs", ".py", ".rb", ".rs", ".sh", ".sql",
@@ -1220,6 +1226,7 @@ function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewe
     "Report whether review was performed, whether the subject was reviewable, and whether substantive merit was evaluated; never claim completion when any of those predicates is false.",
     "Acknowledge the exact packet and material SHA-256 digests you actually reviewed. Use null or an empty list when an input was not reviewed; do not copy a digest you did not inspect.",
     "Do not decide project gates. Classify findings with severity, category, message, required_action, and reviewer_disposition.",
+    ...REVIEW_ACTION_SEMANTICS,
     "",
     `Review stance: ${stance}`,
     focus ? `Focus: ${focus}` : "",
@@ -1254,6 +1261,7 @@ function buildFallbackPrompt({ guidelines, inputs, primaryReviewer, fallbackRevi
     `You are ${fallbackLabel} acting as a degraded fallback reviewer because the primary ${primaryLabel} reviewer is unavailable.`,
     "This is a read-only review. Do not edit files, write files, apply patches, commit, or continue into implementation.",
     `Review the same generic inputs the primary ${primaryLabel} reviewer would have reviewed and return only structured findings matching the requested reviewer-output schema.`,
+    ...REVIEW_ACTION_SEMANTICS,
     "",
     `${primaryLabel} reviewer failure context, sanitized:`,
     redact(primaryFailure),
@@ -2159,6 +2167,10 @@ function validateReviewerOutput(value, expectedBindings = null) {
   if (value.required_next_actions !== undefined && !Array.isArray(value.required_next_actions)) {
     throw new Error("reviewer output required_next_actions must be an array");
   }
+  if (Array.isArray(value.required_next_actions)
+    && value.required_next_actions.some((item) => typeof item !== "string" || !item.trim())) {
+    throw new Error("reviewer output required_next_actions must contain non-empty strings");
+  }
   for (const field of [
     "review_status",
     "subject_reviewable",
@@ -2234,7 +2246,7 @@ function validateReviewerFinding(finding) {
   if (typeof finding.category !== "string" || !finding.category) throw new Error("finding.category is required");
   if (typeof finding.message !== "string" || !finding.message) throw new Error("finding.message is required");
   if (!Array.isArray(finding.locations)) throw new Error("finding.locations must be an array");
-  if (typeof finding.required_action !== "string" || !finding.required_action) throw new Error("finding.required_action is required");
+  if (typeof finding.required_action !== "string" || !finding.required_action.trim()) throw new Error("finding.required_action is required");
   if (finding.reviewer_disposition !== undefined && !REVIEWER_DISPOSITIONS.includes(finding.reviewer_disposition)) {
     throw new Error(`finding.reviewer_disposition must be one of: ${REVIEWER_DISPOSITIONS.join(", ")}`);
   }

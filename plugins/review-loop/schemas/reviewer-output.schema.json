@@ -22,15 +22,12 @@
     "subject_reviewable": { "type": "boolean" },
     "substantive_merit_evaluated": { "type": "boolean" },
     "acknowledged_packet_digest": {
-      "oneOf": [
-        { "$ref": "#/$defs/sha256" },
-        { "type": "null" }
-      ]
+      "type": ["string", "null"],
+      "pattern": "^[a-f0-9]{64}$"
     },
     "acknowledged_material_digests": {
       "type": "array",
-      "items": { "$ref": "#/$defs/sha256" },
-      "uniqueItems": true
+      "items": { "$ref": "#/$defs/sha256" }
     },
     "decision": {
       "type": "string",
@@ -70,7 +67,8 @@
           },
           "required_action": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "description": "The concrete remediation for a blocking finding; a recommendation when reviewer_disposition is advisory."
           },
           "reviewer_disposition": {
             "type": "string",
@@ -81,8 +79,10 @@
     },
     "required_next_actions": {
       "type": "array",
+      "description": "Remediation required before the current reviewed subject may advance. This must be empty when decision is approved.",
       "items": {
-        "type": "string"
+        "type": "string",
+        "minLength": 1
       }
     },
     "limitations": {
