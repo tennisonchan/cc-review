@@ -2,8 +2,36 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["decision", "summary", "findings", "required_next_actions"],
+  "required": [
+    "review_status",
+    "subject_reviewable",
+    "substantive_merit_evaluated",
+    "acknowledged_packet_digest",
+    "acknowledged_material_digests",
+    "decision",
+    "summary",
+    "findings",
+    "required_next_actions",
+    "limitations"
+  ],
   "properties": {
+    "review_status": {
+      "type": "string",
+      "enum": ["performed", "partial", "not_performed"]
+    },
+    "subject_reviewable": { "type": "boolean" },
+    "substantive_merit_evaluated": { "type": "boolean" },
+    "acknowledged_packet_digest": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256" },
+        { "type": "null" }
+      ]
+    },
+    "acknowledged_material_digests": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/sha256" },
+      "uniqueItems": true
+    },
     "decision": {
       "type": "string",
       "enum": ["approved", "changes_requested", "invalid_input", "blocked"]
@@ -56,9 +84,17 @@
       "items": {
         "type": "string"
       }
+    },
+    "limitations": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
     }
   },
   "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
     "severity": {
       "type": "string",
       "enum": ["info", "low", "medium", "high"]

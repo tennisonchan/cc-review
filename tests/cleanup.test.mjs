@@ -18,13 +18,13 @@ test("Review Loop exposes only policy/model review inputs and no tier/catalog br
   assert.doesNotMatch(top.stdout, /capabilities/);
 });
 
-test("Review Loop ships only the normalized v3 action-neutral result contract", () => {
+test("Review Loop ships only the normalized v4 action-neutral result contract", () => {
   const schemas = path.join(root, "plugins/review-loop/schemas");
   assert.equal(fs.existsSync(path.join(schemas, "authorization.v1.schema.json")), false);
   assert.equal(fs.existsSync(path.join(schemas, "transaction-result.v1.schema.json")), false);
   assert.equal(fs.existsSync(path.join(schemas, "reviewer-output-continuation.schema.json")), false);
   const schema = JSON.parse(fs.readFileSync(path.join(schemas, "normalized-result.schema.json"), "utf8"));
-  assert.equal(schema.properties.schema_version.const, "3");
+  assert.equal(schema.properties.schema_version.const, "4");
   assert.deepEqual(schema.properties.reviewer_mechanism, { type: "string", minLength: 1 });
   assert.equal("continuation_envelope" in schema.properties, false);
 });

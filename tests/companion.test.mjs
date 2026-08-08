@@ -311,7 +311,18 @@ process.stdin.on("end", () => {
   assert.ok(argv.includes("--output-last-message"));
   const schemaPath = argv[argv.indexOf("--output-schema") + 1];
   const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
-  assert.deepEqual(schema.required, ["decision", "summary", "findings", "required_next_actions"]);
+  assert.deepEqual(schema.required, [
+    "review_status",
+    "subject_reviewable",
+    "substantive_merit_evaluated",
+    "acknowledged_packet_digest",
+    "acknowledged_material_digests",
+    "decision",
+    "summary",
+    "findings",
+    "required_next_actions",
+    "limitations",
+  ]);
   assert.ok(schema.properties.findings.items.required.includes("reviewer_disposition"));
   const envCapture = JSON.parse(readFileSync(envFile, "utf8"));
   assert.equal(envCapture.terminalReviewer, "1");
@@ -1072,10 +1083,46 @@ test("run can fail open explicitly on reviewer mechanism failure", () => {
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.result.decision, "approved");
+  assert.equal(parsed.result.decision, "blocked");
+  assert.equal(parsed.result.review_status, "not_performed");
   assert.match(parsed.result.summary, /on-reviewer-failure=allow/);
   assert.equal(parsed.review_execution.outcome, "unavailable");
   assert.equal(parsed.review_execution.effective_route, null);
+});
+
+test("v4 rejects approval when substantive merit was not evaluated", () => {
+  const repo = makeGitRepo();
+  const plan = join(repo, "plan.md");
+  writeFileSync(plan, "Plan\n");
+  const incomplete = approvedOutput("The packet was not substantively evaluated.");
+  incomplete.substantive_merit_evaluated = false;
+  const result = run(["run", "--artifact", plan, "--scope", "none", "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(incomplete) },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /approved normalized result requires substantive merit evaluation/);
+});
+
+test("v4 preserves a structurally complete changes_requested decision without blocking findings", () => {
+  const repo = makeGitRepo();
+  const plan = join(repo, "plan.md");
+  writeFileSync(plan, "Plan\n");
+  const refusal = structurallyCompleteOutput({
+    decision: "changes_requested",
+    summary: "The exact material needs another review pass.",
+    findings: [],
+    required_next_actions: [],
+  });
+  const result = run(["run", "--artifact", plan, "--scope", "none", "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(refusal) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "changes_requested");
+  assert.equal(parsed.result.blocking_findings.length, 0);
+  assert.equal(parsed.result.review_status, "performed");
 });
 
 test("run explicit allow still prefers a healthy distinct-host fallback", () => {
@@ -2598,7 +2645,7 @@ process.stdin.on("end", () => {
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stdout, /secret-value/);
   const completed = JSON.parse(result.stdout);
-  assert.equal(completed.result.result.schema_version, "3");
+  assert.equal(completed.result.result.schema_version, "4");
   assert.equal(completed.result.result.decision, "approved");
   assert.equal(completed.result.raw, "[redacted]");
   const prompt = readFileSync(stdinFile, "utf8");
@@ -2925,15 +2972,27 @@ function testEnv(repo) {
 }
 
 function approvedOutput(summary = "ok") {
-  return { decision: "approved", summary, findings: [], required_next_actions: [] };
+  return structurallyCompleteOutput({ decision: "approved", summary, findings: [], required_next_actions: [] });
 }
 
 function blockingOutput(findings, summary = "blocking findings") {
-  return { decision: "changes_requested", summary, findings: findings.map((item) => ({ ...item, reviewer_disposition: "blocking" })), required_next_actions: [] };
+  return structurallyCompleteOutput({ decision: "changes_requested", summary, findings: findings.map((item) => ({ ...item, reviewer_disposition: "blocking" })), required_next_actions: [] });
 }
 
 function advisoryOutput(findings, summary = "advisory findings") {
-  return { decision: "approved", summary, findings: findings.map((item) => ({ ...item, reviewer_disposition: "advisory" })), required_next_actions: [] };
+  return structurallyCompleteOutput({ decision: "approved", summary, findings: findings.map((item) => ({ ...item, reviewer_disposition: "advisory" })), required_next_actions: [] });
+}
+
+function structurallyCompleteOutput(output) {
+  return {
+    review_status: "performed",
+    subject_reviewable: true,
+    substantive_merit_evaluated: true,
+    acknowledged_packet_digest: "a".repeat(64),
+    acknowledged_material_digests: [],
+    limitations: [],
+    ...output,
+  };
 }
 
 function finding(overrides = {}) {

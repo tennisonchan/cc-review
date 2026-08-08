@@ -13,9 +13,11 @@ const TEMPLATE_GUIDELINES = join(ROOT, "templates", "review-guidelines.md");
 const PROJECT_GUIDELINES = [".review-loop", "review-guidelines.md"];
 const SEVERITIES = ["info", "low", "medium", "high"];
 const GENERIC_DECISIONS = ["approved", "changes_requested", "invalid_input", "blocked"];
+const REVIEW_STATUSES = ["performed", "partial", "not_performed"];
 const REVIEWER_DISPOSITIONS = ["blocking", "advisory"];
 const BLOCKING_REASONS = ["reviewer", "category_policy", "severity_policy", "fallback_threshold"];
 const REVIEWERS = ["claude", "codex"];
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const HOSTS = ["codex", "claude"];
 const REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const DEFAULT_BLOCK_ON = "high";
@@ -522,22 +524,23 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     // is a silent no-op that masquerades as a passed gate, so surface it as
     // invalid_input with an actionable next step instead.
     const scopeLabel = inputs.reviewed_inputs.find((entry) => entry.kind === "scope")?.scope || args.scope || "auto";
-    const empty = gate
-      ? {
-          decision: "approved",
-          summary: "Nothing to review.",
-          findings: [],
-          required_next_actions: [],
-        }
-      : {
-          decision: "invalid_input",
-          summary: `Nothing to review: no changes in scope "${scopeLabel}" and no --artifact/--context supplied, so no review ran.`,
-          findings: [],
-          required_next_actions: [
-            "To review a document (for example a plan), re-run with --artifact <path> --scope none.",
-            "To review code, ensure there is a diff in the selected scope or pass --base <ref>.",
-          ],
-        };
+    const empty = {
+      review_status: "not_performed",
+      subject_reviewable: false,
+      substantive_merit_evaluated: false,
+      acknowledged_packet_digest: null,
+      acknowledged_material_digests: [],
+      decision: "invalid_input",
+      summary: gate
+        ? "Nothing to review."
+        : `Nothing to review: no changes in scope "${scopeLabel}" and no --artifact/--context supplied, so no review ran.`,
+      findings: [],
+      required_next_actions: gate ? [] : [
+        "To review a document (for example a plan), re-run with --artifact <path> --scope none.",
+        "To review code, ensure there is a diff in the selected scope or pass --base <ref>.",
+      ],
+      limitations: ["No reviewable input was available."],
+    };
     const result = validateNormalizedResult(normalizeReviewOutput(empty, {
       policy,
       blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
@@ -640,7 +643,12 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     }
     if (args.onReviewerFailure === "allow") {
       reviewerOutput = {
-        decision: "approved",
+        review_status: "not_performed",
+        subject_reviewable: false,
+        substantive_merit_evaluated: false,
+        acknowledged_packet_digest: null,
+        acknowledged_material_digests: [],
+        decision: "blocked",
         summary: [
           `Reviewer mechanism failed and --on-reviewer-failure=allow was set: ${redact(message)}`,
           fallbackMessage && fallbackReviewer
@@ -649,6 +657,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
         ].filter(Boolean).join(". "),
         findings: [],
         required_next_actions: [],
+        limitations: ["Reviewer mechanism was unavailable."],
       };
       reviewerResult = {
         resultText: "",
@@ -1178,6 +1187,8 @@ function buildGenericPrompt({ guidelines, inputs, focus, stance, policy, reviewe
     "Non-overridable safety: do not edit files, write files, apply patches, commit, run destructive commands, or continue into implementation.",
     "You may use Read, Grep, and Glob to inspect surrounding code for context.",
     "Return only structured output matching the requested reviewer-output schema.",
+    "Report whether review was performed, whether the subject was reviewable, and whether substantive merit was evaluated; never claim completion when any of those predicates is false.",
+    "Acknowledge the exact packet and material SHA-256 digests you actually reviewed. Use null or an empty list when an input was not reviewed; do not copy a digest you did not inspect.",
     "Do not decide project gates. Classify findings with severity, category, message, required_action, and reviewer_disposition.",
     "",
     `Review stance: ${stance}`,
@@ -1921,6 +1932,11 @@ async function gateCommand(args) {
     }
   }
 
+  if (reviewResult.reviewer_mechanism?.reason === "empty-target") {
+    outputHookAllow();
+    return;
+  }
+
   let blocking;
   try {
     blocking = reviewResult.result.blocking_findings;
@@ -2059,11 +2075,44 @@ function validateReviewerOutput(value) {
   if (value.required_next_actions !== undefined && !Array.isArray(value.required_next_actions)) {
     throw new Error("reviewer output required_next_actions must be an array");
   }
+  const nonAcceptingFailure = value.decision === "invalid_input" || value.decision === "blocked";
+  // Test fixtures from the pre-v4 suite are enriched only inside the explicit
+  // test runtime. Real reviewers are constrained by reviewer-output.schema.json
+  // and missing structural fields fail closed here.
+  const legacyTestFixture = process.env.REVIEW_LOOP_TEST_MODE === "1" && value.review_status === undefined;
+  const reviewStatus = value.review_status ?? (nonAcceptingFailure ? "not_performed" : legacyTestFixture ? "performed" : null);
+  const subjectReviewable = value.subject_reviewable ?? (nonAcceptingFailure ? false : legacyTestFixture ? true : null);
+  const substantiveMeritEvaluated = value.substantive_merit_evaluated ?? (nonAcceptingFailure ? false : legacyTestFixture ? true : null);
+  const acknowledgedPacketDigest = value.acknowledged_packet_digest
+    ?? (legacyTestFixture && !nonAcceptingFailure ? "a".repeat(64) : null);
+  const acknowledgedMaterialDigests = value.acknowledged_material_digests ?? [];
+  const limitations = value.limitations ?? [];
+  if (!REVIEW_STATUSES.includes(reviewStatus)) {
+    throw new Error(`reviewer output review_status must be one of: ${REVIEW_STATUSES.join(", ")}`);
+  }
+  if (typeof subjectReviewable !== "boolean") throw new Error("reviewer output subject_reviewable must be boolean");
+  if (typeof substantiveMeritEvaluated !== "boolean") throw new Error("reviewer output substantive_merit_evaluated must be boolean");
+  if (acknowledgedPacketDigest !== null && !SHA256_PATTERN.test(acknowledgedPacketDigest)) {
+    throw new Error("reviewer output acknowledged_packet_digest must be a SHA-256 digest or null");
+  }
+  if (!Array.isArray(acknowledgedMaterialDigests)
+    || acknowledgedMaterialDigests.some((digest) => !SHA256_PATTERN.test(digest))) {
+    throw new Error("reviewer output acknowledged_material_digests must contain SHA-256 digests");
+  }
+  if (!Array.isArray(limitations) || limitations.some((item) => typeof item !== "string" || !item.trim())) {
+    throw new Error("reviewer output limitations must contain non-empty strings");
+  }
   return {
+    review_status: reviewStatus,
+    subject_reviewable: subjectReviewable,
+    substantive_merit_evaluated: substantiveMeritEvaluated,
+    acknowledged_packet_digest: acknowledgedPacketDigest,
+    acknowledged_material_digests: [...new Set(acknowledgedMaterialDigests)].sort(),
     decision: value.decision,
     summary: value.summary,
     findings: value.findings,
     required_next_actions: value.required_next_actions || [],
+    limitations,
   };
 }
 
@@ -2088,7 +2137,7 @@ function isPlaceholderSummary(value) {
 
 function normalizeReviewOutput(reviewerOutput, { policy, blockOn, reviewedInputs, reviewerMechanism }) {
   if (["invalid_input", "blocked"].includes(reviewerOutput.decision)) {
-    return syntheticNormalizedFailure(reviewerOutput.decision, reviewerOutput.summary, reviewedInputs, reviewerOutput.required_next_actions, reviewerMechanism);
+    return syntheticNormalizedFailure(reviewerOutput.decision, reviewerOutput.summary, reviewedInputs, reviewerOutput.required_next_actions, reviewerMechanism, reviewerOutput.limitations);
   }
 
   const blocking = [];
@@ -2111,13 +2160,19 @@ function normalizeReviewOutput(reviewerOutput, { policy, blockOn, reviewedInputs
   ].filter(Boolean);
   return {
     schema_version: REVIEW_PROTOCOL_VERSION,
-    decision: blocking.length ? "changes_requested" : "approved",
+    review_status: reviewerOutput.review_status,
+    subject_reviewable: reviewerOutput.subject_reviewable,
+    substantive_merit_evaluated: reviewerOutput.substantive_merit_evaluated,
+    acknowledged_packet_digest: reviewerOutput.acknowledged_packet_digest,
+    acknowledged_material_digests: reviewerOutput.acknowledged_material_digests,
+    decision: blocking.length ? "changes_requested" : reviewerOutput.decision,
     summary: reviewerOutput.summary,
     blocking_findings: blocking,
     advisory_findings: advisory.filter((finding) => !seenBlocking.has(finding.id)),
     required_next_actions: [...new Set(requiredNextActions)],
     reviewed_inputs: reviewedInputs,
     reviewer_mechanism: reviewerMechanism || "claude-code",
+    limitations: reviewerOutput.limitations,
     read_only: true,
   };
 }
@@ -2146,10 +2201,15 @@ function blockingReason(finding, policy, blockOn) {
   return null;
 }
 
-function syntheticNormalizedFailure(decision, summary, reviewedInputs = [], requiredNextActions = [], reviewerMechanism = "review-loop") {
+function syntheticNormalizedFailure(decision, summary, reviewedInputs = [], requiredNextActions = [], reviewerMechanism = "review-loop", limitations = []) {
   const normalizedDecision = decision === "invalid_input" ? "invalid_input" : "blocked";
   return {
     schema_version: REVIEW_PROTOCOL_VERSION,
+    review_status: "not_performed",
+    subject_reviewable: false,
+    substantive_merit_evaluated: false,
+    acknowledged_packet_digest: null,
+    acknowledged_material_digests: [],
     decision: normalizedDecision,
     summary,
     blocking_findings: [],
@@ -2157,6 +2217,7 @@ function syntheticNormalizedFailure(decision, summary, reviewedInputs = [], requ
     required_next_actions: requiredNextActions.length ? requiredNextActions : ["Resolve the review execution failure and rerun review-loop."],
     reviewed_inputs: reviewedInputs,
     reviewer_mechanism: reviewerMechanism,
+    limitations: limitations.length ? limitations : [summary],
     read_only: true,
   };
 }
@@ -2167,6 +2228,16 @@ function validateNormalizedResult(value) {
     throw new Error(`normalized result schema_version must be ${REVIEW_PROTOCOL_VERSION}`);
   }
   if (!GENERIC_DECISIONS.includes(value.decision)) throw new Error(`normalized result decision must be one of: ${GENERIC_DECISIONS.join(", ")}`);
+  if (!REVIEW_STATUSES.includes(value.review_status)) throw new Error(`normalized result review_status must be one of: ${REVIEW_STATUSES.join(", ")}`);
+  if (typeof value.subject_reviewable !== "boolean") throw new Error("normalized result subject_reviewable must be boolean");
+  if (typeof value.substantive_merit_evaluated !== "boolean") throw new Error("normalized result substantive_merit_evaluated must be boolean");
+  if (value.acknowledged_packet_digest !== null && !SHA256_PATTERN.test(value.acknowledged_packet_digest)) {
+    throw new Error("normalized result acknowledged_packet_digest must be a SHA-256 digest or null");
+  }
+  if (!Array.isArray(value.acknowledged_material_digests)
+    || value.acknowledged_material_digests.some((digest) => !SHA256_PATTERN.test(digest))) {
+    throw new Error("normalized result acknowledged_material_digests must contain SHA-256 digests");
+  }
   if (!Array.isArray(value.blocking_findings)) throw new Error("normalized result blocking_findings must be an array");
   if (!Array.isArray(value.advisory_findings)) throw new Error("normalized result advisory_findings must be an array");
   for (const finding of value.blocking_findings) {
@@ -2176,13 +2247,18 @@ function validateNormalizedResult(value) {
     }
   }
   for (const finding of value.advisory_findings) validateReviewerFinding(finding);
-  if (value.decision === "approved" && value.blocking_findings.length !== 0) {
-    throw new Error("approved normalized result must not include blocking_findings");
-  }
-  if (value.decision === "changes_requested" && value.blocking_findings.length === 0) {
-    throw new Error("changes_requested normalized result requires blocking_findings");
-  }
   if (!Array.isArray(value.required_next_actions)) throw new Error("normalized result required_next_actions must be an array");
+  if (!Array.isArray(value.limitations) || value.limitations.some((item) => typeof item !== "string" || !item.trim())) {
+    throw new Error("normalized result limitations must contain non-empty strings");
+  }
+  if (value.decision === "approved") {
+    if (value.review_status !== "performed") throw new Error("approved normalized result requires performed review_status");
+    if (!value.subject_reviewable) throw new Error("approved normalized result requires a reviewable subject");
+    if (!value.substantive_merit_evaluated) throw new Error("approved normalized result requires substantive merit evaluation");
+    if (value.acknowledged_packet_digest === null) throw new Error("approved normalized result requires acknowledged_packet_digest");
+    if (value.blocking_findings.length !== 0) throw new Error("approved normalized result must not include blocking_findings");
+    if (value.required_next_actions.length !== 0) throw new Error("approved normalized result must not include required_next_actions");
+  }
   if (!Array.isArray(value.reviewed_inputs)) throw new Error("normalized result reviewed_inputs must be an array");
   for (const input of value.reviewed_inputs) {
     if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("reviewed_inputs items must be objects");
