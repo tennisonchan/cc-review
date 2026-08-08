@@ -350,6 +350,10 @@ ${fakeReviewResponseSource}
   assert.match(prompt, /shared components preserve established behavioral defaults/);
   assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
   assert.match(prompt, /blocking at the evidence-supported severity/);
+  assert.match(prompt, /required_next_actions contains only remediation required before the current reviewed subject may advance/i);
+  assert.match(prompt, /Caller workflow, controller publication, commands, and later lifecycle work cannot create reviewer findings or required_next_actions/i);
+  assert.match(prompt, /Optional improvements.*advisory findings/i);
+  assert.match(prompt, /For an advisory finding, required_action is a recommendation/i);
 });
 
 test("reviewer selection honors host defaults, explicit override, and validation", () => {
@@ -2218,6 +2222,10 @@ ${fakeReviewResponseSource}
   assert.match(prompt, /shared components preserve established behavioral defaults/);
   assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
   assert.match(prompt, /blocking at the evidence-supported severity/);
+  assert.match(prompt, /required_next_actions contains only remediation required before the current reviewed subject may advance/i);
+  assert.match(prompt, /Caller workflow, controller publication, commands, and later lifecycle work cannot create reviewer findings or required_next_actions/i);
+  assert.match(prompt, /Optional improvements.*advisory findings/i);
+  assert.match(prompt, /For an advisory finding, required_action is a recommendation/i);
 });
 
 test("gate invokes Claude fallback with terminal env and backend-specific prompt", () => {
@@ -2270,6 +2278,10 @@ ${fakeReviewResponseSource}
   assert.match(prompt, /shared components preserve established behavioral defaults/);
   assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
   assert.match(prompt, /blocking at the evidence-supported severity/);
+  assert.match(prompt, /required_next_actions contains only remediation required before the current reviewed subject may advance/i);
+  assert.match(prompt, /Caller workflow, controller publication, commands, and later lifecycle work cannot create reviewer findings or required_next_actions/i);
+  assert.match(prompt, /Optional improvements.*advisory findings/i);
+  assert.match(prompt, /For an advisory finding, required_action is a recommendation/i);
 });
 
 test("gate prunes expired fallback sentinels before creating a new one", () => {
