@@ -1993,18 +1993,6 @@ async function gateCommand(args) {
   const targetSummary = gateTargetSummary(reviewResult.result);
   if (fallbackTaskKey !== taskKey) delete state.tasks[fallbackTaskKey];
 
-  if (reviewResult.result.decision !== "approved" && !blocking.length) {
-    delete state.tasks[taskKey];
-    writeGateState(repo.root, state);
-    outputHookBlock([
-      `review-loop ${reviewResult.result.decision}: ${reviewResult.result.summary}`,
-      ...reviewResult.result.advisory_findings.map((finding) => `[${finding.severity}] ${finding.locations[0] || ""}: ${finding.message}`),
-      ...reviewResult.result.required_next_actions.map((action) => `Required action: ${action}`),
-      ...reviewResult.result.limitations.map((limitation) => `Limitation: ${limitation}`),
-    ].join("\n"));
-    return;
-  }
-
   if (reviewResult.result.decision === "approved" && !blocking.length) {
     delete state.tasks[taskKey];
     writeGateState(repo.root, state);
@@ -2014,16 +2002,30 @@ async function gateCommand(args) {
 
   // Reset the same-fingerprint count when Claude reports a different finding
   // set; the total ceiling bounds churn when findings change on every run.
-  const fingerprint = blocking.map((finding) => finding.id).sort().join("|");
+  const refusalFingerprintParts = blocking.length
+    ? blocking.map((finding) => finding.id).sort()
+    : [
+      reviewResult.result.decision,
+      ...reviewResult.result.advisory_findings.map((finding) => finding.id).sort(),
+      ...reviewResult.result.required_next_actions,
+    ];
+  const fingerprint = refusalFingerprintParts.join("|");
   taskState.block_count = taskState.fingerprint === fingerprint ? Number(taskState.block_count || 0) + 1 : 1;
   taskState.fingerprint = fingerprint;
   taskState.total_blocks = Number(taskState.total_blocks || 0) + 1;
   taskState.last_blocked_at = new Date().toISOString();
   taskState.updated_at = taskState.last_blocked_at;
-  taskState.last_findings = blocking.map((finding) => finding.id);
+  taskState.last_findings = (blocking.length ? blocking : reviewResult.result.advisory_findings).map((finding) => finding.id);
 
-  const findingLines = blocking.map((finding) => `[${finding.severity}] ${finding.locations[0] || ""}: ${finding.message}`);
-  const reason = [targetSummary ? `Reviewed target: ${targetSummary}` : "", ...findingLines].filter(Boolean).join("\n");
+  const findingLines = (blocking.length ? blocking : reviewResult.result.advisory_findings)
+    .map((finding) => `[${finding.severity}] ${finding.locations[0] || ""}: ${finding.message}`);
+  const reason = [
+    targetSummary ? `Reviewed target: ${targetSummary}` : "",
+    !blocking.length ? reviewResult.result.summary : "",
+    ...findingLines,
+    ...reviewResult.result.required_next_actions.map((action) => `Required action: ${action}`),
+    ...reviewResult.result.limitations.map((limitation) => `Limitation: ${limitation}`),
+  ].filter(Boolean).join("\n");
   const cap = taskState.block_count > GATE_FINGERPRINT_BLOCK_LIMIT
     ? "review-loop reached the three-block convergence cap."
     : taskState.total_blocks > GATE_TOTAL_BLOCK_LIMIT
@@ -2034,7 +2036,7 @@ async function gateCommand(args) {
     // stop under the same coarse key is a new task and stays gated.
     delete state.tasks[taskKey];
     writeGateState(repo.root, state);
-    outputHookAllow(`Cap-forced finalization: ${cap} The automatic gate is allowing this stop as report-only after exhausting its bounded retry budget.\nUnresolved blocking findings:\n${reason}`);
+    outputHookAllow(`Cap-forced finalization: ${cap} The automatic gate is allowing this stop as report-only after exhausting its bounded retry budget.\nUnresolved review refusal:\n${reason}`);
     return;
   }
   state.tasks[taskKey] = taskState;

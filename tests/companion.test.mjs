@@ -1280,6 +1280,16 @@ test("gate blocks a grounded non-approved result even without blocking findings"
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.decision, "block");
   assert.match(parsed.reason, /Complete the required action/);
+  for (let i = 0; i < 2; i += 1) {
+    const repeated = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"grounded-refusal"}' });
+    assert.equal(JSON.parse(repeated.stdout).decision, "block", `repeat ${i + 2}`);
+  }
+  const capped = run(["gate", "--json"], { cwd: repo, env, input: '{"turn_id":"grounded-refusal"}' });
+  const cappedParsed = JSON.parse(capped.stdout);
+  assert.equal(cappedParsed.decision, undefined);
+  assert.match(cappedParsed.systemMessage, /Cap-forced finalization/);
+  assert.match(cappedParsed.systemMessage, /three-block convergence cap/);
+  assert.match(cappedParsed.systemMessage, /Complete the required action/);
 });
 
 test("run explicit allow still prefers a healthy distinct-host fallback", () => {
