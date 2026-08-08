@@ -1109,8 +1109,11 @@ test("v4 rejects approval when substantive merit was not evaluated", () => {
     cwd: repo,
     env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(incomplete) },
   });
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /approved normalized result requires substantive merit evaluation/);
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "blocked");
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.match(parsed.result.summary, /approved reviewer output requires substantive merit evaluation/);
 });
 
 test("v4 preserves a grounded changes_requested decision without blocking findings", () => {
@@ -1198,7 +1201,17 @@ test("v4 accepts caller-bound exact packet and material identities only for the 
     "--expected-material-digests", "[]", "--json",
   ], { cwd: repo, env: testEnv(repo) });
   assert.notEqual(mismatch.status, 0);
-  assert.match(mismatch.stderr, /one exact matching artifact and scope none/);
+  assert.match(mismatch.stderr, /exactly one matching artifact/);
+
+  const context = join(repo, "context.md");
+  writeFileSync(context, "Additional unbound context\n");
+  const unboundContext = run([
+    "run", "--artifact", packet, "--context", context, "--scope", "none",
+    "--expected-packet-digest", packetDigest,
+    "--expected-material-digests", JSON.stringify(materialDigests), "--json",
+  ], { cwd: repo, env: testEnv(repo) });
+  assert.notEqual(unboundContext.status, 0);
+  assert.match(unboundContext.stderr, /no additional review inputs/);
 });
 
 test("v4 exact transaction binding options are paired and structurally validated", () => {
@@ -2454,6 +2467,22 @@ test("guidelines policy drives category-aware blocking", () => {
   })) };
   const styleAllow = run(["gate", "--json"], { cwd: repo, env: styleEnv, input: '{"turn_id":"style"}' });
   assert.deepEqual(JSON.parse(styleAllow.stdout), {});
+
+  // Category exemptions classify findings but cannot rewrite an explicit
+  // non-approved reviewer decision into approval.
+  writeFileSync(join(repo, "file.txt"), "style changes requested\n");
+  const styleRefusalEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(structurallyCompleteOutput({
+    decision: "changes_requested",
+    summary: "The reviewer explicitly requested a style correction.",
+    findings: [{
+      ...finding({ id: "style2", severity: "high", category: "style", locations: ["file.txt:1"], message: "Still ugly.", required_action: "Prettify." }),
+      reviewer_disposition: "blocking",
+    }],
+    required_next_actions: [],
+  })) };
+  const styleRefusal = run(["gate", "--json"], { cwd: repo, env: styleRefusalEnv, input: '{"turn_id":"style-refusal"}' });
+  assert.equal(JSON.parse(styleRefusal.stdout).decision, "block");
+  assert.match(JSON.parse(styleRefusal.stdout).reason, /Still ugly/);
 
   // Categories absent from the policy map use the base threshold.
   writeFileSync(join(repo, "file.txt"), "medium change\n");

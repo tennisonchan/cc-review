@@ -82,6 +82,12 @@ class ReviewerEnvelopeFailure extends Error {
   }
 }
 
+function isTerminalInvalidReviewEvidence(error) {
+  return error instanceof ReviewerEnvelopeFailure
+    && (error.hasSubstantiveContent
+      || /approved reviewer output|acknowledged_(?:packet_digest|material_digests) do(?:es)? not match|changes_requested reviewer output requires/.test(error.message));
+}
+
 class ReviewerIdentityFailure extends Error {
   constructor(message) {
     super(message);
@@ -611,7 +617,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const primaryFailure = classifyTransportFailure(error);
-    if (error instanceof ReviewerEnvelopeFailure && error.hasSubstantiveContent) {
+    if (isTerminalInvalidReviewEvidence(error)) {
       return genericMechanismFailureResult({
         repo,
         guidelines,
@@ -646,7 +652,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
         fallbackFailureDiagnostic = fallbackError instanceof ReviewerIdentityFailure
           ? failureDiagnostic("identity", fallbackError)
           : classifyTransportFailure(fallbackError);
-        if (fallbackError instanceof ReviewerEnvelopeFailure && fallbackError.hasSubstantiveContent) {
+        if (isTerminalInvalidReviewEvidence(fallbackError)) {
           return genericMechanismFailureResult({
             repo,
             guidelines,
@@ -1965,6 +1971,8 @@ async function gateCommand(args) {
   }
 
   if (reviewResult.reviewer_mechanism?.reason === "empty-target") {
+    delete state.tasks[fallbackTaskKey];
+    writeGateState(repo.root, state);
     outputHookAllow();
     return;
   }
@@ -1990,6 +1998,7 @@ async function gateCommand(args) {
     writeGateState(repo.root, state);
     outputHookBlock([
       `review-loop ${reviewResult.result.decision}: ${reviewResult.result.summary}`,
+      ...reviewResult.result.advisory_findings.map((finding) => `[${finding.severity}] ${finding.locations[0] || ""}: ${finding.message}`),
       ...reviewResult.result.required_next_actions.map((action) => `Required action: ${action}`),
       ...reviewResult.result.limitations.map((limitation) => `Limitation: ${limitation}`),
     ].join("\n"));
@@ -2092,8 +2101,11 @@ function reviewInputBindings(inputs, args = {}) {
   if (args.expectedPacketDigest !== null && args.expectedPacketDigest !== undefined) {
     const artifacts = inputs.reviewed_inputs.filter((input) => input.kind === "artifact");
     const scope = inputs.reviewed_inputs.find((input) => input.kind === "scope");
-    if (artifacts.length !== 1 || artifacts[0].hash !== args.expectedPacketDigest || scope?.scope !== "none") {
-      throw new Error("expected packet binding requires one exact matching artifact and scope none");
+    if (inputs.reviewed_inputs.length !== 2
+      || artifacts.length !== 1
+      || artifacts[0].hash !== args.expectedPacketDigest
+      || scope?.scope !== "none") {
+      throw new Error("expected packet binding requires exactly one matching artifact, no additional review inputs, and scope none");
     }
     return {
       packetDigest: args.expectedPacketDigest,
@@ -2179,6 +2191,12 @@ function validateReviewerOutput(value, expectedBindings = null) {
   const requiredNextActions = value.required_next_actions || [];
   if (value.decision === "approved" && requiredNextActions.length) {
     throw new Error("approved reviewer output must not include required_next_actions");
+  }
+  if (value.decision === "approved") {
+    if (reviewStatus !== "performed") throw new Error("approved reviewer output requires performed review_status");
+    if (!subjectReviewable) throw new Error("approved reviewer output requires a reviewable subject");
+    if (!substantiveMeritEvaluated) throw new Error("approved reviewer output requires substantive merit evaluation");
+    if (acknowledgedPacketDigest === null) throw new Error("approved reviewer output requires acknowledged_packet_digest");
   }
   if (value.decision === "changes_requested" && value.findings.length === 0 && requiredNextActions.length === 0) {
     throw new Error("changes_requested reviewer output requires a finding or required_next_action");

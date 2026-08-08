@@ -69,6 +69,8 @@ Mutable model aliases such as `latest`, `opus`, and `sonnet` are rejected. Revie
 
 `--on-reviewer-failure allow` is report-only: the command may return successfully so callers can inspect the failure envelope, but it never converts missing review coverage into an approved review. The automatic Stop gate honors its separately persisted reviewer-failure policy.
 
+An explicit non-approved reviewer decision always blocks the automatic Stop gate, even when every reported finding belongs to a `category_block_on: "never"` category. Category policy can classify findings; it cannot rewrite the reviewer's terminal decision into approval.
+
 ## Setup readiness
 
 `review-loop-setup --json` checks Node, the Codex and Claude CLIs, and authentication. Review Loop is usable when at least one provider is healthy. It does not own caller model policy.
