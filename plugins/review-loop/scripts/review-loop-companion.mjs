@@ -42,9 +42,9 @@ const REVIEW_MECHANISM_CHECKS = [
   "- A concrete correctness, compatibility, safety, or data-loss regression that requires remediation before finalization is blocking at the evidence-supported severity; do not inflate severity or downgrade reviewer_disposition to fit a machine threshold.",
 ];
 const REVIEW_ACTION_SEMANTICS = [
-  "required_next_actions contains only remediation required before the current reviewed subject may advance. An approved decision requires required_next_actions to be empty; genuine remediation requires a non-approving decision.",
+  "required_next_actions follows the explicit decision: on approved it is advisory follow-up and not a condition of advancement; on a non-approving decision it records remediation required before the current reviewed subject may advance.",
   "Caller workflow, controller publication, commands, and later lifecycle work cannot create reviewer findings or required_next_actions, even when caller guidelines or focus request them.",
-  "Optional improvements that do not require remediation before the current subject advances belong in advisory findings, not required_next_actions.",
+  "Prefer advisory findings for optional observations that have finding evidence; approved required_next_actions may preserve standalone follow-up recommendations without changing the decision.",
   "For an advisory finding, required_action is a recommendation, not a condition of approval.",
 ];
 const TEXT_EXTENSIONS = new Set([
@@ -2203,9 +2203,6 @@ function validateReviewerOutput(value, expectedBindings = null) {
     throw new Error("reviewer output limitations must contain non-empty strings");
   }
   const requiredNextActions = value.required_next_actions || [];
-  if (value.decision === "approved" && requiredNextActions.length) {
-    throw new Error("approved reviewer output must not include required_next_actions");
-  }
   if (value.decision === "approved") {
     if (reviewStatus !== "performed") throw new Error("approved reviewer output requires performed review_status");
     if (!subjectReviewable) throw new Error("approved reviewer output requires a reviewable subject");
@@ -2384,7 +2381,6 @@ function validateNormalizedResult(value, expectedBindings = null) {
     if (!value.substantive_merit_evaluated) throw new Error("approved normalized result requires substantive merit evaluation");
     if (value.acknowledged_packet_digest === null) throw new Error("approved normalized result requires acknowledged_packet_digest");
     if (value.blocking_findings.length !== 0) throw new Error("approved normalized result must not include blocking_findings");
-    if (value.required_next_actions.length !== 0) throw new Error("approved normalized result must not include required_next_actions");
   }
   validateReviewEvidenceBindings({
     reviewStatus: value.review_status,

@@ -262,10 +262,10 @@ ${fakeReviewResponseSource}
   assert.match(prompt, /shared components preserve established behavioral defaults/);
   assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
   assert.match(prompt, /blocking at the evidence-supported severity/);
-  assert.match(prompt, /required_next_actions contains only remediation required before the current reviewed subject may advance/i);
-  assert.match(prompt, /An approved decision requires required_next_actions to be empty/i);
+  assert.match(prompt, /required_next_actions follows the explicit decision/i);
+  assert.match(prompt, /on approved it is advisory follow-up and not a condition of advancement/i);
   assert.match(prompt, /Caller workflow, controller publication, commands, and later lifecycle work cannot create reviewer findings or required_next_actions/i);
-  assert.match(prompt, /Optional improvements.*advisory findings/i);
+  assert.match(prompt, /Prefer advisory findings for optional observations/i);
   assert.match(prompt, /For an advisory finding, required_action is a recommendation/i);
   assert.match(prompt, /Focus: Record the outcome with akn gate-record, then continue into delivery\./);
   assert.match(prompt, /^packet_digest: [a-f0-9]{64}$/m);
@@ -350,9 +350,9 @@ ${fakeReviewResponseSource}
   assert.match(prompt, /shared components preserve established behavioral defaults/);
   assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
   assert.match(prompt, /blocking at the evidence-supported severity/);
-  assert.match(prompt, /required_next_actions contains only remediation required before the current reviewed subject may advance/i);
+  assert.match(prompt, /required_next_actions follows the explicit decision/i);
   assert.match(prompt, /Caller workflow, controller publication, commands, and later lifecycle work cannot create reviewer findings or required_next_actions/i);
-  assert.match(prompt, /Optional improvements.*advisory findings/i);
+  assert.match(prompt, /Prefer advisory findings for optional observations/i);
   assert.match(prompt, /For an advisory finding, required_action is a recommendation/i);
 });
 
@@ -1203,7 +1203,7 @@ test("v4 rejects a whitespace-only finding action", () => {
   assert.match(parsed.result.summary, /finding\.required_action is required/);
 });
 
-test("v4 keeps approved-plus-actions terminal and never answer-shops", () => {
+test("v4 preserves approved next actions as advisory and never answer-shops", () => {
   const repo = makeGitRepo();
   const result = run(["run", "--scope", "none", "--json"], {
     cwd: repo,
@@ -1221,9 +1221,11 @@ test("v4 keeps approved-plus-actions terminal and never answer-shops", () => {
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.equal(parsed.review_execution.outcome, "decision");
   assert.equal(parsed.review_execution.fallback_used, false);
-  assert.match(parsed.result.summary, /approved reviewer output must not include required_next_actions/);
+  assert.equal(parsed.result.decision, "approved");
+  assert.deepEqual(parsed.result.blocking_findings, []);
+  assert.deepEqual(parsed.result.required_next_actions, ["Record the gate and continue into delivery."]);
   assert.doesNotMatch(JSON.stringify(parsed), /fallback must not run/);
 });
 
@@ -2222,9 +2224,9 @@ ${fakeReviewResponseSource}
   assert.match(prompt, /shared components preserve established behavioral defaults/);
   assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
   assert.match(prompt, /blocking at the evidence-supported severity/);
-  assert.match(prompt, /required_next_actions contains only remediation required before the current reviewed subject may advance/i);
+  assert.match(prompt, /required_next_actions follows the explicit decision/i);
   assert.match(prompt, /Caller workflow, controller publication, commands, and later lifecycle work cannot create reviewer findings or required_next_actions/i);
-  assert.match(prompt, /Optional improvements.*advisory findings/i);
+  assert.match(prompt, /Prefer advisory findings for optional observations/i);
   assert.match(prompt, /For an advisory finding, required_action is a recommendation/i);
 });
 
@@ -2278,9 +2280,9 @@ ${fakeReviewResponseSource}
   assert.match(prompt, /shared components preserve established behavioral defaults/);
   assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
   assert.match(prompt, /blocking at the evidence-supported severity/);
-  assert.match(prompt, /required_next_actions contains only remediation required before the current reviewed subject may advance/i);
+  assert.match(prompt, /required_next_actions follows the explicit decision/i);
   assert.match(prompt, /Caller workflow, controller publication, commands, and later lifecycle work cannot create reviewer findings or required_next_actions/i);
-  assert.match(prompt, /Optional improvements.*advisory findings/i);
+  assert.match(prompt, /Prefer advisory findings for optional observations/i);
   assert.match(prompt, /For an advisory finding, required_action is a recommendation/i);
 });
 
