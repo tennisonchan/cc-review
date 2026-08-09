@@ -17,7 +17,8 @@ test("reviewer output schema is model-facing and action-neutral", () => {
   assert.equal(reviewerSchema.properties.acknowledged_packet_digest.pattern, "^[a-f0-9]{64}$");
   assert.equal(reviewerSchema.properties.acknowledged_material_digests.uniqueItems, undefined);
   assert.equal(reviewerSchema.properties.required_next_actions.items.minLength, 1);
-  assert.match(reviewerSchema.properties.required_next_actions.description, /before the current reviewed subject may advance/i);
+  assert.match(reviewerSchema.properties.required_next_actions.description, /advisory follow-up when approved/i);
+  assert.match(reviewerSchema.properties.required_next_actions.description, /required remediation.*when non-approving/i);
   assert.match(reviewerSchema.properties.findings.items.properties.required_action.description, /recommendation when.*advisory/i);
   for (const field of [
     "review_status",

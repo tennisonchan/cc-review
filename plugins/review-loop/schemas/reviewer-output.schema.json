@@ -79,7 +79,7 @@
     },
     "required_next_actions": {
       "type": "array",
-      "description": "Remediation required before the current reviewed subject may advance. This must be empty when decision is approved.",
+      "description": "Actions interpreted with the explicit decision: advisory follow-up when approved, or required remediation before advancement when non-approving.",
       "items": {
         "type": "string",
         "minLength": 1

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.11.1
+
+- Preserve `required_next_actions` as advisory follow-up when the reviewer explicitly approves and no blocking finding remains.
+- Continue normalizing approved results with blocking findings to `changes_requested`.
+
 ## 0.11.0
 
 - Publish normalized-result protocol v4 with explicit review completion, reviewability, substantive-merit, packet acknowledgement, material acknowledgement, and limitation fields.
