@@ -15,6 +15,13 @@ const normalizedResultSchema = JSON.parse(readFileSync(
   new URL("../plugins/review-loop/schemas/normalized-result.schema.json", import.meta.url),
   "utf8",
 ));
+const canonicalContract = JSON.parse(readFileSync(
+  new URL("../plugins/review-loop/schemas/reviewer-contract.v5.json", import.meta.url),
+  "utf8",
+));
+const expectedReviewContractDigest = createHash("sha256")
+  .update(`review-loop.contract.v5\0${canonicalJson(canonicalContract)}`)
+  .digest("hex");
 
 function assertSchemaKeys(value, schema, label) {
   for (const key of schema.required || []) assert.ok(Object.hasOwn(value, key), `${label}.${key} is required`);
@@ -73,6 +80,15 @@ function assertExecutionResultSchema(value) {
     assert.equal(value.reviewer_identity.signal, identity.properties.signal.const);
     assert.match(value.reviewer_identity.session_id_digest, new RegExp(schema.$defs.sha256.pattern));
   }
+  if (value.outcome === "decision") {
+    assert.notEqual(value.reviewer_identity, null);
+    const decisionAttempts = value.attempts.filter((attempt) => attempt.status === "decision");
+    assert.equal(decisionAttempts.length, 1);
+    assert.equal(decisionAttempts[0].session_id_digest, value.reviewer_identity.session_id_digest);
+    assert.equal(decisionAttempts[0].reviewer, value.effective_route.reviewer);
+  } else {
+    assert.equal(value.reviewer_identity, null);
+  }
 }
 
 test("setup initializes project review guidelines without overwriting", () => {
@@ -99,6 +115,7 @@ test("setup and both host manifests expose the exact review protocol", () => {
   const result = run(["setup", "--json"], { cwd: repo, env: testEnv(repo) });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).review_protocol_version, expectedProtocol);
+  assert.equal(JSON.parse(result.stdout).review_contract_digest, expectedReviewContractDigest);
 
   for (const host of [".codex-plugin", ".claude-plugin"]) {
     const manifest = JSON.parse(readFileSync(
@@ -106,10 +123,11 @@ test("setup and both host manifests expose the exact review protocol", () => {
       "utf8",
     ));
     assert.equal(manifest.review_protocol_version, expectedProtocol);
+    assert.equal(manifest.review_contract_digest, expectedReviewContractDigest);
   }
 });
 
-test("setup derives the advertised protocol from the normalized-result contract", () => {
+test("setup rejects a normalized schema that drifted from the canonical contract", () => {
   const copyRoot = mkdtempSync(join(tmpdir(), "review-loop-protocol-source-"));
   const copiedPlugin = join(copyRoot, "review-loop");
   cpSync(new URL("../plugins/review-loop/", import.meta.url).pathname, copiedPlugin, { recursive: true });
@@ -124,8 +142,8 @@ test("setup derives the advertised protocol from the normalized-result contract"
     env: testEnv(repo),
     encoding: "utf8",
   });
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).review_protocol_version, "4");
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /contract protocol_version must match normalized-result schema_version/);
 });
 
 test("init-guidelines creates neutral guidance when Claude guidance exists", () => {
@@ -183,7 +201,7 @@ test("run uses normalized structured output and renders blocking findings", () =
   writeFileSync(join(repo, "file.txt"), "changed again\n");
 
   const decision = blockingOutput([
-    finding({ id: "file-txt-high", location: "file.txt:1", message: "The change is intentionally flagged.", required_action: "Fix the test fixture." }),
+    finding({ id: "file-txt-high", locations: ["file.txt:1"], message: "The change is intentionally flagged.", required_action: "Fix the test fixture." }),
   ]);
 
   const result = run(["run", "--scope", "auto"], {
@@ -193,6 +211,30 @@ test("run uses normalized structured output and renders blocking findings", () =
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Decision: changes_requested/);
   assert.match(result.stdout, /Required action: Fix the test fixture/);
+});
+
+test("run normalizes a provider-compatible nullable observation without orphaning content", () => {
+  const repo = makeGitRepo();
+  const reviewerOutput = approvedOutput("Reviewed with a non-actionable note.");
+  reviewerOutput.observations = [{
+    id: "no-suggestion-needed",
+    category: "advisory",
+    message: "The package metadata is internally consistent.",
+    suggestion: null,
+  }];
+  const result = run(["run", "--scope", "none", "--json"], {
+    cwd: repo,
+    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(reviewerOutput) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.review_contract_digest, expectedReviewContractDigest);
+  assert.deepEqual(parsed.result.observations, [{
+    id: "no-suggestion-needed",
+    category: "advisory",
+    message: "The package metadata is internally consistent.",
+    origin: "effective_review",
+  }]);
 });
 
 test("legacy tier catalog inputs are inert and removed tier flags fail visibly", () => {
@@ -240,7 +282,7 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok", session_id: "fresh-claude-capture-session" }));
 });
 ${fakeReviewResponseSource}
 `, { mode: 0o755 });
@@ -262,10 +304,10 @@ ${fakeReviewResponseSource}
   assert.match(prompt, /shared components preserve established behavioral defaults/);
   assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
   assert.match(prompt, /blocking at the evidence-supported severity/);
-  assert.match(prompt, /required_next_actions follows the explicit decision/i);
-  assert.match(prompt, /on approved it is advisory follow-up and not a condition of advancement/i);
-  assert.match(prompt, /Caller workflow, controller publication, commands, and later lifecycle work cannot create reviewer findings or required_next_actions/i);
-  assert.match(prompt, /Prefer advisory findings for optional observations/i);
+  assert.match(prompt, /required_next_actions contains only concrete remediation required on the current reviewed subject/i);
+  assert.match(prompt, /Observations and advisory findings are non-authority-bearing/i);
+  assert.match(prompt, /later lifecycle work are not current-subject remediation/i);
+  assert.match(prompt, /non-blocking notes in advisory observations/i);
   assert.match(prompt, /For an advisory finding, required_action is a recommendation/i);
   assert.match(prompt, /Focus: Record the outcome with akn gate-record, then continue into delivery\./);
   assert.match(prompt, /^packet_digest: [a-f0-9]{64}$/m);
@@ -276,6 +318,9 @@ ${fakeReviewResponseSource}
   const schemaArg = argv[argv.indexOf("--json-schema") + 1];
   const schema = JSON.parse(schemaArg);
   assert.equal(schema.$schema, undefined);
+  const expectedClaudeSchema = structuredClone(canonicalContract.reviewer_output_schema);
+  delete expectedClaudeSchema.$schema;
+  assert.deepEqual(schema, expectedClaudeSchema);
   assert.equal(schema.properties.continuation_envelope, undefined);
   assert.deepEqual(schema.properties.decision.enum, ["approved", "changes_requested", "invalid_input", "blocked"]);
 });
@@ -305,6 +350,7 @@ process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
   const out = argv[argv.indexOf("--output-last-message") + 1];
   fs.writeFileSync(out, JSON.stringify(reviewResponse(input, { decision: "approved", summary: "codex ok", findings: [], required_next_actions: [] })));
+  process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "fresh-codex-primary-session" }) + "\\n");
 });
 ${fakeReviewResponseSource}
 `, { mode: 0o755 });
@@ -324,6 +370,10 @@ ${fakeReviewResponseSource}
   assert.ok(argv.includes("--output-last-message"));
   const schemaPath = argv[argv.indexOf("--output-schema") + 1];
   const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
+  assert.deepEqual(schema, JSON.parse(readFileSync(
+    new URL("../plugins/review-loop/schemas/reviewer-output.codex.schema.json", import.meta.url),
+    "utf8",
+  )));
   assert.deepEqual(schema.required, [
     "review_status",
     "subject_reviewable",
@@ -333,6 +383,7 @@ ${fakeReviewResponseSource}
     "decision",
     "summary",
     "findings",
+    "observations",
     "required_next_actions",
     "limitations",
   ]);
@@ -350,9 +401,9 @@ ${fakeReviewResponseSource}
   assert.match(prompt, /shared components preserve established behavioral defaults/);
   assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
   assert.match(prompt, /blocking at the evidence-supported severity/);
-  assert.match(prompt, /required_next_actions follows the explicit decision/i);
-  assert.match(prompt, /Caller workflow, controller publication, commands, and later lifecycle work cannot create reviewer findings or required_next_actions/i);
-  assert.match(prompt, /Prefer advisory findings for optional observations/i);
+  assert.match(prompt, /required_next_actions contains only concrete remediation required on the current reviewed subject/i);
+  assert.match(prompt, /later lifecycle work are not current-subject remediation/i);
+  assert.match(prompt, /non-blocking notes in advisory observations/i);
   assert.match(prompt, /For an advisory finding, required_action is a recommendation/i);
 });
 
@@ -515,7 +566,7 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok", session_id: "fresh-context-review-session" }));
 });
 ${fakeReviewResponseSource}
 `, { mode: 0o755 });
@@ -667,7 +718,7 @@ test("run treats a missing reviewer decision as mechanism failure instead of app
   assert.doesNotMatch(parsed.result.summary, /Substantive but missing/);
 });
 
-test("run rejects placeholder output containing findings without answer-shopping", () => {
+test("run recovers advisory-only placeholder output but never answer-shops actionable nonapproval", () => {
   for (const decision of ["approved", "changes_requested"]) {
     const repo = makeGitRepo();
     const result = run(["run", "--scope", "none", "--json"], {
@@ -694,12 +745,20 @@ test("run rejects placeholder output containing findings without answer-shopping
     });
     assert.equal(result.status, 0, result.stderr);
     const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.result.decision, "blocked");
-    assert.match(parsed.result.summary, /reviewer_output_integrity: placeholder_summary/);
-    assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
-    assert.equal(parsed.review_execution.fallback_used, false);
-    assert.equal(parsed.review_execution.attempts.length, 1);
-    assert.doesNotMatch(JSON.stringify(parsed), /fallback reviewed the target/i);
+    if (decision === "approved") {
+      assert.equal(parsed.result.decision, "approved");
+      assert.equal(parsed.review_execution.outcome, "decision");
+      assert.equal(parsed.review_execution.fallback_used, true);
+      assert.equal(parsed.review_execution.attempts[0].status, "invalid_review_evidence");
+      assert.ok(parsed.result.observations.some((observation) => observation.origin === "requested_invalid_envelope"));
+    } else {
+      assert.equal(parsed.result.decision, "blocked");
+      assert.match(parsed.result.summary, /reviewer_output_integrity: placeholder_summary/);
+      assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+      assert.equal(parsed.review_execution.fallback_used, false);
+      assert.equal(parsed.review_execution.attempts.length, 1);
+      assert.doesNotMatch(JSON.stringify(parsed), /fallback reviewed the target/i);
+    }
   }
 });
 
@@ -742,7 +801,10 @@ test("run preserves concise clean reviews and findings-authoritative normalizati
       required_next_actions: [],
     })) },
   });
-  assert.equal(JSON.parse(result.stdout).result.decision, "changes_requested");
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "blocked");
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.deepEqual(parsed.result.blocking_findings.map((finding) => finding.id), ["finding"]);
 });
 
 test("run uses Codex fallback when Claude is rate limited", () => {
@@ -961,7 +1023,84 @@ test("run does not answer-shop when malformed output contains recoverable findin
   assertExecutionResultSchema(parsed.review_execution);
 });
 
-test("run treats a malformed invalid_input decision as terminal review evidence", () => {
+test("run uses one fallback for an advisory-only contract-invalid envelope", () => {
+  const repo = makeGitRepo();
+  const partialApproval = advisoryOutput([
+    finding({
+      id: "optional-observation",
+      severity: "low",
+      message: "Preserve this optional observation.",
+      required_action: "Consider this in later lifecycle work.",
+      reviewer_disposition: "advisory",
+    }),
+  ], "The review was useful but incomplete.");
+  partialApproval.review_status = "partial";
+  partialApproval.limitations = ["The reviewer could not complete every required check."];
+
+  const result = run(["run", "--scope", "none", "--reviewer", "claude", "--model", "claude-opus-5", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(partialApproval),
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback completed the review")),
+      REVIEW_LOOP_FAKE_FALLBACK_SESSION_ID: "contract-recovery-session",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "approved", JSON.stringify(parsed));
+  assert.equal(parsed.review_execution.outcome, "decision");
+  assert.equal(parsed.review_execution.fallback_used, true);
+  assert.equal(parsed.review_execution.fallback_reason, "response");
+  assert.deepEqual(parsed.review_execution.attempts.map((attempt) => attempt.status), ["invalid_review_evidence", "decision"]);
+  assert.deepEqual(parsed.result.observations, [{
+    id: "invalid-primary-finding-optional-observation",
+    category: "advisory",
+    message: "Preserve this optional observation.",
+    suggestion: "Consider this in later lifecycle work.",
+    origin: "requested_invalid_envelope",
+  }]);
+  assert.deepEqual(parsed.result.advisory_findings, []);
+});
+
+test("run preserves an actionable blocker from an invalid envelope without fallback", () => {
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--reviewer", "claude", "--model", "claude-opus-5", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify({
+        subject_reviewable: true,
+        substantive_merit_evaluated: true,
+        acknowledged_packet_digest: "__REVIEW_LOOP_PACKET_DIGEST__",
+        acknowledged_material_digests: ["__REVIEW_LOOP_MATERIAL_DIGESTS__"],
+        decision: "changes_requested",
+        summary: "A blocker was found, but review_status was omitted.",
+        findings: [finding({
+          id: "must-not-answer-shop",
+          message: "This actionable blocker must survive envelope rejection.",
+          reviewer_disposition: "blocking",
+        })],
+        required_next_actions: ["Fix the actionable blocker."],
+        limitations: [],
+      }),
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback must not run")),
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.equal(parsed.review_execution.fallback_used, false);
+  assert.deepEqual(parsed.result.blocking_findings.map((finding) => finding.id), ["must-not-answer-shop"]);
+  assert.deepEqual(parsed.result.required_next_actions, ["Fix the actionable blocker."]);
+  assert.doesNotMatch(JSON.stringify(parsed), /fallback must not run/);
+});
+
+test("run uses one fallback for malformed invalid_input without actionable findings", () => {
   const repo = makeGitRepo();
   const result = run(["run", "--scope", "none", "--reviewer", "claude", "--model", "claude-opus-5", "--json"], {
     cwd: repo,
@@ -974,15 +1113,16 @@ test("run treats a malformed invalid_input decision as terminal review evidence"
         findings: [],
         required_next_actions: ["Correct the input."],
       }),
-      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback must not run")),
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback repaired invalid_input envelope")),
     },
   });
 
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
-  assert.equal(parsed.review_execution.fallback_used, false);
-  assert.doesNotMatch(JSON.stringify(parsed), /fallback must not run/);
+  assert.equal(parsed.review_execution.outcome, "decision");
+  assert.equal(parsed.review_execution.fallback_used, true);
+  assert.equal(parsed.result.decision, "approved");
+  assert.deepEqual(parsed.review_execution.attempts.map((attempt) => attempt.status), ["invalid_review_evidence", "decision"]);
 });
 
 test("run preserves invalid fallback findings as invalid_review_evidence even in allow mode", () => {
@@ -1013,6 +1153,80 @@ test("run preserves invalid fallback findings as invalid_review_evidence even in
   assert.equal(parsed.review_execution.fallback_used, true);
   assert.deepEqual(parsed.review_execution.attempts.map((attempt) => attempt.status), ["unavailable", "invalid_review_evidence"]);
   assert.doesNotMatch(parsed.result.summary, /allow was set/i);
+});
+
+test("run uses one fallback when the primary decision lacks fresh native reviewer identity", () => {
+  const repo = makeGitRepo();
+  const primaryOutput = approvedOutput("primary decision missing identity");
+  primaryOutput.observations = [{
+    id: "unbound-primary-note",
+    category: "advisory",
+    message: "Preserve this non-authority note across identity recovery.",
+    suggestion: null,
+  }];
+  const result = run(["run", "--scope", "none", "--reviewer", "claude", "--model", "claude-opus-5", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(primaryOutput),
+      REVIEW_LOOP_FAKE_CLAUDE_SESSION_ID: "",
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback supplied identity")),
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "approved");
+  assert.equal(parsed.review_execution.outcome, "decision");
+  assert.equal(parsed.review_execution.fallback_used, true);
+  assert.equal(parsed.review_execution.fallback_reason, "identity");
+  assert.deepEqual(parsed.review_execution.attempts.map((attempt) => ({
+    status: attempt.status,
+    failure_category: attempt.failure_category || null,
+  })), [
+    { status: "unavailable", failure_category: "identity" },
+    { status: "decision", failure_category: null },
+  ]);
+  assert.equal(parsed.review_execution.reviewer_identity.provider, "openai");
+  assert.match(parsed.review_execution.reviewer_identity.session_id_digest, /^[a-f0-9]{64}$/);
+  assert.deepEqual(parsed.result.observations, [{
+    id: "unbound-primary-note",
+    category: "advisory",
+    message: "Preserve this non-authority note across identity recovery.",
+    origin: "requested_invalid_envelope",
+  }]);
+});
+
+test("run preserves an actionable primary blocker without answer-shopping when reviewer identity is missing", () => {
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--reviewer", "claude", "--model", "claude-opus-5", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+        finding({
+          id: "identity-unbound-blocker",
+          message: "The primary reviewer found an actionable defect.",
+          required_action: "Fix the actionable defect.",
+        }),
+      ])),
+      REVIEW_LOOP_FAKE_CLAUDE_SESSION_ID: "",
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback must not run")),
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "blocked");
+  assert.deepEqual(parsed.result.blocking_findings.map((finding) => finding.id), ["identity-unbound-blocker"]);
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.equal(parsed.review_execution.fallback_used, false);
+  assert.equal(parsed.review_execution.attempts[0].status, "unavailable");
+  assert.equal(parsed.review_execution.attempts[0].failure_category, "identity");
+  assert.equal(parsed.review_execution.reviewer_identity, null);
+  assert.doesNotMatch(JSON.stringify(parsed), /fallback must not run/);
 });
 
 test("run reports unavailable when host fallback lacks a fresh native session identity", () => {
@@ -1111,7 +1325,7 @@ test("run can fail open explicitly on reviewer mechanism failure", () => {
   assert.equal(parsed.result.decision, "blocked");
   assert.equal(parsed.result.review_status, "not_performed");
   assert.match(parsed.result.summary, /on-reviewer-failure=allow/);
-  assert.equal(parsed.review_execution.outcome, "unavailable");
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
   assert.equal(parsed.review_execution.effective_route, null);
 });
 
@@ -1154,7 +1368,7 @@ test("v4 preserves a grounded changes_requested decision without blocking findin
   assert.deepEqual(parsed.result.required_next_actions, ["Review the exact material again."]);
 });
 
-test("v4 rejects whitespace-only required actions without answer-shopping", () => {
+test("v5 recovers once from whitespace-only nonapproval actions", () => {
   const repo = makeGitRepo();
   const plan = join(repo, "plan.md");
   writeFileSync(plan, "Plan\n");
@@ -1169,15 +1383,15 @@ test("v4 rejects whitespace-only required actions without answer-shopping", () =
         findings: [],
         required_next_actions: ["   "],
       })),
-      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback must not run")),
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback repaired empty action")),
     },
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
-  assert.equal(parsed.review_execution.fallback_used, false);
-  assert.match(parsed.result.summary, /non-empty strings/);
-  assert.doesNotMatch(JSON.stringify(parsed), /fallback must not run/);
+  assert.equal(parsed.review_execution.outcome, "decision");
+  assert.equal(parsed.review_execution.fallback_used, true);
+  assert.equal(parsed.result.decision, "approved");
+  assert.deepEqual(parsed.review_execution.attempts.map((attempt) => attempt.status), ["invalid_review_evidence", "decision"]);
 });
 
 test("v4 rejects a whitespace-only finding action", () => {
@@ -1203,7 +1417,7 @@ test("v4 rejects a whitespace-only finding action", () => {
   assert.match(parsed.result.summary, /finding\.required_action is required/);
 });
 
-test("v4 preserves approved next actions as advisory and never answer-shops", () => {
+test("v5 rejects legacy approved actions, recovers once, and preserves them as attributed observations", () => {
   const repo = makeGitRepo();
   const result = run(["run", "--scope", "none", "--json"], {
     cwd: repo,
@@ -1216,20 +1430,26 @@ test("v4 preserves approved next actions as advisory and never answer-shops", ()
         findings: [],
         required_next_actions: ["Record the gate and continue into delivery."],
       })),
-      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback must not run")),
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback emitted a valid v5 approval")),
+      REVIEW_LOOP_FAKE_FALLBACK_SESSION_ID: "legacy-action-recovery-session",
     },
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.review_execution.outcome, "decision");
-  assert.equal(parsed.review_execution.fallback_used, false);
+  assert.equal(parsed.review_execution.fallback_used, true);
   assert.equal(parsed.result.decision, "approved");
   assert.deepEqual(parsed.result.blocking_findings, []);
-  assert.deepEqual(parsed.result.required_next_actions, ["Record the gate and continue into delivery."]);
-  assert.doesNotMatch(JSON.stringify(parsed), /fallback must not run/);
+  assert.deepEqual(parsed.result.required_next_actions, []);
+  assert.deepEqual(parsed.result.observations, [{
+    id: `legacy-approved-action-${createHash("sha256").update("Record the gate and continue into delivery.").digest("hex").slice(0, 16)}`,
+    category: "downstream_workflow",
+    message: "Record the gate and continue into delivery.",
+    origin: "requested_invalid_envelope",
+  }]);
 });
 
-test("v4 rejects an ungrounded changes_requested decision", () => {
+test("v5 uses one fallback for an ungrounded nonapproval with no actionable content", () => {
   const repo = makeGitRepo();
   const plan = join(repo, "plan.md");
   writeFileSync(plan, "Plan\n");
@@ -1241,13 +1461,67 @@ test("v4 rejects an ungrounded changes_requested decision", () => {
   });
   const result = run(["run", "--artifact", plan, "--scope", "none", "--json"], {
     cwd: repo,
-    env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(refusal) },
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(refusal),
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback grounded the decision")),
+      REVIEW_LOOP_FAKE_FALLBACK_SESSION_ID: "ungrounded-recovery-session",
+    },
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.result.decision, "blocked");
+  assert.equal(parsed.result.decision, "approved");
+  assert.equal(parsed.review_execution.outcome, "decision");
+  assert.equal(parsed.review_execution.fallback_used, true);
+  assert.deepEqual(parsed.review_execution.attempts.map((attempt) => attempt.status), ["invalid_review_evidence", "decision"]);
+});
+
+test("v5 uses one fallback for truncated nonapproval prose without an actionable finding", () => {
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--reviewer", "claude", "--model", "claude-opus-5", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: '{"decision":"changes_requested","summary":',
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback handled ungrounded truncation")),
+      REVIEW_LOOP_FAKE_FALLBACK_SESSION_ID: "truncated-recovery-session",
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "approved");
+  assert.deepEqual(parsed.review_execution.attempts.map((attempt) => attempt.status), ["invalid_review_evidence", "decision"]);
+});
+
+test("v5 reports contract-invalid when no fallback route exists", () => {
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--reviewer", "codex", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "",
+      REVIEW_LOOP_FAKE_CODEX_STRUCTURED_OUTPUT: JSON.stringify({
+        decision: "approved",
+        summary: "Missing the v5 completion envelope.",
+        findings: [],
+        observations: [],
+        required_next_actions: [],
+      }),
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
-  assert.match(parsed.result.summary, /requires a finding or required_next_action/);
+  assert.equal(parsed.review_execution.fallback_used, false);
+  assert.equal(parsed.review_execution.attempts[0].status, "invalid_review_evidence");
+  assert.equal(parsed.review_execution.attempts[0].failure_category, "response");
+  assert.deepEqual(parsed.result.required_next_actions, []);
+  assert.ok(parsed.result.observations.some((observation) => (
+    observation.origin === "review_loop_diagnostic"
+      && /rerun review-loop/i.test(observation.message)
+  )));
 });
 
 test("v4 rejects reviewer acknowledgements that do not match the exact packet", () => {
@@ -1413,21 +1687,30 @@ test("run rejects direct --block-on policy override", () => {
 test("run preserves reviewer invalid_input and blocked decisions without synthetic findings", () => {
   const repo = makeGitRepo();
   for (const decision of ["invalid_input", "blocked"]) {
-    const result = run(["run", "--scope", "none", "--json"], {
-      cwd: repo,
-      env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(notPerformedOutput({
+    const reviewerOutput = decision === "invalid_input"
+      ? notPerformedOutput({
         decision,
         summary: `${decision} from reviewer`,
         findings: [],
-        required_next_actions: ["Try again."],
-      })) },
+        required_next_actions: [],
+      })
+      : structurallyCompleteOutput({
+        decision,
+        summary: `${decision} from reviewer`,
+        findings: [],
+        required_next_actions: ["Fix the current subject and review again."],
+      });
+    const result = run(["run", "--scope", "none", "--json"], {
+      cwd: repo,
+      env: { ...testEnv(repo), REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(reviewerOutput) },
     });
     assert.equal(result.status, 0, result.stderr);
     const parsed = JSON.parse(result.stdout);
     assert.equal(parsed.result.decision, decision);
     assert.deepEqual(parsed.result.blocking_findings, []);
-    assert.deepEqual(parsed.result.required_next_actions, ["Try again."]);
-    assert.equal(parsed.result.acknowledged_packet_digest, null);
+    assert.deepEqual(parsed.result.required_next_actions, decision === "blocked" ? ["Fix the current subject and review again."] : []);
+    assert.equal(parsed.result.acknowledged_packet_digest === null, decision === "invalid_input");
+    assert.equal(parsed.review_execution.outcome, "decision");
   }
 });
 
@@ -1450,7 +1733,9 @@ test("empty-target run reports invalid_input without invoking reviewer", () => {
   assert.equal(parsed.ok, false);
   assert.equal(parsed.reviewer_mechanism.reason, "empty-target");
   assert.match(parsed.result.summary, /Nothing to review/);
-  assert.match(parsed.result.required_next_actions.join("\n"), /--artifact/);
+  assert.deepEqual(parsed.result.required_next_actions, []);
+  assert.match(parsed.result.observations.map((observation) => observation.message).join("\n"), /--artifact/);
+  assert.ok(parsed.result.observations.every((observation) => observation.origin === "review_loop_diagnostic"));
 });
 
 test("gate allows finalization on an empty/clean target without invoking reviewer", () => {
@@ -1490,7 +1775,7 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok", session_id: "fresh-oversized-diff-session" }));
 });
 ${fakeReviewResponseSource}
 `, { mode: 0o755 });
@@ -1552,7 +1837,7 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok", session_id: "fresh-unreadable-file-session" }));
 });
 ${fakeReviewResponseSource}
 `, { mode: 0o755 });
@@ -2224,9 +2509,9 @@ ${fakeReviewResponseSource}
   assert.match(prompt, /shared components preserve established behavioral defaults/);
   assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
   assert.match(prompt, /blocking at the evidence-supported severity/);
-  assert.match(prompt, /required_next_actions follows the explicit decision/i);
-  assert.match(prompt, /Caller workflow, controller publication, commands, and later lifecycle work cannot create reviewer findings or required_next_actions/i);
-  assert.match(prompt, /Prefer advisory findings for optional observations/i);
+  assert.match(prompt, /required_next_actions contains only concrete remediation required on the current reviewed subject/i);
+  assert.match(prompt, /later lifecycle work are not current-subject remediation/i);
+  assert.match(prompt, /non-blocking notes in advisory observations/i);
   assert.match(prompt, /For an advisory finding, required_action is a recommendation/i);
 });
 
@@ -2280,9 +2565,9 @@ ${fakeReviewResponseSource}
   assert.match(prompt, /shared components preserve established behavioral defaults/);
   assert.match(prompt, /concrete correctness, compatibility, safety, or data-loss regression/);
   assert.match(prompt, /blocking at the evidence-supported severity/);
-  assert.match(prompt, /required_next_actions follows the explicit decision/i);
-  assert.match(prompt, /Caller workflow, controller publication, commands, and later lifecycle work cannot create reviewer findings or required_next_actions/i);
-  assert.match(prompt, /Prefer advisory findings for optional observations/i);
+  assert.match(prompt, /required_next_actions contains only concrete remediation required on the current reviewed subject/i);
+  assert.match(prompt, /later lifecycle work are not current-subject remediation/i);
+  assert.match(prompt, /non-blocking notes in advisory observations/i);
   assert.match(prompt, /For an advisory finding, required_action is a recommendation/i);
 });
 
@@ -2564,14 +2849,14 @@ test("guidelines policy drives category-aware blocking", () => {
   assert.equal(JSON.parse(secBlock.stdout).decision, "block");
   assert.match(JSON.parse(secBlock.stdout).reason, /Leaky/);
 
-  // An explicit category exemption overrides severity and reviewer disposition.
+  // An explicit category exemption overrides severity for advisory findings.
   writeFileSync(join(repo, "file.txt"), "style change\n");
   const styleEnv = { ...baseEnv, REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(structurallyCompleteOutput({
     decision: "approved",
     summary: "Style issue is explicitly exempt from blocking policy.",
     findings: [{
       ...finding({ id: "style1", severity: "high", category: "style", locations: ["file.txt:1"], message: "Ugly.", required_action: "Prettify." }),
-      reviewer_disposition: "blocking",
+      reviewer_disposition: "advisory",
     }],
     required_next_actions: [],
   })) };
@@ -2915,7 +3200,7 @@ process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
   fs.writeFileSync(${JSON.stringify(envFile)}, JSON.stringify({ backgroundArgs: process.env.REVIEW_LOOP_BACKGROUND_ARGS || "" }));
-  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "reviewer raw text" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "reviewer raw text", session_id: "fresh-background-review-session" }));
 });
 ${fakeReviewResponseSource}
 `, { mode: 0o755 });
@@ -2941,7 +3226,7 @@ ${fakeReviewResponseSource}
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stdout, /secret-value/);
   const completed = JSON.parse(result.stdout);
-  assert.equal(completed.result.result.schema_version, "4");
+  assert.equal(completed.result.result.schema_version, "5");
   assert.equal(completed.result.result.decision, "approved");
   assert.equal(completed.result.raw, "[redacted]");
   const prompt = readFileSync(stdinFile, "utf8");
@@ -3141,7 +3426,7 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok", session_id: "fresh-counter-review-session" }));
 });
 ${fakeReviewResponseSource}
 `, { mode: 0o755 });
@@ -3270,6 +3555,8 @@ ${fakeReviewResponseSource}
     HOME: join(repo, ".home"),
     REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
     REVIEW_LOOP_CODEX_BIN: fakeCodex,
+    REVIEW_LOOP_FAKE_CLAUDE_SESSION_ID: "fresh-primary-claude-session",
+    REVIEW_LOOP_FAKE_CODEX_SESSION_ID: "fresh-primary-codex-session",
     REVIEW_LOOP_FAKE_FALLBACK_SESSION_ID: "fresh-fallback-session",
     XDG_STATE_HOME: mkdtempSync(join(tmpdir(), "review-loop-state-")),
   };
@@ -3295,6 +3582,9 @@ function structurallyCompleteOutput(output) {
     acknowledged_packet_digest: "__REVIEW_LOOP_PACKET_DIGEST__",
     acknowledged_material_digests: ["__REVIEW_LOOP_MATERIAL_DIGESTS__"],
     limitations: [],
+    findings: [],
+    observations: [],
+    required_next_actions: [],
     ...output,
   };
 }
@@ -3307,6 +3597,7 @@ function notPerformedOutput(output) {
     acknowledged_packet_digest: null,
     acknowledged_material_digests: [],
     limitations: ["The review was not performed."],
+    observations: [],
     ...output,
   };
 }
@@ -3322,6 +3613,7 @@ function reviewResponse(input, output) {
     acknowledged_packet_digest: packetDigest,
     acknowledged_material_digests: materialDigests,
     limitations: [],
+    observations: [],
     ...output,
   };
 }
@@ -3341,6 +3633,12 @@ function finding(overrides = {}) {
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
 }
 
 async function waitFor(predicate) {

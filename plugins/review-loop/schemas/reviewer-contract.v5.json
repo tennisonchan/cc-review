@@ -1,0 +1,936 @@
+{
+  "schema_version": "review-loop.contract.v5",
+  "protocol_version": "5",
+  "description": "Canonical Review Loop v5 producer, normalized-result, execution, and semantic authority contract.",
+  "reviewer_output_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "review_status",
+      "subject_reviewable",
+      "substantive_merit_evaluated",
+      "acknowledged_packet_digest",
+      "acknowledged_material_digests",
+      "decision",
+      "summary",
+      "findings",
+      "observations",
+      "required_next_actions",
+      "limitations"
+    ],
+    "properties": {
+      "review_status": {
+        "type": "string",
+        "enum": [
+          "performed",
+          "partial",
+          "not_performed"
+        ],
+        "description": "Use performed only after completing substantive review of the reviewable exact subject. Partial and not_performed cannot carry a merits decision."
+      },
+      "subject_reviewable": {
+        "type": "boolean",
+        "description": "True only when the exact bound subject was available and inspectable. A merits decision requires true."
+      },
+      "substantive_merit_evaluated": {
+        "type": "boolean",
+        "description": "True only when correctness and requested review dimensions were substantively evaluated. A merits decision requires true."
+      },
+      "acknowledged_packet_digest": {
+        "description": "The exact reviewed packet digest. A performed merits decision requires the supplied digest; not_performed requires null.",
+        "oneOf": [
+          {
+            "$ref": "#/$defs/sha256"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "acknowledged_material_digests": {
+        "type": "array",
+        "description": "The exact material digests actually inspected. Performed review requires the complete supplied set; not_performed requires an empty array.",
+        "items": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "decision": {
+        "type": "string",
+        "enum": [
+          "approved",
+          "changes_requested",
+          "invalid_input",
+          "blocked"
+        ],
+        "description": "approved, changes_requested, and blocked are merits decisions requiring performed review, a reviewable subject, and substantive evaluation. approved forbids blocking findings and required_next_actions. invalid_input is not_performed diagnostic output."
+      },
+      "summary": {
+        "type": "string",
+        "minLength": 1
+      },
+      "findings": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "severity",
+            "category",
+            "message",
+            "locations",
+            "required_action",
+            "reviewer_disposition"
+          ],
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "severity": {
+              "$ref": "#/$defs/severity"
+            },
+            "category": {
+              "type": "string",
+              "minLength": 1
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1
+            },
+            "locations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "required_action": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The concrete remediation for a blocking finding; a recommendation when reviewer_disposition is advisory."
+            },
+            "reviewer_disposition": {
+              "type": "string",
+              "enum": [
+                "blocking",
+                "advisory"
+              ]
+            }
+          }
+        }
+      },
+      "observations": {
+        "type": "array",
+        "description": "Non-authority-bearing advisory observations and downstream-workflow notes. Observations cannot require remediation of the current reviewed subject or change the decision.",
+        "items": {
+          "$ref": "#/$defs/observation"
+        }
+      },
+      "required_next_actions": {
+        "type": "array",
+        "description": "Concrete remediation required on the current reviewed subject before it may advance. This array must be empty when decision is approved.",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "limitations": {
+        "type": "array",
+        "description": "Material limitations on review completeness. Partial or not_performed output requires at least one limitation and cannot authorize a merits decision.",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "$defs": {
+      "sha256": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{64}$"
+      },
+      "severity": {
+        "type": "string",
+        "enum": [
+          "info",
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "observation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "category",
+          "message",
+          "suggestion"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "category": {
+            "enum": [
+              "advisory",
+              "downstream_workflow"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "suggestion": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1,
+            "description": "A non-blocking suggestion, or null when there is no suggestion. It is not current-subject remediation."
+          }
+        }
+      }
+    }
+  },
+  "normalized_result_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "schema_version",
+      "review_contract_digest",
+      "review_status",
+      "subject_reviewable",
+      "substantive_merit_evaluated",
+      "acknowledged_packet_digest",
+      "acknowledged_material_digests",
+      "decision",
+      "summary",
+      "blocking_findings",
+      "advisory_findings",
+      "observations",
+      "required_next_actions",
+      "reviewed_inputs",
+      "reviewer_mechanism",
+      "limitations",
+      "read_only"
+    ],
+    "properties": {
+      "schema_version": {
+        "const": "5"
+      },
+      "review_contract_digest": {
+        "$ref": "#/$defs/sha256"
+      },
+      "review_status": {
+        "enum": [
+          "performed",
+          "partial",
+          "not_performed"
+        ]
+      },
+      "subject_reviewable": {
+        "type": "boolean"
+      },
+      "substantive_merit_evaluated": {
+        "type": "boolean"
+      },
+      "acknowledged_packet_digest": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/sha256"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "acknowledged_material_digests": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/sha256"
+        },
+        "uniqueItems": true
+      },
+      "decision": {
+        "type": "string",
+        "enum": [
+          "approved",
+          "changes_requested",
+          "invalid_input",
+          "blocked"
+        ]
+      },
+      "summary": {
+        "type": "string",
+        "minLength": 1
+      },
+      "blocking_findings": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/finding"
+        }
+      },
+      "advisory_findings": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/finding"
+        }
+      },
+      "observations": {
+        "type": "array",
+        "description": "Non-authority-bearing advisory observations and downstream-workflow notes. Observations cannot require remediation of the current reviewed subject or change the decision.",
+        "items": {
+          "$ref": "#/$defs/observation"
+        }
+      },
+      "required_next_actions": {
+        "type": "array",
+        "description": "Concrete remediation required on the current reviewed subject before it may advance. This array must be empty when decision is approved.",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "reviewed_inputs": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "kind",
+            "display_path",
+            "size",
+            "hash",
+            "format"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "display_path": {
+              "type": "string"
+            },
+            "scope": {
+              "type": "string"
+            },
+            "base": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "size": {
+              "type": "number"
+            },
+            "hash": {
+              "type": "string"
+            },
+            "format": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "reviewer_mechanism": {
+        "type": "string",
+        "minLength": 1
+      },
+      "limitations": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "read_only": {
+        "const": true
+      }
+    },
+    "$defs": {
+      "sha256": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{64}$"
+      },
+      "finding": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "severity",
+          "category",
+          "message",
+          "locations",
+          "required_action",
+          "reviewer_disposition"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "severity": {
+            "enum": [
+              "info",
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "category": {
+            "type": "string",
+            "minLength": 1
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "locations": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "required_action": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reviewer_disposition": {
+            "enum": [
+              "blocking",
+              "advisory"
+            ]
+          },
+          "blocking_reason": {
+            "enum": [
+              "reviewer",
+              "category_policy",
+              "severity_policy",
+              "fallback_threshold"
+            ]
+          }
+        }
+      },
+      "observation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "category",
+          "message",
+          "origin"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "category": {
+            "enum": [
+              "advisory",
+              "downstream_workflow"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "origin": {
+            "enum": [
+              "effective_review",
+              "requested_invalid_envelope",
+              "review_loop_diagnostic"
+            ]
+          },
+          "suggestion": {
+            "type": "string",
+            "minLength": 1,
+            "description": "An optional non-blocking suggestion. It is not current-subject remediation."
+          }
+        }
+      }
+    }
+  },
+  "execution_result_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Review Loop Execution Result",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "schema_version",
+      "outcome",
+      "requested_route",
+      "effective_route",
+      "fallback_used",
+      "fallback_reason",
+      "attempts",
+      "reviewer_identity",
+      "read_only"
+    ],
+    "properties": {
+      "schema_version": {
+        "const": "review-loop.execution-result.v1"
+      },
+      "outcome": {
+        "enum": [
+          "decision",
+          "invalid_review_evidence",
+          "unavailable"
+        ]
+      },
+      "requested_route": {
+        "$ref": "#/$defs/requested_route"
+      },
+      "effective_route": {
+        "oneOf": [
+          {
+            "type": "null"
+          },
+          {
+            "$ref": "#/$defs/effective_route"
+          }
+        ]
+      },
+      "fallback_used": {
+        "type": "boolean"
+      },
+      "fallback_reason": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "enum": [
+          "authentication",
+          "rate_limit",
+          "timeout",
+          "process",
+          "provider",
+          "response",
+          "identity",
+          "unknown",
+          null
+        ]
+      },
+      "attempts": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 2,
+        "items": {
+          "$ref": "#/$defs/attempt"
+        }
+      },
+      "reviewer_identity": {
+        "description": "A fresh provider-reported reviewer session identity when outcome is decision; null for unavailable or invalid review evidence.",
+        "oneOf": [
+          {
+            "type": "null"
+          },
+          {
+            "$ref": "#/$defs/reviewer_identity"
+          }
+        ]
+      },
+      "read_only": {
+        "const": true
+      }
+    },
+    "allOf": [
+      {
+        "if": {
+          "properties": {
+            "outcome": {
+              "const": "decision"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "reviewer_identity": {
+              "$ref": "#/$defs/reviewer_identity"
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "outcome": {
+              "enum": [
+                "invalid_review_evidence",
+                "unavailable"
+              ]
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "reviewer_identity": {
+              "type": "null"
+            }
+          }
+        }
+      }
+    ],
+    "$defs": {
+      "requested_route": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reviewer",
+          "model",
+          "reasoning_effort"
+        ],
+        "properties": {
+          "reviewer": {
+            "enum": [
+              "claude",
+              "codex"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max",
+              null
+            ]
+          }
+        }
+      },
+      "effective_route": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reviewer",
+          "model",
+          "model_identity_evidence"
+        ],
+        "properties": {
+          "reviewer": {
+            "enum": [
+              "claude",
+              "codex"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_identity_evidence": {
+            "enum": [
+              "explicit_argv",
+              "provider_reported",
+              "host_default_unreported"
+            ]
+          }
+        }
+      },
+      "attempt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ordinal",
+          "role",
+          "reviewer",
+          "model",
+          "status"
+        ],
+        "properties": {
+          "ordinal": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2
+          },
+          "role": {
+            "enum": [
+              "requested",
+              "host_fallback"
+            ]
+          },
+          "reviewer": {
+            "enum": [
+              "claude",
+              "codex"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "enum": [
+              "decision",
+              "invalid_review_evidence",
+              "unavailable"
+            ]
+          },
+          "failure_category": {
+            "enum": [
+              "authentication",
+              "rate_limit",
+              "timeout",
+              "process",
+              "provider",
+              "response",
+              "identity",
+              "unknown"
+            ]
+          },
+          "diagnostic_digest": {
+            "$ref": "#/$defs/sha256"
+          },
+          "session_id_digest": {
+            "$ref": "#/$defs/sha256"
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "enum": [
+                    "invalid_review_evidence",
+                    "unavailable"
+                  ]
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "failure_category",
+                "diagnostic_digest"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "decision"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "session_id_digest"
+              ]
+            }
+          }
+        ]
+      },
+      "reviewer_identity": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provider",
+          "signal",
+          "session_id_digest"
+        ],
+        "properties": {
+          "provider": {
+            "enum": [
+              "anthropic",
+              "openai"
+            ]
+          },
+          "signal": {
+            "const": "provider_reported_session_id"
+          },
+          "session_id_digest": {
+            "$ref": "#/$defs/sha256"
+          }
+        }
+      },
+      "sha256": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{64}$"
+      }
+    }
+  },
+  "semantic_invariants": [
+    {
+      "id": "decision_merits_require_completed_review",
+      "description": "A provider merits decision is authoritative only when review was performed on a reviewable subject and substantive merit was evaluated.",
+      "when": {
+        "review_execution_outcome": "decision",
+        "decision": [
+          "approved",
+          "changes_requested",
+          "blocked"
+        ]
+      },
+      "requires": {
+        "review_status": "performed",
+        "subject_reviewable": true,
+        "substantive_merit_evaluated": true
+      }
+    },
+    {
+      "id": "completed_review_acknowledges_exact_inputs",
+      "description": "A completed review acknowledges the exact packet and complete material digest set supplied by the caller.",
+      "when": {
+        "review_status": "performed"
+      },
+      "requires": {
+        "acknowledged_packet_digest": "expected_packet_digest",
+        "acknowledged_material_digests": "expected_material_digests_exact_set"
+      }
+    },
+    {
+      "id": "approval_has_no_actionable_blockers",
+      "description": "Approval cannot carry a blocking finding or current-subject remediation.",
+      "when": {
+        "decision": "approved"
+      },
+      "requires": {
+        "blocking_findings_max_items": 0,
+        "reviewer_blocking_findings_max_items": 0,
+        "required_next_actions_max_items": 0
+      }
+    },
+    {
+      "id": "nonapproval_merits_are_actionable",
+      "description": "A changes-requested or performed blocked decision identifies at least one current-subject blocker or remediation.",
+      "when": {
+        "review_execution_outcome": "decision",
+        "decision": [
+          "changes_requested",
+          "blocked"
+        ]
+      },
+      "requires_any": [
+        "blocking_finding",
+        "required_next_action"
+      ]
+    },
+    {
+      "id": "partial_review_never_authorizes_merits",
+      "description": "Partial review is an invalid provider contract result and cannot carry a merits decision.",
+      "when": {
+        "review_status": "partial"
+      },
+      "forbids": {
+        "review_execution_outcome": "decision"
+      }
+    },
+    {
+      "id": "not_performed_is_unbound",
+      "description": "A review that was not performed has false review predicates and acknowledges no packet or material.",
+      "when": {
+        "review_status": "not_performed"
+      },
+      "requires": {
+        "subject_reviewable": false,
+        "substantive_merit_evaluated": false,
+        "acknowledged_packet_digest": null,
+        "acknowledged_material_digests_max_items": 0
+      }
+    },
+    {
+      "id": "unavailable_wrapper_is_diagnostic_only",
+      "description": "Execution unavailability is represented by a blocked, not-performed normalized diagnostic and never grants authority.",
+      "when": {
+        "review_execution_outcome": [
+          "unavailable",
+          "invalid_review_evidence"
+        ]
+      },
+      "requires": {
+        "decision": "blocked",
+        "review_status": "not_performed"
+      }
+    },
+    {
+      "id": "required_next_actions_are_current_subject_remediation_only",
+      "description": "Ordinary downstream workflow and optional suggestions are observations; required_next_actions contains only remediation needed on the current reviewed subject.",
+      "requires": {
+        "observations_authority_bearing": false,
+        "approved_required_next_actions_max_items": 0
+      }
+    },
+    {
+      "id": "decision_requires_fresh_consistent_reviewer_identity",
+      "description": "Every primary or fallback decision carries one fresh provider-reported session identity consistent with its terminal decision attempt and effective reviewer.",
+      "when": {
+        "review_execution_outcome": "decision"
+      },
+      "requires": {
+        "reviewer_identity_non_null": true,
+        "reviewer_identity_signal": "provider_reported_session_id",
+        "decision_attempt_session_id_matches_identity": true,
+        "reviewer_identity_provider_matches_effective_reviewer": true
+      }
+    },
+    {
+      "id": "contract_digest_matches_runtime",
+      "description": "Every normalized v5 result carries the exact digest of this canonical contract artifact.",
+      "requires": {
+        "review_contract_digest": "computed_contract_digest"
+      }
+    }
+  ],
+  "provider_projections": {
+    "claude": {
+      "source": "reviewer_output_schema",
+      "transforms": [
+        {
+          "id": "claude_remove_schema_meta_key",
+          "path": "/$schema",
+          "operation": "remove",
+          "from": "https://json-schema.org/draft/2020-12/schema",
+          "description": "Claude Code 2.1.176 omits structured_output when the response schema carries the JSON-Schema meta key; invocation removes only that annotation."
+        }
+      ],
+      "description": "Claude receives the canonical reviewer-output schema with the JSON-Schema meta key removed at invocation time."
+    },
+    "codex": {
+      "source": "reviewer_output_schema",
+      "transforms": [
+        {
+          "id": "codex_nullable_packet_digest_without_one_of",
+          "path": "/properties/acknowledged_packet_digest",
+          "operation": "replace",
+          "from": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/sha256"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "to": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "description": "Codex CLI 0.146.0 rejects oneOf at acknowledged_packet_digest; this is the only permitted semantic-preserving projection rewrite."
+        }
+      ]
+    }
+  }
+}

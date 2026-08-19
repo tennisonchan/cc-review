@@ -34,15 +34,11 @@
       "description": "True only when correctness and requested review dimensions were substantively evaluated. A merits decision requires true."
     },
     "acknowledged_packet_digest": {
-      "description": "The exact reviewed packet digest. A performed merits decision requires the supplied digest; not_performed requires null.",
-      "oneOf": [
-        {
-          "$ref": "#/$defs/sha256"
-        },
-        {
-          "type": "null"
-        }
-      ]
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[a-f0-9]{64}$"
     },
     "acknowledged_material_digests": {
       "type": "array",

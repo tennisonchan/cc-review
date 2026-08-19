@@ -8,7 +8,9 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REVIEWER_OUTPUT_SCHEMA_PATH = join(ROOT, "schemas", "reviewer-output.schema.json");
+const CODEX_REVIEWER_OUTPUT_SCHEMA_PATH = join(ROOT, "schemas", "reviewer-output.codex.schema.json");
 const NORMALIZED_RESULT_SCHEMA_PATH = join(ROOT, "schemas", "normalized-result.schema.json");
+const REVIEW_CONTRACT_PATH = join(ROOT, "schemas", "reviewer-contract.v5.json");
 const TEMPLATE_GUIDELINES = join(ROOT, "templates", "review-guidelines.md");
 const PROJECT_GUIDELINES = [".review-loop", "review-guidelines.md"];
 const SEVERITIES = ["info", "low", "medium", "high"];
@@ -32,6 +34,12 @@ const REVIEW_PROTOCOL_VERSION = (() => {
   if (typeof value !== "string" || !value) throw new Error("normalized result schema_version const is required");
   return value;
 })();
+const REVIEW_CONTRACT = JSON.parse(readFileSync(REVIEW_CONTRACT_PATH, "utf8"));
+export const reviewContractDigest = sha256(`review-loop.contract.v5\0${canonicalJson(REVIEW_CONTRACT)}`);
+const REVIEW_CONTRACT_DIGEST = reviewContractDigest;
+if (REVIEW_CONTRACT.protocol_version !== REVIEW_PROTOCOL_VERSION) {
+  throw new Error("review contract protocol_version must match normalized-result schema_version");
+}
 const DEFAULT_MAX_DIFF_CHARS = 200 * 1000;
 const DEFAULT_CLAUDE_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_FALLBACK_TIMEOUT_MS = 10 * 60 * 1000;
@@ -42,9 +50,10 @@ const REVIEW_MECHANISM_CHECKS = [
   "- A concrete correctness, compatibility, safety, or data-loss regression that requires remediation before finalization is blocking at the evidence-supported severity; do not inflate severity or downgrade reviewer_disposition to fit a machine threshold.",
 ];
 const REVIEW_ACTION_SEMANTICS = [
-  "required_next_actions follows the explicit decision: on approved it is advisory follow-up and not a condition of advancement; on a non-approving decision it records remediation required before the current reviewed subject may advance.",
-  "Caller workflow, controller publication, commands, and later lifecycle work cannot create reviewer findings or required_next_actions, even when caller guidelines or focus request them.",
-  "Prefer advisory findings for optional observations that have finding evidence; approved required_next_actions may preserve standalone follow-up recommendations without changing the decision.",
+  "required_next_actions contains only concrete remediation required on the current reviewed subject before it may advance; it must be empty when decision is approved.",
+  "Ordinary caller workflow, controller publication, commands, delivery steps, and later lifecycle work are not current-subject remediation. Put those facts in observations with category downstream_workflow.",
+  "Put non-blocking notes in advisory observations; every reviewer observation includes suggestion (null when none).",
+  "Observations and advisory findings are non-authority-bearing: they cannot change approval, and their optional suggestion is never a condition of advancement.",
   "For an advisory finding, required_action is a recommendation, not a condition of approval.",
 ];
 const TEXT_EXTENSIONS = new Set([
@@ -84,20 +93,23 @@ class ReviewerEnvelopeFailure extends Error {
     super(message);
     this.name = "ReviewerEnvelopeFailure";
     this.contentDigest = domainDigest("review-loop.reviewer-envelope.v1", content);
-    this.hasSubstantiveContent = hasRecoverableSubstantiveContent(content);
+    this.recoverableEvidence = recoverInvalidReviewEvidence(content);
+    this.hasActionableBlockingContent = hasActionableBlockingContent(content, this.recoverableEvidence);
   }
 }
 
 function isTerminalInvalidReviewEvidence(error) {
-  return error instanceof ReviewerEnvelopeFailure
-    && (error.hasSubstantiveContent
-      || /approved reviewer output|acknowledged_(?:packet_digest|material_digests) do(?:es)? not match|changes_requested reviewer output requires/.test(error.message));
+  return (error instanceof ReviewerEnvelopeFailure || error instanceof ReviewerIdentityFailure)
+    && error.hasActionableBlockingContent;
 }
 
 class ReviewerIdentityFailure extends Error {
-  constructor(message) {
+  constructor(message, content = null) {
     super(message);
     this.name = "ReviewerIdentityFailure";
+    this.contentDigest = domainDigest("review-loop.reviewer-identity.v1", content);
+    this.recoverableEvidence = recoverInvalidReviewEvidence(content);
+    this.hasActionableBlockingContent = hasActionableBlockingContent(content, this.recoverableEvidence);
   }
 }
 
@@ -418,6 +430,7 @@ async function setup(args) {
   };
   const result = {
     review_protocol_version: REVIEW_PROTOCOL_VERSION,
+    review_contract_digest: REVIEW_CONTRACT_DIGEST,
     operational_status: executionReadiness.status,
     execution_readiness: executionReadiness,
     repo: repo.root,
@@ -570,6 +583,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
         ? "Nothing to review."
         : `Nothing to review: no changes in scope "${scopeLabel}" and no --artifact/--context supplied, so no review ran.`,
       findings: [],
+      observations: [],
       required_next_actions: gate ? [] : [
         "To review a document (for example a plan), re-run with --artifact <path> --scope none.",
         "To review code, ensure there is a diff in the selected scope or pass --base <ref>.",
@@ -610,7 +624,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
   try {
     reviewerResult = await runReviewer(prompt, {
       reviewer,
-      schemaPath: REVIEWER_OUTPUT_SCHEMA_PATH,
+      schemaPath: reviewerOutputSchemaPath(reviewer),
       cwd: repo.root,
       selection,
       fakeErrorEnv: reviewer === "claude" ? "REVIEW_LOOP_FAKE_ERROR" : "REVIEW_LOOP_FAKE_CODEX_ERROR",
@@ -620,9 +634,16 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     } catch (error) {
       throw new ReviewerEnvelopeFailure(error instanceof Error ? error.message : String(error), reviewerResult.structuredOutput);
     }
+    if (!reviewerIdentityEvidence(reviewer, reviewerResult.meta)) {
+      throw new ReviewerIdentityFailure(
+        `${reviewerDisplayName(reviewer)} reviewer did not report a fresh native session id`,
+        reviewerOutput,
+      );
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const primaryFailure = classifyTransportFailure(error);
+    const primaryAttemptStatus = error instanceof ReviewerEnvelopeFailure ? "invalid_review_evidence" : "unavailable";
     if (isTerminalInvalidReviewEvidence(error)) {
       return genericMechanismFailureResult({
         repo,
@@ -632,8 +653,12 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
         inputs,
         selection,
         outcome: "invalid_review_evidence",
-        summary: `Reviewer output was invalid but contained recoverable substantive review content; no fallback reviewer was invoked. Validation: ${redact(message)}`,
+        summary: error instanceof ReviewerIdentityFailure
+          ? `Reviewer identity was missing but the response contained an actionable blocker; no fallback reviewer was invoked. Validation: ${redact(message)}`
+          : `Reviewer output was invalid but contained recoverable substantive review content; no fallback reviewer was invoked. Validation: ${redact(message)}`,
         primaryFailure,
+        recoverableEvidence: error.recoverableEvidence,
+        primaryAttemptStatus,
       });
     }
     if (args.onReviewerFailure === "throw") {
@@ -652,6 +677,8 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
           fallbackReviewer,
           primaryFailure: message,
           primaryFailureDiagnostic: primaryFailure,
+          primaryRecoverableEvidence: error.recoverableEvidence || null,
+          primaryAttemptStatus,
         });
       } catch (fallbackError) {
         fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
@@ -671,7 +698,9 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
             primaryFailure,
             fallbackReviewer,
             fallbackFailureDiagnostic,
-            fallbackAttemptStatus: "invalid_review_evidence",
+            fallbackAttemptStatus: fallbackError instanceof ReviewerEnvelopeFailure ? "invalid_review_evidence" : "unavailable",
+            recoverableEvidence: fallbackError.recoverableEvidence,
+            primaryAttemptStatus,
           });
         }
       }
@@ -691,6 +720,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
             : null,
         ].filter(Boolean).join(". "),
         findings: [],
+        observations: [],
         required_next_actions: [],
         limitations: ["Reviewer mechanism was unavailable."],
       };
@@ -705,10 +735,13 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
       };
       reviewExecutionOverride = reviewExecutionFailure({
         selection,
-        outcome: "unavailable",
+        outcome: !fallbackReviewer && primaryAttemptStatus === "invalid_review_evidence"
+          ? "invalid_review_evidence"
+          : "unavailable",
         primaryFailure,
         fallbackReviewer,
         fallbackFailureDiagnostic,
+        primaryAttemptStatus,
       });
     } else {
       if (!fallbackReviewer) {
@@ -727,8 +760,9 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
           reviewer_mechanism: { failed: true, on_reviewer_failure: "block" },
           review_execution: reviewExecutionFailure({
             selection,
-            outcome: "unavailable",
+            outcome: primaryAttemptStatus === "invalid_review_evidence" ? "invalid_review_evidence" : "unavailable",
             primaryFailure,
+            primaryAttemptStatus,
           }),
         };
       }
@@ -749,6 +783,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
           primaryFailure,
           fallbackReviewer,
           fallbackFailureDiagnostic,
+          primaryAttemptStatus,
         }),
       };
     }
@@ -783,7 +818,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
   };
 }
 
-async function runFallbackReview({ args, cwd, selection, primaryReviewer, fallbackReviewer, primaryFailure, primaryFailureDiagnostic }) {
+async function runFallbackReview({ args, cwd, selection, primaryReviewer, fallbackReviewer, primaryFailure, primaryFailureDiagnostic, primaryRecoverableEvidence = null, primaryAttemptStatus = "unavailable" }) {
   const repo = resolveWorkspace(cwd);
   const guidelines = resolveGuidelines(args.guidelines, cwd, repo.root);
   const policy = guidelinePolicy(guidelines);
@@ -800,14 +835,24 @@ async function runFallbackReview({ args, cwd, selection, primaryReviewer, fallba
   }
   const reviewerIdentity = reviewerIdentityEvidence(fallbackReviewer, fallback.meta);
   if (!reviewerIdentity) {
-    throw new ReviewerIdentityFailure(`${reviewerDisplayName(fallbackReviewer)} fallback reviewer did not report a fresh native session id`);
+    throw new ReviewerIdentityFailure(
+      `${reviewerDisplayName(fallbackReviewer)} fallback reviewer did not report a fresh native session id`,
+      reviewerOutput,
+    );
   }
-  const normalized = validateNormalizedResult(normalizeReviewOutput(reviewerOutput, {
+  const normalizedDraft = normalizeReviewOutput(reviewerOutput, {
     policy,
     blockOn: args.blockOn || policy.blockOn || DEFAULT_BLOCK_ON,
     reviewedInputs: inputs.reviewed_inputs,
     reviewerMechanism: mechanismName(fallback.meta),
-  }), bindings);
+  });
+  if (primaryRecoverableEvidence) {
+    normalizedDraft.observations = dedupeById([
+      ...normalizedDraft.observations,
+      ...primaryRecoverableEvidence.observations.map((observation) => normalizeObservation(observation, "requested_invalid_envelope")),
+    ]);
+  }
+  const normalized = validateNormalizedResult(normalizedDraft, bindings);
   return {
     ok: normalized.decision === "approved",
     repo: repo.root,
@@ -823,6 +868,7 @@ async function runFallbackReview({ args, cwd, selection, primaryReviewer, fallba
       fallbackUsed: true,
       fallbackReason: primaryFailureDiagnostic.category,
       primaryFailure: primaryFailureDiagnostic,
+      primaryAttemptStatus,
     }),
   };
 }
@@ -840,6 +886,8 @@ function genericMechanismFailureResult({
   fallbackReviewer = null,
   fallbackFailureDiagnostic = null,
   fallbackAttemptStatus = "unavailable",
+  recoverableEvidence = null,
+  primaryAttemptStatus = null,
 }) {
   return {
     ok: false,
@@ -851,6 +899,8 @@ function genericMechanismFailureResult({
       inputs.reviewed_inputs,
       [],
       "review-loop",
+      [],
+      recoverableEvidence,
     )),
     raw: "",
     reviewer_mechanism: { failed: true, on_reviewer_failure: "block" },
@@ -861,12 +911,16 @@ function genericMechanismFailureResult({
       fallbackReviewer,
       fallbackFailureDiagnostic,
       fallbackAttemptStatus,
+      primaryAttemptStatus,
     }),
   };
 }
 
-function reviewExecutionDecision({ selection, effectiveReviewer, meta, fallbackUsed = false, fallbackReason = null, primaryFailure = null }) {
+function reviewExecutionDecision({ selection, effectiveReviewer, meta, fallbackUsed = false, fallbackReason = null, primaryFailure = null, primaryAttemptStatus = "unavailable" }) {
   const identity = reviewerIdentityEvidence(effectiveReviewer, meta);
+  if (!identity) {
+    throw new ReviewerIdentityFailure(`${reviewerDisplayName(effectiveReviewer)} reviewer did not report a fresh native session id`);
+  }
   const attempts = [];
   if (fallbackUsed) {
     attempts.push(reviewExecutionAttempt({
@@ -874,7 +928,7 @@ function reviewExecutionDecision({ selection, effectiveReviewer, meta, fallbackU
       role: "requested",
       reviewer: selection.reviewer,
       model: selection.model || null,
-      status: "unavailable",
+      status: primaryAttemptStatus,
       failureCategory: primaryFailure?.category || "unknown",
       diagnosticDigest: primaryFailure?.diagnostic_digest || null,
     }));
@@ -907,13 +961,14 @@ function reviewExecutionFailure({
   fallbackReviewer = null,
   fallbackFailureDiagnostic = null,
   fallbackAttemptStatus = "unavailable",
+  primaryAttemptStatus = null,
 }) {
   const attempts = [reviewExecutionAttempt({
     ordinal: 1,
     role: "requested",
     reviewer: selection.reviewer,
     model: selection.model || null,
-    status: !fallbackReviewer && outcome === "invalid_review_evidence" ? "invalid_review_evidence" : "unavailable",
+    status: primaryAttemptStatus || (!fallbackReviewer && outcome === "invalid_review_evidence" ? "invalid_review_evidence" : "unavailable"),
     failureCategory: primaryFailure?.category || "unknown",
     diagnosticDigest: primaryFailure?.diagnostic_digest || null,
   })];
@@ -1019,10 +1074,31 @@ function validateReviewExecution(value) {
   if (value.outcome === "decision" && !value.effective_route) {
     throw new Error("decision review execution requires an effective route");
   }
+  if (value.outcome === "decision") {
+    if (!value.reviewer_identity) throw new Error("decision review execution requires reviewer identity");
+    const decisionAttempts = value.attempts.filter((attempt) => attempt.status === "decision");
+    if (decisionAttempts.length !== 1 || decisionAttempts[0] !== value.attempts.at(-1)) {
+      throw new Error("decision review execution requires exactly one terminal decision attempt");
+    }
+    if (decisionAttempts[0].session_id_digest !== value.reviewer_identity.session_id_digest) {
+      throw new Error("decision attempt session identity must match reviewer identity");
+    }
+    if (decisionAttempts[0].reviewer !== value.effective_route.reviewer) {
+      throw new Error("decision attempt reviewer must match the effective reviewer");
+    }
+    const expectedProvider = value.effective_route.reviewer === "claude" ? "anthropic" : "openai";
+    if (value.reviewer_identity.provider !== expectedProvider) {
+      throw new Error("reviewer identity provider must match the effective reviewer");
+    }
+  }
   if (value.outcome !== "decision" && value.effective_route !== null) {
     throw new Error("non-decision review execution must not expose an effective route");
   }
+  if (value.outcome !== "decision" && value.reviewer_identity !== null) {
+    throw new Error("non-decision review execution must not expose reviewer identity");
+  }
   if (value.read_only !== true) throw new Error("review execution must be read-only");
+  assertCanonicalSchema(value, REVIEW_CONTRACT.execution_result_schema, "review execution");
   return value;
 }
 
@@ -1040,6 +1116,7 @@ async function runFallbackReviewer(prompt, { fallbackReviewer, repoRoot }) {
       mechanism,
       fakeMechanism,
       useFallbackSentinel: true,
+      schemaPath: reviewerOutputSchemaPath(fallbackReviewer),
     });
   }
   if (fallbackReviewer === "claude") {
@@ -1052,10 +1129,15 @@ async function runFallbackReviewer(prompt, { fallbackReviewer, repoRoot }) {
       mechanism,
       fakeMechanism,
       useFallbackSentinel: true,
+      schemaPath: reviewerOutputSchemaPath(fallbackReviewer),
       repoRoot,
     });
   }
   throw new Error(`unsupported fallback reviewer: ${fallbackReviewer}`);
+}
+
+function reviewerOutputSchemaPath(reviewer) {
+  return reviewer === "codex" ? CODEX_REVIEWER_OUTPUT_SCHEMA_PATH : REVIEWER_OUTPUT_SCHEMA_PATH;
 }
 
 async function runReviewer(prompt, options = {}) {
@@ -1288,6 +1370,98 @@ function loadSchema(schemaPath) {
   const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
   delete schema.$schema;
   return JSON.stringify(schema);
+}
+
+function assertCanonicalSchema(value, schema, label) {
+  const errors = [];
+  validateSchemaNode(value, schema, schema, "$", errors);
+  if (errors.length) throw new Error(`${label} schema validation failed: ${errors[0]}`);
+}
+
+function validateSchemaNode(value, schema, rootSchema, path, errors) {
+  if (!schema || typeof schema !== "object" || errors.length) return;
+  if (schema.$ref) {
+    const target = resolveLocalSchemaRef(rootSchema, schema.$ref);
+    validateSchemaNode(value, target, rootSchema, path, errors);
+    return;
+  }
+  if (schema.const !== undefined && !deepEqualJson(value, schema.const)) {
+    errors.push(`${path} must equal ${JSON.stringify(schema.const)}`);
+    return;
+  }
+  if (schema.enum && !schema.enum.some((candidate) => deepEqualJson(value, candidate))) {
+    errors.push(`${path} must be one of the declared enum values`);
+    return;
+  }
+  if (schema.oneOf) {
+    const matches = schema.oneOf.filter((candidate) => schemaMatches(value, candidate, rootSchema));
+    if (matches.length !== 1) {
+      errors.push(`${path} must match exactly one oneOf branch`);
+      return;
+    }
+  }
+  for (const candidate of schema.allOf || []) validateSchemaNode(value, candidate, rootSchema, path, errors);
+  if (schema.if && schemaMatches(value, schema.if, rootSchema) && schema.then) {
+    validateSchemaNode(value, schema.then, rootSchema, path, errors);
+  }
+
+  if (schema.type !== undefined) {
+    const allowed = Array.isArray(schema.type) ? schema.type : [schema.type];
+    if (!allowed.some((type) => matchesJsonType(value, type))) {
+      errors.push(`${path} must have type ${allowed.join(" or ")}`);
+      return;
+    }
+  }
+  if (typeof value === "string") {
+    if (schema.minLength !== undefined && value.length < schema.minLength) errors.push(`${path} is shorter than minLength ${schema.minLength}`);
+    if (schema.pattern && !new RegExp(schema.pattern).test(value)) errors.push(`${path} does not match the required pattern`);
+  }
+  if (typeof value === "number") {
+    if (schema.minimum !== undefined && value < schema.minimum) errors.push(`${path} is below minimum ${schema.minimum}`);
+    if (schema.maximum !== undefined && value > schema.maximum) errors.push(`${path} is above maximum ${schema.maximum}`);
+  }
+  if (Array.isArray(value)) {
+    if (schema.minItems !== undefined && value.length < schema.minItems) errors.push(`${path} has fewer than ${schema.minItems} items`);
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) errors.push(`${path} has more than ${schema.maxItems} items`);
+    if (schema.uniqueItems && new Set(value.map((item) => canonicalJson(item))).size !== value.length) errors.push(`${path} items must be unique`);
+    if (schema.items) value.forEach((item, index) => validateSchemaNode(item, schema.items, rootSchema, `${path}[${index}]`, errors));
+  }
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    for (const key of schema.required || []) {
+      if (!Object.hasOwn(value, key)) errors.push(`${path}.${key} is required`);
+    }
+    for (const [key, item] of Object.entries(value)) {
+      if (schema.properties?.[key]) validateSchemaNode(item, schema.properties[key], rootSchema, `${path}.${key}`, errors);
+      else if (schema.additionalProperties === false) errors.push(`${path}.${key} is not allowed`);
+      else if (schema.additionalProperties && typeof schema.additionalProperties === "object") {
+        validateSchemaNode(item, schema.additionalProperties, rootSchema, `${path}.${key}`, errors);
+      }
+    }
+  }
+}
+
+function schemaMatches(value, schema, rootSchema) {
+  const errors = [];
+  validateSchemaNode(value, schema, rootSchema, "$", errors);
+  return errors.length === 0;
+}
+
+function resolveLocalSchemaRef(rootSchema, ref) {
+  if (!ref.startsWith("#/")) throw new Error(`unsupported canonical schema reference: ${ref}`);
+  return ref.slice(2).split("/").reduce((value, segment) => value?.[segment.replace(/~1/g, "/").replace(/~0/g, "~")], rootSchema);
+}
+
+function matchesJsonType(value, type) {
+  if (type === "null") return value === null;
+  if (type === "array") return Array.isArray(value);
+  if (type === "object") return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  if (type === "integer") return Number.isInteger(value);
+  if (type === "number") return typeof value === "number" && Number.isFinite(value);
+  return typeof value === type;
+}
+
+function deepEqualJson(left, right) {
+  return canonicalJson(left) === canonicalJson(right);
 }
 
 async function runClaudeReviewer(prompt, options = {}) {
@@ -2144,10 +2318,17 @@ function hydrateFakeReviewBindings(value, prompt) {
   return hydrated;
 }
 
-function validateReviewerOutput(value, expectedBindings = null) {
+export function validateReviewerOutput(value, expectedBindings = null) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("reviewer output must be an object");
   }
+  const allowedFields = [
+    "review_status", "subject_reviewable", "substantive_merit_evaluated",
+    "acknowledged_packet_digest", "acknowledged_material_digests", "decision",
+    "summary", "findings", "observations", "required_next_actions", "limitations",
+  ];
+  const unexpectedFields = Object.keys(value).filter((field) => !allowedFields.includes(field));
+  if (unexpectedFields.length) throw new Error(`reviewer output has unexpected fields: ${unexpectedFields.join(", ")}`);
   if (value.decision === undefined) {
     throw new Error("reviewer output decision is required");
   }
@@ -2164,6 +2345,8 @@ function validateReviewerOutput(value, expectedBindings = null) {
     throw new Error("reviewer output findings must be an array");
   }
   for (const finding of value.findings) validateReviewerFinding(finding);
+  if (!Array.isArray(value.observations)) throw new Error("reviewer output observations must be an array");
+  for (const observation of value.observations) validateObservation(observation, "reviewer output observation");
   if (value.required_next_actions !== undefined && !Array.isArray(value.required_next_actions)) {
     throw new Error("reviewer output required_next_actions must be an array");
   }
@@ -2208,9 +2391,26 @@ function validateReviewerOutput(value, expectedBindings = null) {
     if (!subjectReviewable) throw new Error("approved reviewer output requires a reviewable subject");
     if (!substantiveMeritEvaluated) throw new Error("approved reviewer output requires substantive merit evaluation");
     if (acknowledgedPacketDigest === null) throw new Error("approved reviewer output requires acknowledged_packet_digest");
+    if (value.findings.some((finding) => finding.reviewer_disposition === "blocking")) {
+      throw new Error("approved reviewer output must not include blocking findings");
+    }
+    if (requiredNextActions.length !== 0) throw new Error("approved reviewer output requires empty required_next_actions");
   }
-  if (value.decision === "changes_requested" && value.findings.length === 0 && requiredNextActions.length === 0) {
-    throw new Error("changes_requested reviewer output requires a finding or required_next_action");
+  if (["changes_requested", "blocked"].includes(value.decision)) {
+    if (reviewStatus !== "performed") throw new Error(`${value.decision} reviewer output requires performed review_status`);
+    if (!subjectReviewable) throw new Error(`${value.decision} reviewer output requires a reviewable subject`);
+    if (!substantiveMeritEvaluated) throw new Error(`${value.decision} reviewer output requires substantive merit evaluation`);
+    if (acknowledgedPacketDigest === null) throw new Error(`${value.decision} reviewer output requires acknowledged_packet_digest`);
+    const hasBlockingFinding = value.findings.some((finding) => finding.reviewer_disposition === "blocking");
+    if (!hasBlockingFinding && requiredNextActions.length === 0) {
+      throw new Error(`${value.decision} reviewer output requires a blocking finding or required_next_action`);
+    }
+  }
+  if (value.decision === "invalid_input") {
+    if (reviewStatus !== "not_performed") throw new Error("invalid_input reviewer output requires not_performed review_status");
+    if (value.findings.length !== 0 || requiredNextActions.length !== 0) {
+      throw new Error("invalid_input reviewer output routes diagnostics and recovery notes through limitations or observations");
+    }
   }
   validateReviewEvidenceBindings({
     reviewStatus,
@@ -2220,6 +2420,7 @@ function validateReviewerOutput(value, expectedBindings = null) {
     acknowledgedMaterialDigests,
     limitations,
   }, expectedBindings, "reviewer output");
+  assertCanonicalSchema(value, REVIEW_CONTRACT.reviewer_output_schema, "reviewer output");
   return {
     review_status: reviewStatus,
     subject_reviewable: subjectReviewable,
@@ -2229,6 +2430,7 @@ function validateReviewerOutput(value, expectedBindings = null) {
     decision: value.decision,
     summary: value.summary,
     findings: value.findings,
+    observations: value.observations,
     required_next_actions: requiredNextActions,
     limitations,
   };
@@ -2244,8 +2446,36 @@ function validateReviewerFinding(finding) {
   if (typeof finding.message !== "string" || !finding.message) throw new Error("finding.message is required");
   if (!Array.isArray(finding.locations)) throw new Error("finding.locations must be an array");
   if (typeof finding.required_action !== "string" || !finding.required_action.trim()) throw new Error("finding.required_action is required");
-  if (finding.reviewer_disposition !== undefined && !REVIEWER_DISPOSITIONS.includes(finding.reviewer_disposition)) {
+  if (!REVIEWER_DISPOSITIONS.includes(finding.reviewer_disposition)) {
     throw new Error(`finding.reviewer_disposition must be one of: ${REVIEWER_DISPOSITIONS.join(", ")}`);
+  }
+}
+
+function validateObservation(observation, label = "observation", { normalized = false } = {}) {
+  if (!observation || typeof observation !== "object" || Array.isArray(observation)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const requiredFields = ["id", "category", "message"];
+  for (const field of requiredFields) {
+    if (typeof observation[field] !== "string" || !observation[field].trim()) {
+      throw new Error(`${label}.${field} is required`);
+    }
+  }
+  if (!["advisory", "downstream_workflow"].includes(observation.category)) {
+    throw new Error(`${label}.category must be one of: advisory, downstream_workflow`);
+  }
+  if (normalized && !["effective_review", "requested_invalid_envelope", "review_loop_diagnostic"].includes(observation.origin)) {
+    throw new Error(`${label}.origin must be one of: effective_review, requested_invalid_envelope, review_loop_diagnostic`);
+  }
+  if (!normalized && !Object.hasOwn(observation, "suggestion")) {
+    throw new Error(`${label}.suggestion is required and may be null`);
+  }
+  const allowedFields = [...requiredFields, ...(normalized ? ["origin"] : []), "suggestion"];
+  const unexpectedFields = Object.keys(observation).filter((field) => !allowedFields.includes(field));
+  if (unexpectedFields.length) throw new Error(`${label} has unexpected fields: ${unexpectedFields.join(", ")}`);
+  if (observation.suggestion !== undefined && observation.suggestion !== null
+    && (typeof observation.suggestion !== "string" || !observation.suggestion.trim())) {
+    throw new Error(`${label}.suggestion must be a non-empty string or null`);
   }
 }
 
@@ -2254,8 +2484,16 @@ function isPlaceholderSummary(value) {
 }
 
 function normalizeReviewOutput(reviewerOutput, { policy, blockOn, reviewedInputs, reviewerMechanism }) {
-  if (["invalid_input", "blocked"].includes(reviewerOutput.decision)) {
-    return syntheticNormalizedFailure(reviewerOutput.decision, reviewerOutput.summary, reviewedInputs, reviewerOutput.required_next_actions, reviewerMechanism, reviewerOutput.limitations);
+  if (reviewerOutput.decision === "invalid_input") {
+    return syntheticNormalizedFailure(
+      reviewerOutput.decision,
+      reviewerOutput.summary,
+      reviewedInputs,
+      reviewerOutput.required_next_actions,
+      reviewerMechanism,
+      reviewerOutput.limitations,
+      { observations: reviewerOutput.observations, observationOrigin: "effective_review" },
+    );
   }
 
   const blocking = [];
@@ -2278,6 +2516,7 @@ function normalizeReviewOutput(reviewerOutput, { policy, blockOn, reviewedInputs
   ].filter(Boolean);
   return {
     schema_version: REVIEW_PROTOCOL_VERSION,
+    review_contract_digest: REVIEW_CONTRACT_DIGEST,
     review_status: reviewerOutput.review_status,
     subject_reviewable: reviewerOutput.subject_reviewable,
     substantive_merit_evaluated: reviewerOutput.substantive_merit_evaluated,
@@ -2287,6 +2526,7 @@ function normalizeReviewOutput(reviewerOutput, { policy, blockOn, reviewedInputs
     summary: reviewerOutput.summary,
     blocking_findings: blocking,
     advisory_findings: advisory.filter((finding) => !seenBlocking.has(finding.id)),
+    observations: reviewerOutput.observations.map((observation) => normalizeObservation(observation, "effective_review")),
     required_next_actions: [...new Set(requiredNextActions)],
     reviewed_inputs: reviewedInputs,
     reviewer_mechanism: reviewerMechanism || "claude-code",
@@ -2307,10 +2547,28 @@ function normalizeFinding(finding) {
   };
 }
 
+function dedupeById(items) {
+  const seen = new Set();
+  return items.filter((item) => {
+    if (seen.has(item.id)) return false;
+    seen.add(item.id);
+    return true;
+  });
+}
+
+function normalizeObservation(observation, origin) {
+  const { suggestion, ...normalized } = observation;
+  return {
+    ...normalized,
+    ...(typeof suggestion === "string" ? { suggestion } : {}),
+    origin,
+  };
+}
+
 function blockingReason(finding, policy, blockOn) {
   const categoryThreshold = finding.category ? policy.categories[finding.category] : undefined;
-  if (categoryThreshold === "never") return null;
   if (finding.reviewer_disposition === "blocking") return "reviewer";
+  if (categoryThreshold === "never") return null;
   const threshold = categoryThreshold !== undefined ? categoryThreshold : blockOn;
   if (SEVERITIES.indexOf(finding.severity) >= SEVERITIES.indexOf(threshold)) {
     if (categoryThreshold !== undefined) return "category_policy";
@@ -2319,10 +2577,28 @@ function blockingReason(finding, policy, blockOn) {
   return null;
 }
 
-function syntheticNormalizedFailure(decision, summary, reviewedInputs = [], requiredNextActions = [], reviewerMechanism = "review-loop", limitations = []) {
+function syntheticNormalizedFailure(decision, summary, reviewedInputs = [], requiredNextActions = [], reviewerMechanism = "review-loop", limitations = [], recoverableEvidence = null) {
   const normalizedDecision = decision === "invalid_input" ? "invalid_input" : "blocked";
+  const preservedBlockingFindings = recoverableEvidence?.blockingFindings || [];
+  const preservedRequiredNextActions = recoverableEvidence?.requiredNextActions || [];
+  const recoveryMessages = requiredNextActions.length || preservedRequiredNextActions.length
+    ? requiredNextActions
+    : ["Resolve the review execution failure and rerun review-loop."];
+  const engineObservations = recoveryMessages
+    .filter((action) => typeof action === "string" && action.trim())
+    .map((action) => ({
+      id: `engine-recovery-${sha256(action.trim()).slice(0, 16)}`,
+      category: "downstream_workflow",
+      message: action.trim(),
+      origin: "review_loop_diagnostic",
+    }));
+  const recoveredObservations = (recoverableEvidence?.observations || []).map((observation) => normalizeObservation(
+    observation,
+    recoverableEvidence?.observationOrigin || "requested_invalid_envelope",
+  ));
   return {
     schema_version: REVIEW_PROTOCOL_VERSION,
+    review_contract_digest: REVIEW_CONTRACT_DIGEST,
     review_status: "not_performed",
     subject_reviewable: false,
     substantive_merit_evaluated: false,
@@ -2330,9 +2606,10 @@ function syntheticNormalizedFailure(decision, summary, reviewedInputs = [], requ
     acknowledged_material_digests: [],
     decision: normalizedDecision,
     summary,
-    blocking_findings: [],
-    advisory_findings: [],
-    required_next_actions: requiredNextActions.length ? requiredNextActions : ["Resolve the review execution failure and rerun review-loop."],
+    blocking_findings: preservedBlockingFindings,
+    advisory_findings: recoverableEvidence?.advisoryFindings || [],
+    observations: dedupeById([...recoveredObservations, ...engineObservations]),
+    required_next_actions: preservedRequiredNextActions,
     reviewed_inputs: reviewedInputs,
     reviewer_mechanism: reviewerMechanism,
     limitations: limitations.length ? limitations : [summary],
@@ -2340,10 +2617,13 @@ function syntheticNormalizedFailure(decision, summary, reviewedInputs = [], requ
   };
 }
 
-function validateNormalizedResult(value, expectedBindings = null) {
+export function validateNormalizedResult(value, expectedBindings = null) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("normalized result must be an object");
   if (value.schema_version !== REVIEW_PROTOCOL_VERSION) {
     throw new Error(`normalized result schema_version must be ${REVIEW_PROTOCOL_VERSION}`);
+  }
+  if (value.review_contract_digest !== REVIEW_CONTRACT_DIGEST) {
+    throw new Error("normalized result review_contract_digest does not match the active canonical contract");
   }
   if (!GENERIC_DECISIONS.includes(value.decision)) throw new Error(`normalized result decision must be one of: ${GENERIC_DECISIONS.join(", ")}`);
   if (!REVIEW_STATUSES.includes(value.review_status)) throw new Error(`normalized result review_status must be one of: ${REVIEW_STATUSES.join(", ")}`);
@@ -2364,16 +2644,25 @@ function validateNormalizedResult(value, expectedBindings = null) {
       throw new Error(`finding.blocking_reason must be one of: ${BLOCKING_REASONS.join(", ")}`);
     }
   }
-  for (const finding of value.advisory_findings) validateReviewerFinding(finding);
+  for (const finding of value.advisory_findings) {
+    validateReviewerFinding(finding);
+    if (finding.reviewer_disposition !== "advisory") {
+      throw new Error("normalized advisory_findings must have advisory reviewer_disposition");
+    }
+  }
+  if (!Array.isArray(value.observations)) throw new Error("normalized result observations must be an array");
+  for (const observation of value.observations) validateObservation(observation, "normalized result observation", { normalized: true });
   if (!Array.isArray(value.required_next_actions)) throw new Error("normalized result required_next_actions must be an array");
+  if (value.required_next_actions.some((item) => typeof item !== "string" || !item.trim())) {
+    throw new Error("normalized result required_next_actions must contain non-empty strings");
+  }
   if (!Array.isArray(value.limitations) || value.limitations.some((item) => typeof item !== "string" || !item.trim())) {
     throw new Error("normalized result limitations must contain non-empty strings");
   }
   if (value.decision === "changes_requested"
     && value.blocking_findings.length === 0
-    && value.advisory_findings.length === 0
     && value.required_next_actions.length === 0) {
-    throw new Error("changes_requested normalized result requires a finding or required_next_action");
+    throw new Error("changes_requested normalized result requires a blocking finding or required_next_action");
   }
   if (value.decision === "approved") {
     if (value.review_status !== "performed") throw new Error("approved normalized result requires performed review_status");
@@ -2381,6 +2670,32 @@ function validateNormalizedResult(value, expectedBindings = null) {
     if (!value.substantive_merit_evaluated) throw new Error("approved normalized result requires substantive merit evaluation");
     if (value.acknowledged_packet_digest === null) throw new Error("approved normalized result requires acknowledged_packet_digest");
     if (value.blocking_findings.length !== 0) throw new Error("approved normalized result must not include blocking_findings");
+    if (value.required_next_actions.length !== 0) throw new Error("approved normalized result requires empty required_next_actions");
+  }
+  if (value.decision === "changes_requested") {
+    if (value.review_status !== "performed") throw new Error("changes_requested normalized result requires performed review_status");
+    if (!value.subject_reviewable) throw new Error("changes_requested normalized result requires a reviewable subject");
+    if (!value.substantive_merit_evaluated) throw new Error("changes_requested normalized result requires substantive merit evaluation");
+  }
+  if (value.decision === "blocked" && value.review_status === "performed") {
+    if (!value.subject_reviewable || !value.substantive_merit_evaluated) {
+      throw new Error("performed blocked normalized result requires completed review predicates");
+    }
+    if (value.blocking_findings.length === 0 && value.required_next_actions.length === 0) {
+      throw new Error("performed blocked normalized result requires a blocker or required_next_action");
+    }
+  }
+  if (value.decision === "blocked" && value.review_status !== "performed" && value.review_status !== "not_performed") {
+    throw new Error("blocked normalized result must be performed merits or not_performed diagnostic output");
+  }
+  if (value.decision === "invalid_input" && value.review_status !== "not_performed") {
+    throw new Error("invalid_input normalized result requires not_performed review_status");
+  }
+  if (value.decision === "invalid_input"
+    && (value.blocking_findings.length !== 0
+      || value.advisory_findings.length !== 0
+      || value.required_next_actions.length !== 0)) {
+    throw new Error("invalid_input normalized result routes diagnostics through limitations or observations, not findings or required_next_actions");
   }
   validateReviewEvidenceBindings({
     reviewStatus: value.review_status,
@@ -2403,6 +2718,7 @@ function validateNormalizedResult(value, expectedBindings = null) {
     throw new Error("normalized result reviewer_mechanism must be a non-empty string");
   }
   if (value.read_only !== true) throw new Error("normalized result read_only must be true");
+  assertCanonicalSchema(value, REVIEW_CONTRACT.normalized_result_schema, "normalized result");
   return value;
 }
 
@@ -2989,7 +3305,11 @@ function classifyTransportFailure(error) {
   const raw = error instanceof Error ? error.message : String(error);
   const normalized = raw.toLowerCase();
   let category = "unknown";
-  if (/auth|login|unauthori[sz]ed|forbidden|\b401\b|\b403\b/.test(normalized)) {
+  if (error instanceof ReviewerIdentityFailure) {
+    category = "identity";
+  } else if (error instanceof ReviewerEnvelopeFailure) {
+    category = "response";
+  } else if (/auth|login|unauthori[sz]ed|forbidden|\b401\b|\b403\b/.test(normalized)) {
     category = "authentication";
   } else if (/rate.?limit|capacity|quota|\b429\b/.test(normalized)) {
     category = "rate_limit";
@@ -3009,6 +3329,7 @@ function classifyTransportFailure(error) {
     process: "Reviewer process failed before returning a result.",
     provider: "Reviewer provider or network was unavailable.",
     response: "Reviewer returned an unusable response envelope.",
+    identity: "Reviewer did not report a fresh native session identity.",
     unknown: "Reviewer transport failed without a safe diagnostic category.",
   };
   return {
@@ -3029,20 +3350,72 @@ function failureDiagnostic(category, error) {
   };
 }
 
-function hasRecoverableSubstantiveContent(content) {
+function recoverInvalidReviewEvidence(content) {
   if (content && typeof content === "object" && !Array.isArray(content)) {
-    if (content.structured_output !== undefined
-      && hasRecoverableSubstantiveContent(content.structured_output)) {
-      return true;
-    }
+    if (content.structured_output !== undefined) return recoverInvalidReviewEvidence(content.structured_output);
     const decision = typeof content.decision === "string" ? content.decision : "";
     const findings = Array.isArray(content.findings) ? content.findings : [];
-    return ["changes_requested", "invalid_input", "blocked"].includes(decision) || findings.length > 0;
+    const blockingFindings = [];
+    const observations = [];
+    for (const finding of findings) {
+      try {
+        validateReviewerFinding(finding);
+      } catch {
+        continue;
+      }
+      const explicitlyAdvisory = finding.reviewer_disposition === "advisory";
+      const actionableByDecision = ["changes_requested", "blocked"].includes(decision) && !explicitlyAdvisory;
+      if (finding.reviewer_disposition === "blocking" || actionableByDecision) {
+        blockingFindings.push({
+          ...normalizeFinding(finding),
+          reviewer_disposition: finding.reviewer_disposition || "blocking",
+          blocking_reason: "reviewer",
+        });
+      } else if (finding.reviewer_disposition === "advisory") {
+        observations.push({
+          id: `invalid-primary-finding-${finding.id}`,
+          category: "advisory",
+          message: finding.message,
+          suggestion: finding.required_action,
+        });
+      }
+    }
+    const requiredNextActions = ["changes_requested", "blocked"].includes(decision)
+      ? (Array.isArray(content.required_next_actions)
+        ? content.required_next_actions.filter((item) => typeof item === "string" && item.trim())
+        : [])
+      : [];
+    for (const observation of Array.isArray(content.observations) ? content.observations : []) {
+      try {
+        validateObservation(observation);
+        observations.push({ ...observation });
+      } catch {}
+    }
+    if (["approved", "invalid_input"].includes(decision) && Array.isArray(content.required_next_actions)) {
+      for (const action of content.required_next_actions) {
+        if (typeof action !== "string" || !action.trim()) continue;
+        observations.push({
+          id: `legacy-${decision}-action-${sha256(action.trim()).slice(0, 16)}`,
+          category: "downstream_workflow",
+          message: action.trim(),
+        });
+      }
+    }
+    return { blockingFindings, observations: dedupeById(observations), requiredNextActions };
+  }
+  return { blockingFindings: [], observations: [], requiredNextActions: [] };
+}
+
+function hasActionableBlockingContent(content, recovered = recoverInvalidReviewEvidence(content)) {
+  if (recovered.blockingFindings.length || recovered.requiredNextActions.length) return true;
+  if (content && typeof content === "object" && !Array.isArray(content)) {
+    if (content.structured_output !== undefined) return hasActionableBlockingContent(content.structured_output, recovered);
+    return false;
   }
   const raw = typeof content === "string" ? content : canonicalJson(content);
-  if (/"decision"\s*:\s*"(?:changes_requested|invalid_input|blocked)"/i.test(raw)) return true;
   const findingsMatch = raw.match(/"findings"\s*:\s*\[([\s\S]*)/i);
-  return Boolean(findingsMatch && /"(?:id|message|required_action)"\s*:/.test(findingsMatch[1]));
+  if (!findingsMatch || !/"(?:id|message|required_action)"\s*:/.test(findingsMatch[1])) return false;
+  return !/"reviewer_disposition"\s*:\s*"advisory"/i.test(findingsMatch[1]);
 }
 
 if (invokedDirectly) runMain(process.argv.slice(2));

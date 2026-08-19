@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.11.2
+
+- Publish normalized-result protocol v5 from one canonical declarative reviewer contract, with a deterministic contract digest in both host manifests, setup readiness, and every normalized result.
+- Generate the canonical reviewer, normalized-result, execution-result, and Codex-compatible schemas from that contract, and reject generated-file drift during validation.
+- Add mandatory canonical post-validation and closed semantic invariants so incomplete, contradictory, extra, or malformed reviewer evidence cannot become authority.
+- Route optional advice, downstream workflow, invalid-envelope recovery, and Review Loop diagnostics through non-authority observations with explicit origin; reserve `required_next_actions` for current-subject remediation.
+- Use the existing single fallback only for transport failures and contract-invalid envelopes without actionable blockers. Preserve actionable invalid evidence without answer-shopping, and preserve non-actionable invalid-envelope notes without attributing them to the fallback reviewer.
+- Require every primary or fallback decision to carry a fresh provider-reported session identity, with schema and post-validation consistency across the effective route and terminal decision attempt.
+
 ## 0.11.1
 
 - Preserve `required_next_actions` as advisory follow-up when the reviewer explicitly approves and no blocking finding remains.

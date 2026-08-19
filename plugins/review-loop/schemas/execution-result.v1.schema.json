@@ -15,86 +15,298 @@
     "read_only"
   ],
   "properties": {
-    "schema_version": { "const": "review-loop.execution-result.v1" },
-    "outcome": { "enum": ["decision", "invalid_review_evidence", "unavailable"] },
-    "requested_route": { "$ref": "#/$defs/requested_route" },
-    "effective_route": {
-      "oneOf": [
-        { "type": "null" },
-        { "$ref": "#/$defs/effective_route" }
+    "schema_version": {
+      "const": "review-loop.execution-result.v1"
+    },
+    "outcome": {
+      "enum": [
+        "decision",
+        "invalid_review_evidence",
+        "unavailable"
       ]
     },
-    "fallback_used": { "type": "boolean" },
+    "requested_route": {
+      "$ref": "#/$defs/requested_route"
+    },
+    "effective_route": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/effective_route"
+        }
+      ]
+    },
+    "fallback_used": {
+      "type": "boolean"
+    },
     "fallback_reason": {
-      "type": ["string", "null"],
-      "enum": ["authentication", "rate_limit", "timeout", "process", "provider", "response", "unknown", null]
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "authentication",
+        "rate_limit",
+        "timeout",
+        "process",
+        "provider",
+        "response",
+        "identity",
+        "unknown",
+        null
+      ]
     },
     "attempts": {
       "type": "array",
       "minItems": 1,
       "maxItems": 2,
-      "items": { "$ref": "#/$defs/attempt" }
+      "items": {
+        "$ref": "#/$defs/attempt"
+      }
     },
     "reviewer_identity": {
+      "description": "A fresh provider-reported reviewer session identity when outcome is decision; null for unavailable or invalid review evidence.",
       "oneOf": [
-        { "type": "null" },
-        { "$ref": "#/$defs/reviewer_identity" }
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/reviewer_identity"
+        }
       ]
     },
-    "read_only": { "const": true }
+    "read_only": {
+      "const": true
+    }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "decision"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "reviewer_identity": {
+            "$ref": "#/$defs/reviewer_identity"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "invalid_review_evidence",
+              "unavailable"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "reviewer_identity": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "requested_route": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["reviewer", "model", "reasoning_effort"],
+      "required": [
+        "reviewer",
+        "model",
+        "reasoning_effort"
+      ],
       "properties": {
-        "reviewer": { "enum": ["claude", "codex"] },
-        "model": { "type": ["string", "null"] },
-        "reasoning_effort": { "type": ["string", "null"], "enum": ["low", "medium", "high", "xhigh", "max", null] }
+        "reviewer": {
+          "enum": [
+            "claude",
+            "codex"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasoning_effort": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            null
+          ]
+        }
       }
     },
     "effective_route": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["reviewer", "model", "model_identity_evidence"],
+      "required": [
+        "reviewer",
+        "model",
+        "model_identity_evidence"
+      ],
       "properties": {
-        "reviewer": { "enum": ["claude", "codex"] },
-        "model": { "type": ["string", "null"] },
-        "model_identity_evidence": { "enum": ["explicit_argv", "provider_reported", "host_default_unreported"] }
+        "reviewer": {
+          "enum": [
+            "claude",
+            "codex"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_identity_evidence": {
+          "enum": [
+            "explicit_argv",
+            "provider_reported",
+            "host_default_unreported"
+          ]
+        }
       }
     },
     "attempt": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["ordinal", "role", "reviewer", "model", "status"],
+      "required": [
+        "ordinal",
+        "role",
+        "reviewer",
+        "model",
+        "status"
+      ],
       "properties": {
-        "ordinal": { "type": "integer", "minimum": 1, "maximum": 2 },
-        "role": { "enum": ["requested", "host_fallback"] },
-        "reviewer": { "enum": ["claude", "codex"] },
-        "model": { "type": ["string", "null"] },
-        "status": { "enum": ["decision", "invalid_review_evidence", "unavailable"] },
-        "failure_category": { "enum": ["authentication", "rate_limit", "timeout", "process", "provider", "response", "identity", "unknown"] },
-        "diagnostic_digest": { "$ref": "#/$defs/sha256" },
-        "session_id_digest": { "$ref": "#/$defs/sha256" }
+        "ordinal": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2
+        },
+        "role": {
+          "enum": [
+            "requested",
+            "host_fallback"
+          ]
+        },
+        "reviewer": {
+          "enum": [
+            "claude",
+            "codex"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "enum": [
+            "decision",
+            "invalid_review_evidence",
+            "unavailable"
+          ]
+        },
+        "failure_category": {
+          "enum": [
+            "authentication",
+            "rate_limit",
+            "timeout",
+            "process",
+            "provider",
+            "response",
+            "identity",
+            "unknown"
+          ]
+        },
+        "diagnostic_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "session_id_digest": {
+          "$ref": "#/$defs/sha256"
+        }
       },
       "allOf": [
         {
-          "if": { "properties": { "status": { "enum": ["invalid_review_evidence", "unavailable"] } } },
-          "then": { "required": ["failure_category", "diagnostic_digest"] }
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "invalid_review_evidence",
+                  "unavailable"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "failure_category",
+              "diagnostic_digest"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "decision"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "session_id_digest"
+            ]
+          }
         }
       ]
     },
     "reviewer_identity": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["provider", "signal", "session_id_digest"],
+      "required": [
+        "provider",
+        "signal",
+        "session_id_digest"
+      ],
       "properties": {
-        "provider": { "enum": ["anthropic", "openai"] },
-        "signal": { "const": "provider_reported_session_id" },
-        "session_id_digest": { "$ref": "#/$defs/sha256" }
+        "provider": {
+          "enum": [
+            "anthropic",
+            "openai"
+          ]
+        },
+        "signal": {
+          "const": "provider_reported_session_id"
+        },
+        "session_id_digest": {
+          "$ref": "#/$defs/sha256"
+        }
       }
     },
-    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
   }
 }
