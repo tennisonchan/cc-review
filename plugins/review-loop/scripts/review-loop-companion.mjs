@@ -99,14 +99,17 @@ class ReviewerEnvelopeFailure extends Error {
 }
 
 function isTerminalInvalidReviewEvidence(error) {
-  return error instanceof ReviewerEnvelopeFailure
+  return (error instanceof ReviewerEnvelopeFailure || error instanceof ReviewerIdentityFailure)
     && error.hasActionableBlockingContent;
 }
 
 class ReviewerIdentityFailure extends Error {
-  constructor(message) {
+  constructor(message, content = null) {
     super(message);
     this.name = "ReviewerIdentityFailure";
+    this.contentDigest = domainDigest("review-loop.reviewer-identity.v1", content);
+    this.recoverableEvidence = recoverInvalidReviewEvidence(content);
+    this.hasActionableBlockingContent = hasActionableBlockingContent(content, this.recoverableEvidence);
   }
 }
 
@@ -631,6 +634,12 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
     } catch (error) {
       throw new ReviewerEnvelopeFailure(error instanceof Error ? error.message : String(error), reviewerResult.structuredOutput);
     }
+    if (!reviewerIdentityEvidence(reviewer, reviewerResult.meta)) {
+      throw new ReviewerIdentityFailure(
+        `${reviewerDisplayName(reviewer)} reviewer did not report a fresh native session id`,
+        reviewerOutput,
+      );
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const primaryFailure = classifyTransportFailure(error);
@@ -644,9 +653,12 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
         inputs,
         selection,
         outcome: "invalid_review_evidence",
-        summary: `Reviewer output was invalid but contained recoverable substantive review content; no fallback reviewer was invoked. Validation: ${redact(message)}`,
+        summary: error instanceof ReviewerIdentityFailure
+          ? `Reviewer identity was missing but the response contained an actionable blocker; no fallback reviewer was invoked. Validation: ${redact(message)}`
+          : `Reviewer output was invalid but contained recoverable substantive review content; no fallback reviewer was invoked. Validation: ${redact(message)}`,
         primaryFailure,
         recoverableEvidence: error.recoverableEvidence,
+        primaryAttemptStatus,
       });
     }
     if (args.onReviewerFailure === "throw") {
@@ -665,7 +677,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
           fallbackReviewer,
           primaryFailure: message,
           primaryFailureDiagnostic: primaryFailure,
-          primaryRecoverableEvidence: error instanceof ReviewerEnvelopeFailure ? error.recoverableEvidence : null,
+          primaryRecoverableEvidence: error.recoverableEvidence || null,
           primaryAttemptStatus,
         });
       } catch (fallbackError) {
@@ -686,7 +698,7 @@ async function runGenericReview({ args, cwd, cache = false, gate = false }) {
             primaryFailure,
             fallbackReviewer,
             fallbackFailureDiagnostic,
-            fallbackAttemptStatus: "invalid_review_evidence",
+            fallbackAttemptStatus: fallbackError instanceof ReviewerEnvelopeFailure ? "invalid_review_evidence" : "unavailable",
             recoverableEvidence: fallbackError.recoverableEvidence,
             primaryAttemptStatus,
           });
@@ -823,7 +835,10 @@ async function runFallbackReview({ args, cwd, selection, primaryReviewer, fallba
   }
   const reviewerIdentity = reviewerIdentityEvidence(fallbackReviewer, fallback.meta);
   if (!reviewerIdentity) {
-    throw new ReviewerIdentityFailure(`${reviewerDisplayName(fallbackReviewer)} fallback reviewer did not report a fresh native session id`);
+    throw new ReviewerIdentityFailure(
+      `${reviewerDisplayName(fallbackReviewer)} fallback reviewer did not report a fresh native session id`,
+      reviewerOutput,
+    );
   }
   const normalizedDraft = normalizeReviewOutput(reviewerOutput, {
     policy,
@@ -903,6 +918,9 @@ function genericMechanismFailureResult({
 
 function reviewExecutionDecision({ selection, effectiveReviewer, meta, fallbackUsed = false, fallbackReason = null, primaryFailure = null, primaryAttemptStatus = "unavailable" }) {
   const identity = reviewerIdentityEvidence(effectiveReviewer, meta);
+  if (!identity) {
+    throw new ReviewerIdentityFailure(`${reviewerDisplayName(effectiveReviewer)} reviewer did not report a fresh native session id`);
+  }
   const attempts = [];
   if (fallbackUsed) {
     attempts.push(reviewExecutionAttempt({
@@ -1056,8 +1074,28 @@ function validateReviewExecution(value) {
   if (value.outcome === "decision" && !value.effective_route) {
     throw new Error("decision review execution requires an effective route");
   }
+  if (value.outcome === "decision") {
+    if (!value.reviewer_identity) throw new Error("decision review execution requires reviewer identity");
+    const decisionAttempts = value.attempts.filter((attempt) => attempt.status === "decision");
+    if (decisionAttempts.length !== 1 || decisionAttempts[0] !== value.attempts.at(-1)) {
+      throw new Error("decision review execution requires exactly one terminal decision attempt");
+    }
+    if (decisionAttempts[0].session_id_digest !== value.reviewer_identity.session_id_digest) {
+      throw new Error("decision attempt session identity must match reviewer identity");
+    }
+    if (decisionAttempts[0].reviewer !== value.effective_route.reviewer) {
+      throw new Error("decision attempt reviewer must match the effective reviewer");
+    }
+    const expectedProvider = value.effective_route.reviewer === "claude" ? "anthropic" : "openai";
+    if (value.reviewer_identity.provider !== expectedProvider) {
+      throw new Error("reviewer identity provider must match the effective reviewer");
+    }
+  }
   if (value.outcome !== "decision" && value.effective_route !== null) {
     throw new Error("non-decision review execution must not expose an effective route");
+  }
+  if (value.outcome !== "decision" && value.reviewer_identity !== null) {
+    throw new Error("non-decision review execution must not expose reviewer identity");
   }
   if (value.read_only !== true) throw new Error("review execution must be read-only");
   assertCanonicalSchema(value, REVIEW_CONTRACT.execution_result_schema, "review execution");
@@ -3267,7 +3305,9 @@ function classifyTransportFailure(error) {
   const raw = error instanceof Error ? error.message : String(error);
   const normalized = raw.toLowerCase();
   let category = "unknown";
-  if (error instanceof ReviewerEnvelopeFailure) {
+  if (error instanceof ReviewerIdentityFailure) {
+    category = "identity";
+  } else if (error instanceof ReviewerEnvelopeFailure) {
     category = "response";
   } else if (/auth|login|unauthori[sz]ed|forbidden|\b401\b|\b403\b/.test(normalized)) {
     category = "authentication";
@@ -3289,6 +3329,7 @@ function classifyTransportFailure(error) {
     process: "Reviewer process failed before returning a result.",
     provider: "Reviewer provider or network was unavailable.",
     response: "Reviewer returned an unusable response envelope.",
+    identity: "Reviewer did not report a fresh native session identity.",
     unknown: "Reviewer transport failed without a safe diagnostic category.",
   };
   return {

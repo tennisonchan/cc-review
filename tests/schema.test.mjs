@@ -288,8 +288,20 @@ test("execution result schema bounds automatic host fallback provenance", () => 
   assert.equal(executionSchema.properties.attempts.maxItems, 2);
   assert.deepEqual(executionSchema.$defs.attempt.properties.role.enum, ["requested", "host_fallback"]);
   assert.ok(executionSchema.$defs.attempt.properties.failure_category.enum.includes("identity"));
+  assert.ok(executionSchema.properties.fallback_reason.enum.includes("identity"));
   assert.equal(executionSchema.$defs.attempt.properties.diagnostic_digest.$ref, "#/$defs/sha256");
+  assert.ok(executionSchema.$defs.attempt.allOf.some((rule) => (
+    rule.if?.properties?.status?.const === "decision"
+      && rule.then?.required?.includes("session_id_digest")
+  )));
   assert.equal(executionSchema.$defs.reviewer_identity.properties.signal.const, "provider_reported_session_id");
+  assert.ok(executionSchema.allOf.some((rule) => (
+    rule.if?.properties?.outcome?.const === "decision"
+      && rule.then?.properties?.reviewer_identity?.$ref === "#/$defs/reviewer_identity"
+  )));
+  assert.ok(canonicalContract.semantic_invariants.some((invariant) => (
+    invariant.id === "decision_requires_fresh_consistent_reviewer_identity"
+  )));
   assert.equal(executionSchema.properties.read_only.const, true);
   assert.equal(executionSchema.properties.next_action, undefined);
 });

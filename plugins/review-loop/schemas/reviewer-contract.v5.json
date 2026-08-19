@@ -511,6 +511,7 @@
           "process",
           "provider",
           "response",
+          "identity",
           "unknown",
           null
         ]
@@ -524,6 +525,7 @@
         }
       },
       "reviewer_identity": {
+        "description": "A fresh provider-reported reviewer session identity when outcome is decision; null for unavailable or invalid review evidence.",
         "oneOf": [
           {
             "type": "null"
@@ -537,6 +539,43 @@
         "const": true
       }
     },
+    "allOf": [
+      {
+        "if": {
+          "properties": {
+            "outcome": {
+              "const": "decision"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "reviewer_identity": {
+              "$ref": "#/$defs/reviewer_identity"
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "outcome": {
+              "enum": [
+                "invalid_review_evidence",
+                "unavailable"
+              ]
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "reviewer_identity": {
+              "type": "null"
+            }
+          }
+        }
+      }
+    ],
     "$defs": {
       "requested_route": {
         "type": "object",
@@ -683,6 +722,20 @@
                 "diagnostic_digest"
               ]
             }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "decision"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "session_id_digest"
+              ]
+            }
           }
         ]
       },
@@ -814,6 +867,19 @@
       "requires": {
         "observations_authority_bearing": false,
         "approved_required_next_actions_max_items": 0
+      }
+    },
+    {
+      "id": "decision_requires_fresh_consistent_reviewer_identity",
+      "description": "Every primary or fallback decision carries one fresh provider-reported session identity consistent with its terminal decision attempt and effective reviewer.",
+      "when": {
+        "review_execution_outcome": "decision"
+      },
+      "requires": {
+        "reviewer_identity_non_null": true,
+        "reviewer_identity_signal": "provider_reported_session_id",
+        "decision_attempt_session_id_matches_identity": true,
+        "reviewer_identity_provider_matches_effective_reviewer": true
       }
     },
     {

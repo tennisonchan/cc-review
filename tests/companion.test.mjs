@@ -80,6 +80,15 @@ function assertExecutionResultSchema(value) {
     assert.equal(value.reviewer_identity.signal, identity.properties.signal.const);
     assert.match(value.reviewer_identity.session_id_digest, new RegExp(schema.$defs.sha256.pattern));
   }
+  if (value.outcome === "decision") {
+    assert.notEqual(value.reviewer_identity, null);
+    const decisionAttempts = value.attempts.filter((attempt) => attempt.status === "decision");
+    assert.equal(decisionAttempts.length, 1);
+    assert.equal(decisionAttempts[0].session_id_digest, value.reviewer_identity.session_id_digest);
+    assert.equal(decisionAttempts[0].reviewer, value.effective_route.reviewer);
+  } else {
+    assert.equal(value.reviewer_identity, null);
+  }
 }
 
 test("setup initializes project review guidelines without overwriting", () => {
@@ -273,7 +282,7 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok", session_id: "fresh-claude-capture-session" }));
 });
 ${fakeReviewResponseSource}
 `, { mode: 0o755 });
@@ -341,6 +350,7 @@ process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
   const out = argv[argv.indexOf("--output-last-message") + 1];
   fs.writeFileSync(out, JSON.stringify(reviewResponse(input, { decision: "approved", summary: "codex ok", findings: [], required_next_actions: [] })));
+  process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "fresh-codex-primary-session" }) + "\\n");
 });
 ${fakeReviewResponseSource}
 `, { mode: 0o755 });
@@ -556,7 +566,7 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok", session_id: "fresh-context-review-session" }));
 });
 ${fakeReviewResponseSource}
 `, { mode: 0o755 });
@@ -1145,6 +1155,80 @@ test("run preserves invalid fallback findings as invalid_review_evidence even in
   assert.doesNotMatch(parsed.result.summary, /allow was set/i);
 });
 
+test("run uses one fallback when the primary decision lacks fresh native reviewer identity", () => {
+  const repo = makeGitRepo();
+  const primaryOutput = approvedOutput("primary decision missing identity");
+  primaryOutput.observations = [{
+    id: "unbound-primary-note",
+    category: "advisory",
+    message: "Preserve this non-authority note across identity recovery.",
+    suggestion: null,
+  }];
+  const result = run(["run", "--scope", "none", "--reviewer", "claude", "--model", "claude-opus-5", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(primaryOutput),
+      REVIEW_LOOP_FAKE_CLAUDE_SESSION_ID: "",
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback supplied identity")),
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "approved");
+  assert.equal(parsed.review_execution.outcome, "decision");
+  assert.equal(parsed.review_execution.fallback_used, true);
+  assert.equal(parsed.review_execution.fallback_reason, "identity");
+  assert.deepEqual(parsed.review_execution.attempts.map((attempt) => ({
+    status: attempt.status,
+    failure_category: attempt.failure_category || null,
+  })), [
+    { status: "unavailable", failure_category: "identity" },
+    { status: "decision", failure_category: null },
+  ]);
+  assert.equal(parsed.review_execution.reviewer_identity.provider, "openai");
+  assert.match(parsed.review_execution.reviewer_identity.session_id_digest, /^[a-f0-9]{64}$/);
+  assert.deepEqual(parsed.result.observations, [{
+    id: "unbound-primary-note",
+    category: "advisory",
+    message: "Preserve this non-authority note across identity recovery.",
+    origin: "requested_invalid_envelope",
+  }]);
+});
+
+test("run preserves an actionable primary blocker without answer-shopping when reviewer identity is missing", () => {
+  const repo = makeGitRepo();
+  const result = run(["run", "--scope", "none", "--reviewer", "claude", "--model", "claude-opus-5", "--json"], {
+    cwd: repo,
+    env: {
+      ...testEnv(repo),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_FAKE_STRUCTURED_OUTPUT: JSON.stringify(blockingOutput([
+        finding({
+          id: "identity-unbound-blocker",
+          message: "The primary reviewer found an actionable defect.",
+          required_action: "Fix the actionable defect.",
+        }),
+      ])),
+      REVIEW_LOOP_FAKE_CLAUDE_SESSION_ID: "",
+      REVIEW_LOOP_FAKE_FALLBACK_STRUCTURED_OUTPUT: JSON.stringify(approvedOutput("fallback must not run")),
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "blocked");
+  assert.deepEqual(parsed.result.blocking_findings.map((finding) => finding.id), ["identity-unbound-blocker"]);
+  assert.equal(parsed.review_execution.outcome, "invalid_review_evidence");
+  assert.equal(parsed.review_execution.fallback_used, false);
+  assert.equal(parsed.review_execution.attempts[0].status, "unavailable");
+  assert.equal(parsed.review_execution.attempts[0].failure_category, "identity");
+  assert.equal(parsed.review_execution.reviewer_identity, null);
+  assert.doesNotMatch(JSON.stringify(parsed), /fallback must not run/);
+});
+
 test("run reports unavailable when host fallback lacks a fresh native session identity", () => {
   const repo = makeGitRepo();
   const result = run(["run", "--scope", "none", "--reviewer", "claude", "--model", "claude-opus-5", "--json"], {
@@ -1691,7 +1775,7 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok", session_id: "fresh-oversized-diff-session" }));
 });
 ${fakeReviewResponseSource}
 `, { mode: 0o755 });
@@ -1753,7 +1837,7 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok", session_id: "fresh-unreadable-file-session" }));
 });
 ${fakeReviewResponseSource}
 `, { mode: 0o755 });
@@ -3116,7 +3200,7 @@ process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
   fs.writeFileSync(${JSON.stringify(envFile)}, JSON.stringify({ backgroundArgs: process.env.REVIEW_LOOP_BACKGROUND_ARGS || "" }));
-  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "reviewer raw text" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "reviewer raw text", session_id: "fresh-background-review-session" }));
 });
 ${fakeReviewResponseSource}
 `, { mode: 0o755 });
@@ -3342,7 +3426,7 @@ let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(stdinFile)}, input);
-  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok" }));
+  console.log(JSON.stringify({ structured_output: reviewResponse(input, { decision: "approved", summary: "ok", findings: [], required_next_actions: [] }), result: "ok", session_id: "fresh-counter-review-session" }));
 });
 ${fakeReviewResponseSource}
 `, { mode: 0o755 });
@@ -3471,6 +3555,8 @@ ${fakeReviewResponseSource}
     HOME: join(repo, ".home"),
     REVIEW_LOOP_CLAUDE_BIN: fakeClaude,
     REVIEW_LOOP_CODEX_BIN: fakeCodex,
+    REVIEW_LOOP_FAKE_CLAUDE_SESSION_ID: "fresh-primary-claude-session",
+    REVIEW_LOOP_FAKE_CODEX_SESSION_ID: "fresh-primary-codex-session",
     REVIEW_LOOP_FAKE_FALLBACK_SESSION_ID: "fresh-fallback-session",
     XDG_STATE_HOME: mkdtempSync(join(tmpdir(), "review-loop-state-")),
   };

@@ -13,6 +13,7 @@ Review Loop does not classify risk, translate risk to models, decide gates, or c
 - With an exact reviewer/model override, it invokes that mechanism read-only.
 - If the requested mechanism fails, or its envelope is contract-invalid without an actionable current-subject blocker, Review Loop automatically tries at most one fresh host-model reviewer. It never asks the operator to choose a fallback.
 - A contract-invalid envelope with an actionable blocker is terminal `invalid_review_evidence`; Review Loop preserves that evidence and does not answer-shop. Advisory-only and finding-free invalid envelopes remain eligible for the single fallback, with recovered notes preserved as non-authority observations carrying their invalid-envelope origin.
+- Every primary or fallback decision requires a fresh provider-native reviewer session identity. A missing primary identity uses the same single-fallback rule for non-actionable content, while identity-unbound actionable blockers remain terminal and preserved.
 - If both mechanisms fail, the result is `unavailable` with bounded diagnostic evidence.
 - Results are action-neutral. The complete normalized v5 review is under `result`; requested/effective routes, at most two attempts, fallback provenance, diagnostics, and hashed provider-native reviewer identity are under `review_execution`.
 

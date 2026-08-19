@@ -53,6 +53,7 @@
         "process",
         "provider",
         "response",
+        "identity",
         "unknown",
         null
       ]
@@ -66,6 +67,7 @@
       }
     },
     "reviewer_identity": {
+      "description": "A fresh provider-reported reviewer session identity when outcome is decision; null for unavailable or invalid review evidence.",
       "oneOf": [
         {
           "type": "null"
@@ -79,6 +81,43 @@
       "const": true
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "decision"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "reviewer_identity": {
+            "$ref": "#/$defs/reviewer_identity"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "invalid_review_evidence",
+              "unavailable"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "reviewer_identity": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "requested_route": {
       "type": "object",
@@ -223,6 +262,20 @@
             "required": [
               "failure_category",
               "diagnostic_digest"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "decision"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "session_id_digest"
             ]
           }
         }
