@@ -11,10 +11,10 @@ Review Loop does not classify risk, translate risk to models, decide gates, or c
 
 - With no reviewer/model override, Review Loop uses the host-aware default reviewer.
 - With an exact reviewer/model override, it invokes that mechanism read-only.
-- If the requested mechanism fails before substantive review content exists, it automatically tries one fresh host-model reviewer. It never asks the operator to choose a fallback.
-- Substantive content is terminal: malformed output that still contains a decision or finding returns `invalid_review_evidence` without answer-shopping.
+- If the requested mechanism fails, or its envelope is contract-invalid without an actionable current-subject blocker, Review Loop automatically tries at most one fresh host-model reviewer. It never asks the operator to choose a fallback.
+- A contract-invalid envelope with an actionable blocker is terminal `invalid_review_evidence`; Review Loop preserves that evidence and does not answer-shop. Advisory-only and finding-free invalid envelopes remain eligible for the single fallback, with recovered notes preserved as non-authority observations carrying their invalid-envelope origin.
 - If both mechanisms fail, the result is `unavailable` with bounded diagnostic evidence.
-- Results are action-neutral. The complete normalized v3 review is under `result`; requested/effective routes, at most two attempts, fallback provenance, diagnostics, and hashed provider-native reviewer identity are under `review_execution`.
+- Results are action-neutral. The complete normalized v5 review is under `result`; requested/effective routes, at most two attempts, fallback provenance, diagnostics, and hashed provider-native reviewer identity are under `review_execution`.
 
 See [the product boundary](../../docs/product-boundary.md).
 
@@ -69,7 +69,7 @@ Mutable model aliases such as `latest`, `opus`, and `sonnet` are rejected. Revie
 
 ## Setup readiness
 
-`review-loop-setup --json` reports the exact `review_protocol_version`, which is the normalized-result `schema_version`. Consumers should treat any inequality as protocol-incompatible. Setup then checks Node, the Codex and Claude CLIs, and authentication. Review Loop is usable when at least one provider is healthy. It does not own caller model policy.
+`review-loop-setup --json` reports the exact `review_protocol_version`, which is the normalized-result `schema_version`, and `review_contract_digest`. Consumers must require both values to match the contract they pinned; equal protocol numbers with unequal contract digests are incompatible. Setup then checks Node, the Codex and Claude CLIs, and authentication. Review Loop is usable when at least one provider is healthy. It does not own caller model policy.
 
 ## Install
 

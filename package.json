@@ -1,6 +1,6 @@
 {
   "name": "review-loop",
-  "version": "0.11.1",
+  "version": "0.11.2",
   "description": "Multi-agent review loop engine for read-only independent reviews and review gates.",
   "type": "module",
   "private": false,
@@ -17,8 +17,10 @@
     "review-loop-cancel": "./plugins/review-loop/scripts/bin/review-loop-cancel.mjs"
   },
   "scripts": {
+    "generate-contract": "node plugins/review-loop/scripts/generate-review-contract.mjs",
+    "check-contract": "node plugins/review-loop/scripts/generate-review-contract.mjs --check",
     "test": "node --test tests/*.test.mjs",
-    "validate": "node --test tests/*.test.mjs && node plugins/review-loop/scripts/review-loop-companion.mjs setup --json"
+    "validate": "npm run check-contract && node --test tests/*.test.mjs && node plugins/review-loop/scripts/review-loop-companion.mjs setup --json"
   },
   "keywords": [
     "codex",

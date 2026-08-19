@@ -4,6 +4,7 @@
   "additionalProperties": false,
   "required": [
     "schema_version",
+    "review_contract_digest",
     "review_status",
     "subject_reviewable",
     "substantive_merit_evaluated",
@@ -13,6 +14,7 @@
     "summary",
     "blocking_findings",
     "advisory_findings",
+    "observations",
     "required_next_actions",
     "reviewed_inputs",
     "reviewer_mechanism",
@@ -20,64 +22,139 @@
     "read_only"
   ],
   "properties": {
-    "schema_version": { "const": "4" },
-    "review_status": {
-      "enum": ["performed", "partial", "not_performed"]
+    "schema_version": {
+      "const": "5"
     },
-    "subject_reviewable": { "type": "boolean" },
-    "substantive_merit_evaluated": { "type": "boolean" },
+    "review_contract_digest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "review_status": {
+      "enum": [
+        "performed",
+        "partial",
+        "not_performed"
+      ]
+    },
+    "subject_reviewable": {
+      "type": "boolean"
+    },
+    "substantive_merit_evaluated": {
+      "type": "boolean"
+    },
     "acknowledged_packet_digest": {
       "oneOf": [
-        { "$ref": "#/$defs/sha256" },
-        { "type": "null" }
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "acknowledged_material_digests": {
       "type": "array",
-      "items": { "$ref": "#/$defs/sha256" },
+      "items": {
+        "$ref": "#/$defs/sha256"
+      },
       "uniqueItems": true
     },
     "decision": {
       "type": "string",
-      "enum": ["approved", "changes_requested", "invalid_input", "blocked"]
+      "enum": [
+        "approved",
+        "changes_requested",
+        "invalid_input",
+        "blocked"
+      ]
     },
-    "summary": { "type": "string", "minLength": 1 },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
     "blocking_findings": {
       "type": "array",
-      "items": { "$ref": "#/$defs/finding" }
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
     },
     "advisory_findings": {
       "type": "array",
-      "items": { "$ref": "#/$defs/finding" }
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    },
+    "observations": {
+      "type": "array",
+      "description": "Non-authority-bearing advisory observations and downstream-workflow notes. Observations cannot require remediation of the current reviewed subject or change the decision.",
+      "items": {
+        "$ref": "#/$defs/observation"
+      }
     },
     "required_next_actions": {
       "type": "array",
-      "items": { "type": "string" }
+      "description": "Concrete remediation required on the current reviewed subject before it may advance. This array must be empty when decision is approved.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
     },
     "reviewed_inputs": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": true,
-        "required": ["kind", "display_path", "size", "hash", "format"],
+        "required": [
+          "kind",
+          "display_path",
+          "size",
+          "hash",
+          "format"
+        ],
         "properties": {
-          "kind": { "type": "string" },
-          "path": { "type": "string" },
-          "display_path": { "type": "string" },
-          "scope": { "type": "string" },
-          "base": { "type": ["string", "null"] },
-          "size": { "type": "number" },
-          "hash": { "type": "string" },
-          "format": { "type": "string" }
+          "kind": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "display_path": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string"
+          },
+          "base": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "size": {
+            "type": "number"
+          },
+          "hash": {
+            "type": "string"
+          },
+          "format": {
+            "type": "string"
+          }
         }
       }
     },
-    "reviewer_mechanism": { "type": "string", "minLength": 1 },
+    "reviewer_mechanism": {
+      "type": "string",
+      "minLength": 1
+    },
     "limitations": {
       "type": "array",
-      "items": { "type": "string", "minLength": 1 }
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
     },
-    "read_only": { "const": true }
+    "read_only": {
+      "const": true
+    }
   },
   "$defs": {
     "sha256": {
@@ -87,20 +164,97 @@
     "finding": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "severity", "category", "message", "locations", "required_action", "reviewer_disposition"],
+      "required": [
+        "id",
+        "severity",
+        "category",
+        "message",
+        "locations",
+        "required_action",
+        "reviewer_disposition"
+      ],
       "properties": {
-        "id": { "type": "string", "minLength": 1 },
-        "severity": { "enum": ["info", "low", "medium", "high"] },
-        "category": { "type": "string", "minLength": 1 },
-        "message": { "type": "string", "minLength": 1 },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "severity": {
+          "enum": [
+            "info",
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "category": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
         "locations": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         },
-        "required_action": { "type": "string", "minLength": 1 },
-        "reviewer_disposition": { "enum": ["blocking", "advisory"] },
+        "required_action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviewer_disposition": {
+          "enum": [
+            "blocking",
+            "advisory"
+          ]
+        },
         "blocking_reason": {
-          "enum": ["reviewer", "category_policy", "severity_policy", "fallback_threshold"]
+          "enum": [
+            "reviewer",
+            "category_policy",
+            "severity_policy",
+            "fallback_threshold"
+          ]
+        }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "category",
+        "message",
+        "origin"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "enum": [
+            "advisory",
+            "downstream_workflow"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "origin": {
+          "enum": [
+            "effective_review",
+            "requested_invalid_envelope",
+            "review_loop_diagnostic"
+          ]
+        },
+        "suggestion": {
+          "type": "string",
+          "minLength": 1,
+          "description": "An optional non-blocking suggestion. It is not current-subject remediation."
         }
       }
     }
