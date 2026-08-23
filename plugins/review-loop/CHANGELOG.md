@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.11.3
+
+- Allow read-only Codex reviews of explicitly supplied artifacts outside Git worktrees by adding the Codex non-Git opt-in only for those workspaces, consistently across exact-model, host-default, and fallback routes.
+
 ## 0.11.2
 
 - Publish normalized-result protocol v5 from one canonical declarative reviewer contract, with a deterministic contract digest in both host manifests, setup readiness, and every normalized result.

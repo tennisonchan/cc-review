@@ -366,6 +366,7 @@ ${fakeReviewResponseSource}
   const argv = JSON.parse(readFileSync(argvFile, "utf8"));
   assert.equal(argv[0], "exec");
   assert.deepEqual(argv.slice(argv.indexOf("--sandbox"), argv.indexOf("--sandbox") + 2), ["--sandbox", "read-only"]);
+  assert.equal(argv.includes("--skip-git-repo-check"), false);
   assert.ok(argv.includes("--output-schema"));
   assert.ok(argv.includes("--output-last-message"));
   const schemaPath = argv[argv.indexOf("--output-schema") + 1];
@@ -405,6 +406,77 @@ ${fakeReviewResponseSource}
   assert.match(prompt, /later lifecycle work are not current-subject remediation/i);
   assert.match(prompt, /non-blocking notes in advisory observations/i);
   assert.match(prompt, /For an advisory finding, required_action is a recommendation/i);
+});
+
+test("run opts exact-model Codex into non-Git artifact review without weakening isolation", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "review-loop-non-git-exact-"));
+  writeFileSync(join(workspace, "design.md"), "# Design\n\nReview this artifact.\n");
+  const capture = makeCodexCapture(workspace, "exact");
+  const result = run([
+    "run", "--scope", "none", "--artifact", "design.md", "--reviewer", "codex",
+    "--model", "gpt-5.6-sol-20260731", "--reasoning-effort", "high", "--json",
+  ], {
+    cwd: workspace,
+    env: { ...testEnv(workspace), REVIEW_LOOP_CODEX_BIN: capture.bin },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).result.decision, "approved");
+  const argv = JSON.parse(readFileSync(capture.argvFile, "utf8"));
+  assert.equal(argv[0], "exec");
+  assert.ok(argv.includes("--skip-git-repo-check"));
+  assert.equal(realpathSync(argv[argv.indexOf("--cd") + 1]), realpathSync(workspace));
+  assert.ok(argv.includes("--ephemeral"));
+  assert.ok(argv.includes("--ignore-user-config"));
+  assert.ok(argv.includes("--ignore-rules"));
+  assert.ok(argv.includes("--strict-config"));
+  assert.deepEqual(argv.slice(argv.indexOf("--sandbox"), argv.indexOf("--sandbox") + 2), ["--sandbox", "read-only"]);
+  assert.notEqual(realpathSync(readFileSync(capture.cwdFile, "utf8")), realpathSync(workspace));
+});
+
+test("run opts host-default Codex into non-Git artifact review", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "review-loop-non-git-default-"));
+  writeFileSync(join(workspace, "design.md"), "# Design\n\nReview this artifact.\n");
+  const capture = makeCodexCapture(workspace, "default");
+  const result = run([
+    "run", "--scope", "none", "--artifact", "design.md", "--reviewer", "codex", "--json",
+  ], {
+    cwd: workspace,
+    env: { ...testEnv(workspace), REVIEW_LOOP_CODEX_BIN: capture.bin },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).result.decision, "approved");
+  const argv = JSON.parse(readFileSync(capture.argvFile, "utf8"));
+  assert.ok(argv.includes("--skip-git-repo-check"));
+  assert.equal(realpathSync(argv[argv.indexOf("--cd") + 1]), realpathSync(workspace));
+  assert.deepEqual(argv.slice(argv.indexOf("--sandbox"), argv.indexOf("--sandbox") + 2), ["--sandbox", "read-only"]);
+});
+
+test("run opts host-default Codex fallback into non-Git artifact review", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "review-loop-non-git-fallback-"));
+  writeFileSync(join(workspace, "design.md"), "# Design\n\nReview this artifact.\n");
+  const capture = makeCodexCapture(workspace, "fallback");
+  const result = run([
+    "run", "--scope", "none", "--artifact", "design.md", "--reviewer", "claude", "--json",
+  ], {
+    cwd: workspace,
+    env: {
+      ...testEnv(workspace),
+      REVIEW_LOOP_HOST: "codex",
+      REVIEW_LOOP_CODEX_BIN: capture.bin,
+      REVIEW_LOOP_FAKE_ERROR: "primary Claude provider unavailable",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.result.decision, "approved");
+  assert.equal(parsed.result.reviewer_mechanism, "codex-fallback");
+  const argv = JSON.parse(readFileSync(capture.argvFile, "utf8"));
+  assert.ok(argv.includes("--skip-git-repo-check"));
+  assert.equal(realpathSync(argv[argv.indexOf("--cd") + 1]), realpathSync(workspace));
+  assert.deepEqual(argv.slice(argv.indexOf("--sandbox"), argv.indexOf("--sandbox") + 2), ["--sandbox", "read-only"]);
 });
 
 test("reviewer selection honors host defaults, explicit override, and validation", () => {
@@ -3511,6 +3583,29 @@ function run(args, { cwd, env, input } = {}) {
     input,
     encoding: "utf8",
   });
+}
+
+function makeCodexCapture(workspace, label) {
+  const captureDir = join(workspace, ".capture", label);
+  mkdirSync(captureDir, { recursive: true });
+  const argvFile = join(captureDir, "argv.json");
+  const cwdFile = join(captureDir, "cwd.txt");
+  const bin = join(captureDir, "codex");
+  writeFileSync(bin, `#!/usr/bin/env node
+const fs = require("fs");
+const argv = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(argv));
+fs.writeFileSync(${JSON.stringify(cwdFile)}, process.cwd());
+let input = "";
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  const out = argv[argv.indexOf("--output-last-message") + 1];
+  fs.writeFileSync(out, JSON.stringify(reviewResponse(input, { decision: "approved", summary: "codex captured", findings: [], required_next_actions: [] })));
+  process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "fresh-codex-capture-session" }) + "\\n");
+});
+${fakeReviewResponseSource}
+`, { mode: 0o755 });
+  return { argvFile, cwdFile, bin };
 }
 
 function makeGitRepo() {

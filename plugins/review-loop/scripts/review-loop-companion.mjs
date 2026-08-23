@@ -1203,7 +1203,7 @@ function runCodexReviewerPrimitive(prompt, options) {
   const result = spawnSync(codexBin(), [
     "exec",
     ...reviewerArgs,
-    ...(options.selection?.model ? codexWorkspaceArgs(options.repoRoot) : ["--cd", options.repoRoot]),
+    ...codexWorkspaceArgs(options.repoRoot),
     "--json",
     "--output-schema", options.schemaPath || REVIEWER_OUTPUT_SCHEMA_PATH,
     "--output-last-message", outPath,
@@ -2884,7 +2884,12 @@ function codexNeutralRoot() {
 }
 
 function codexWorkspaceArgs(repoRoot) {
-  return ["--cd", repoRoot];
+  const args = ["--cd", repoRoot];
+  const insideWorkTree = git(["rev-parse", "--is-inside-work-tree"], { cwd: repoRoot, optional: true });
+  if (!insideWorkTree.ok || insideWorkTree.stdout.trim() !== "true") {
+    args.push("--skip-git-repo-check");
+  }
+  return args;
 }
 
 function isMutableModelAlias(model) {
